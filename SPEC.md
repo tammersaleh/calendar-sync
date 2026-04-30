@@ -77,6 +77,29 @@ Google's events.list documentation is internally inconsistent about whether mult
 
 The `calendar-sync:source` property uses the **canonical** calendar ID, never the alias `primary`. At config-load time, calendar-sync resolves every calendar reference (including `primary`) to its canonical ID via `gws calendar calendarList get`. Canonicalized IDs are used everywhere downstream: in-memory state keys, extended properties, log fields. This survives config edits where the user swaps `primary` for the explicit email or vice versa.
 
+#### Deterministic mirror event IDs
+
+Every mirror event is inserted with a **deterministic event ID** computed from `(canonical_source_calendar_id, source_event_id)`. The ID is base32hex-encoded, prefixed `cs2`, and within Google's allowed event-ID character set (`[a-v0-9]`, length 5-1024).
+
+```
+mirror_id = "cs2" + lowercase(base32hex(sha256(canonical_source_calendar_id + ":" + source_event_id))[:50])
+```
+
+The derivation deliberately omits the pair name and direction. Event IDs are calendar-scoped on Google's side, so `(target_calendar, mirror_id)` is already unique even if the same source event were ever mirrored to multiple target calendars. Omitting `scope` from the ID derivation means renaming a pair in config doesn't change the mirror ID - the same physical mirror just gets re-tagged with the new scope value via the next reconciliation's patch.
+
+This serves three purposes:
+
+1. **Race-free concurrent insert.** If two processes try to mirror the same source event at the same moment (e.g. a daemon and a manual `calendar-sync run` racing through the socket-based exclusion check, or two tick handlers handling overlapping deltas), the deterministic ID makes both insert requests target the same event ID. Google rejects the second one with HTTP 409 (`reason=duplicate`); the losing process catches the conflict, fetches the existing mirror via `events.get?eventId=<computed>`, and continues as if the mirror already existed (which it now does). No duplicate mirrors, ever.
+2. **Cheap mirror lookup.** Instead of always querying `events.list?privateExtendedProperty=calendar-sync:source=...` to find a mirror, the daemon computes the expected ID and either reads it from the in-memory inventory (steady state) or does an `events.get` (warm path).
+3. **Stable across pair renames.** Renaming a pair from `work-personal` to `work-personal-2` in config keeps the same source-to-mirror mapping. The next reconciliation pass updates the `calendar-sync:scope`/`calendar-sync:pair` fields on each existing mirror via a normal `source_updated` patch path; no duplicate mirrors are created and no orphan cleanup is needed. (The rename does invalidate any in-memory state from the previous daemon process; restart the daemon after config changes per the documented config-reload model.)
+
+Cancelled-and-revived: Google retains the event ID after `events.delete` for some retention window. If a mirror was deleted (orphan cleanup, `mirror prune`) and then becomes eligible again, an `events.insert` with the same deterministic ID may return 409 with `reason=duplicate` even though `events.get?eventId=<id>` shows `status=cancelled`. The daemon handles this by:
+
+1. Insert with deterministic ID.
+2. On 409 duplicate, `events.get` the ID.
+3. If the existing event is `status=cancelled`, call `events.patch?eventId=<id>` with `status=confirmed` plus the full mirror payload to revive it.
+4. If the existing event is alive, treat as "mirror already exists" and run the standard reconciliation.
+
 #### Loop prevention
 
 A source event is "already a mirror" if it carries `calendar-sync:source` in its extended properties. Such events are skipped when scanning a calendar as a *source*. This prevents bidirectional pairs from re-mirroring their own output.
@@ -483,7 +506,7 @@ The `source_updated` and `mirror_updated` fields show the timestamps that drove 
 - **Connect returns `ECONNREFUSED`**: the socket file exists but no process is listening. Treat as "not running" - the file is stale from a crashed daemon. `run` proceeds and the next `watch` startup will unlink the stale file before binding.
 - **Socket file does not exist**: no daemon. `run` proceeds.
 
-There's a TOCTOU window between the socket check and the start of `run`'s API calls during which a daemon could appear; this is intentionally not closed. The intent of the exclusion is to prevent the common case of `run` colliding with an already-running daemon, not to provide a hard distributed lock. If the user starts `watch` mid-`run`, the worst outcome is two processes briefly contending on the same calendars; idempotency in the classification logic prevents corruption.
+There's a TOCTOU window between the socket check and the start of `run`'s API calls during which a daemon could appear. The exclusion is intentionally advisory, not a hard distributed lock. The deterministic mirror event ID design (see "Mirror identification" / "Deterministic mirror event IDs") is what makes this safe: even if two processes race through the check and both attempt to mirror the same source event, both insert requests target the same Google event ID, and one gets HTTP 409 `duplicate` which is handled by fetching the existing mirror and continuing. No duplicate mirrors are ever created. The socket-based exclusion is friction to prevent obviously-redundant work, not the safety mechanism.
 
 #### Errors
 
@@ -761,7 +784,7 @@ The plist generated:
 </plist>
 ```
 
-`KeepAlive=true` makes launchd restart the daemon if it crashes (with launchd's standard exponential-backoff between restarts). `RunAtLoad=true` starts it at user login. `ProcessType=Interactive` keeps it from being aggressively suspended on system sleep. There is no `StartInterval`; the daemon's own internal scheduler drives the polling cadence (see `settings.poll_interval`).
+`KeepAlive=true` makes launchd restart the daemon if it crashes (with launchd's standard exponential-backoff between restarts). `RunAtLoad=true` starts it at user login. `ProcessType=Interactive` signals to launchd that the process behaves like an interactive (foreground) program rather than a long-running background service - this affects launchd's resource scheduling but does not prevent the OS from suspending the process during system sleep. (Sleep behavior is documented in "Sleep and wake" within the Sync Algorithm section.) There is no `StartInterval`; the daemon's own internal scheduler drives the polling cadence (see `settings.poll_interval`).
 
 #### Errors
 
@@ -878,19 +901,13 @@ The mirror inventory and source listings are grown and pruned in place as the da
      "maxResults": 250
    }' --page-all
    ```
-   Capture `nextSyncToken` from the final page. If it's missing (Google omits it for very long lists), leave the in-memory token empty - the next cycle will full-sync again.
-6. **Mirror inventory per unique target.** For each distinct target calendar `T`:
-   ```
-   gws calendar events list --params '{
-     "calendarId": "<T>",
-     "privateExtendedProperty": ["calendar-sync:version=2"],
-     "showDeleted": false,
-     "maxResults": 250
-   }' --page-all
-   ```
-   Build the in-memory inventory keyed by `(scope, source_event_id)`. Note: `version=1` mirrors don't appear in this list. They're encountered (and migrated) when the classification logic processes their corresponding source event.
-7. **Reconcile.** For each enabled pdir `(P, D)` with source `S` and target `T`, walk the in-memory list of source events for `S`. For each event, run the classification logic (see below) using the `T` mirror inventory to look up existing mirrors.
-8. **Schedule.** Set the per-tick timer (`poll_interval`) and the periodic-full-resync timer (`full_sync_interval`).
+   Capture `nextSyncToken` from the final page into a *staging* variable - not into the in-memory per-source token yet. See step 8.
+6. **Mirror inventory per unique target.** For each distinct target calendar `T`, run the rebuild described in "Mirror inventory rebuild" - two `events.list` calls, one for `version=2` and one for `version=1`, merged into a single inventory. v1 entries are flagged for migration during reconciliation.
+7. **Reconcile.** For each enabled pdir `(P, D)` with source `S` and target `T`, walk the in-memory list of source events for `S`. For each event, run the classification logic (see below) using the `T` mirror inventory to look up existing mirrors. Track success/failure per pdir.
+8. **Commit syncTokens conditionally.** For each unique source `S`, install the staged `nextSyncToken` from step 5 into the in-memory per-source token *only if every pdir whose source matches `S` succeeded in step 7*. If any pdir for `S` failed, leave the in-memory token empty so the next cycle re-runs a full source-list for `S`. This is the same conditional-advancement rule that protects the per-tick path; both paths apply it.
+
+   If the staged token is missing (Google can omit `nextSyncToken` on very long full lists) the same rule applies in spirit: leave the in-memory token empty so the next cycle re-runs a full source-list.
+9. **Schedule.** Set the per-tick timer (`poll_interval`) and the periodic-full-resync timer (`full_sync_interval`).
 
 Startup wall-clock cost on real-world calendars (1-year horizon, ~1000 events per source): on the order of 10-20s for a typical multi-pdir setup. Mostly Google API latency.
 
@@ -919,7 +936,9 @@ Empty deltas (the common case) cost a single API call per source - measured at ~
 
 ### Daemon lifecycle: periodic full re-sync
 
-Every `full_sync_interval` (default 24h), the daemon repeats the work of startup, plus a follow-up orphan-cleanup walk that doesn't run during the per-tick path. The full re-sync re-runs every step of startup including config-derived bookkeeping:
+Every `full_sync_interval` (default 24h), the daemon repeats the source-list / inventory-rebuild / reconcile work of startup, plus a follow-up orphan-cleanup walk that doesn't run during the per-tick path. The full re-sync does NOT re-read `config.toml` from disk: a parsed config snapshot is captured at daemon startup and reused for the daemon's lifetime. Config edits require a daemon restart.
+
+What full re-sync does refresh:
 
 1. Re-canonicalize calendar IDs (in case Google reassigned a primary, though rare) and re-fetch each calendar's `accessRole` via `gws calendar calendarList get`. If a target's `accessRole` has dropped below `writer`, log an error and skip pdirs that target it for the rest of this re-sync. If a source's `accessRole` has changed, recompute the corresponding pdirs' `source_writable` flag (drift handling switches between propagate and revert accordingly).
 2. Full source-list per unique source. Replace the in-memory source listings.
@@ -1293,7 +1312,7 @@ What lives in process memory:
 
 What survives across daemon restarts:
 
-- `extendedProperties.private` on every mirror event. The full provenance (`calendar-sync:source`, `calendar-sync:source_updated`, `calendar-sync:checksum`, `calendar-sync:scope`, etc.) is colocated with the mirror itself on Google Calendar. A cold start re-derives the in-memory inventory by listing every mirror via `privateExtendedProperty=calendar-sync:version=2`.
+- `extendedProperties.private` on every mirror event. The full provenance (`calendar-sync:source`, `calendar-sync:source_updated`, `calendar-sync:checksum`, `calendar-sync:scope`, etc.) is colocated with the mirror itself on Google Calendar. A cold start re-derives the in-memory inventory by running the "Mirror inventory rebuild" subroutine (two `events.list` calls per target: one for `version=2`, one for `version=1`).
 
 A cold start (process launch, restart after crash, system reboot) walks the same path described in "Daemon lifecycle: startup": canonicalize, list, build inventory, reconcile. Wall-clock cost on a real-world calendar setup is on the order of 10-20 seconds.
 

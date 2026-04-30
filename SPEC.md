@@ -61,17 +61,12 @@ Every mirror event carries these private extended properties (`extendedPropertie
 
 | Key                            | Value example                              | Purpose                                                                                                          |
 |--------------------------------|--------------------------------------------|------------------------------------------------------------------------------------------------------------------|
-| `calendar-sync:source`         | `alice@example.com:abc123def456`           | `<canonical_source_calendar_id>:<source_event_id>`. Unique on a target calendar. Used to find a specific mirror. |
+| `calendar-sync:source`         | `alice@example.com:abc123def456`           | `<canonical_source_calendar_id>:<source_event_id>`. Identifies which source event this is a mirror of. Used by the orphan walk during full re-sync to look up the source. Inventory lookups use the deterministic mirror event ID instead - see below. |
 | `calendar-sync:source_updated` | `2026-04-29T23:00:00Z`                     | The source event's `updated` field at the time of the last reconciliation. The "did source change?" signal.      |
 | `calendar-sync:checksum`       | `sha256:c3a4...e891`                       | SHA-256 over a canonical serialization of the fields calendar-sync manages on the mirror. The "did mirror drift?" signal. (See "Drift detection model" below.) |
-| `calendar-sync:scope`          | `work-personal:a_to_b`                     | `<pair>:<direction>`. Composite for bulk listing by pdir. (See "Why composite" below.)                           |
-| `calendar-sync:pair`           | `work-personal`                            | Pair name. Stored separately for human-readable output.                                                          |
-| `calendar-sync:direction`      | `a_to_b`                                   | Direction. Stored separately for human-readable output.                                                          |
 | `calendar-sync:version`        | `2`                                        | Schema version. Current version is `2`. Bump if the property layout changes.                                     |
 
-#### Why composite `scope`
-
-Google's events.list documentation is internally inconsistent about whether multiple `privateExtendedProperty` parameters are AND'd or OR'd. To stay on documented-and-stable ground, calendar-sync only ever queries on a **single** extended property. The composite `scope` lets us fetch all mirrors of a pdir in one single-property query without depending on AND-of-multi semantics.
+The pair name and direction are deliberately *not* stored on the mirror. The deterministic mirror event ID (see below) is derived from the source event alone, so renaming a pair in config is a metadata-only operation that doesn't require touching any mirror events. Bulk operations like `mirror list --pair X` derive the pair-to-mirror mapping client-side from the current config plus the mirror's `calendar-sync:source` value (the source calendar ID identifies the pdir given the target calendar being listed).
 
 #### Canonical calendar IDs
 
@@ -85,13 +80,13 @@ Every mirror event is inserted with a **deterministic event ID** computed from `
 mirror_id = "cs2" + lowercase(base32hex(sha256(canonical_source_calendar_id + ":" + source_event_id))[:50])
 ```
 
-The derivation deliberately omits the pair name and direction. Event IDs are calendar-scoped on Google's side, so `(target_calendar, mirror_id)` is already unique even if the same source event were ever mirrored to multiple target calendars. Omitting `scope` from the ID derivation means renaming a pair in config doesn't change the mirror ID - the same physical mirror just gets re-tagged with the new scope value via the next reconciliation's patch.
+The derivation depends only on source identity. Event IDs are calendar-scoped on Google's side, so `(target_calendar, mirror_id)` is already unique even if the same source event were mirrored to multiple target calendars (different targets produce different `(target_calendar, mirror_id)` tuples even with the same `mirror_id`). Pair names and directions are derived client-side from current config when needed for display; they aren't stored on the mirror, so renaming a pair touches no mirror events.
 
 This serves three purposes:
 
 1. **Race-free concurrent insert.** If two processes try to mirror the same source event at the same moment (e.g. a daemon and a manual `calendar-sync run` racing through the socket-based exclusion check, or two tick handlers handling overlapping deltas), the deterministic ID makes both insert requests target the same event ID. Google rejects the second one with HTTP 409 (`reason=duplicate`); the losing process catches the conflict, fetches the existing mirror via `events.get?eventId=<computed>`, and continues as if the mirror already existed (which it now does). No duplicate mirrors, ever.
 2. **Cheap mirror lookup.** Instead of always querying `events.list?privateExtendedProperty=calendar-sync:source=...` to find a mirror, the daemon computes the expected ID and either reads it from the in-memory inventory (steady state) or does an `events.get` (warm path).
-3. **Stable across pair renames.** Renaming a pair from `work-personal` to `work-personal-2` in config keeps the same source-to-mirror mapping. The next reconciliation pass updates the `calendar-sync:scope`/`calendar-sync:pair` fields on each existing mirror via a normal `source_updated` patch path; no duplicate mirrors are created and no orphan cleanup is needed. (The rename does invalidate any in-memory state from the previous daemon process; restart the daemon after config changes per the documented config-reload model.)
+3. **Stable across pair renames.** Renaming a pair in config doesn't change any mirror IDs because the derivation depends only on source identity. The mirror's extended properties also don't carry the pair name or direction (those are derived client-side from current config when needed for display), so there's nothing on the mirror to refresh. After a config rename and daemon restart, the existing mirrors map cleanly under the new pair name with no API writes.
 
 Cancelled-and-revived: Google retains the event ID after `events.delete` for some retention window. If a mirror was deleted (orphan cleanup, `mirror prune`) and then becomes eligible again, an `events.insert` with the same deterministic ID may return 409 with `reason=duplicate` even though `events.get?eventId=<id>` shows `status=cancelled`. The daemon handles this by:
 
@@ -256,7 +251,7 @@ Duration strings follow Go's `time.ParseDuration` syntax (`30s`, `5m`, `24h`) pl
 
 | Field       | Type   | Required  | Description                                                                                                                                                  |
 |-------------|--------|-----------|--------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `name`      | string | yes       | Unique. Used as the `calendar-sync:pair` extended property and in logs. Must match `^[a-z0-9][a-z0-9-]{0,62}$`.                                            |
+| `name`      | string | yes       | Unique. Used in logs and as the human-facing identifier for `--pair` flags on `mirror list`/`mirror prune`. Must match `^[a-z0-9][a-z0-9-]{0,62}$`.        |
 | `direction` | string | yes       | One of `source_to_target`, `target_to_source`, `bidirectional`.                                                                                              |
 | `source`    | string | yes       | Calendar ID for the "left" calendar.                                                                                                                         |
 | `target`    | string | yes       | Calendar ID for the "right" calendar.                                                                                                                        |
@@ -662,13 +657,15 @@ calendar-sync mirror list <calendar> [flags]
   --all                Fetch all pages.
 ```
 
-`--pair` + `--direction` builds the composite `scope` query (`pair:direction`) which is a single-property events.list filter.
+`--pair`/`--direction` filtering is applied client-side: the command lists all mirrors via `privateExtendedProperty=calendar-sync:version=2` (and `version=1` if any), parses each mirror's `calendar-sync:source` to recover the source calendar ID, and matches against the current config to determine which pdir produced it. Matching is uniquely defined because validation guarantees no two pdirs share the same `(canonical_source, canonical_target, direction)` triple.
 
 ```
 $ calendar-sync mirror list primary --pair work-personal --direction a_to_b
-{"id":"def456","summary":"Standup","start":"2026-04-30T15:00:00Z","end":"2026-04-30T15:30:00Z","source":"alice@example.com:abc123","source_updated":"2026-04-29T23:00:00Z","scope":"work-personal:a_to_b"}
+{"id":"cs2abc...","summary":"Standup","start":"2026-04-30T15:00:00Z","end":"2026-04-30T15:30:00Z","source":"alice@example.com:abc123","source_updated":"2026-04-29T23:00:00Z","pair":"work-personal","direction":"a_to_b"}
 {"_meta":{"count":1,"has_more":false}}
 ```
+
+The `pair` and `direction` fields in the output are derived client-side from current config; they're not stored on the mirror itself.
 
 #### Errors
 
@@ -871,7 +868,7 @@ Per source calendar (deduplicated across pdirs that share a source):
 Per target calendar (deduplicated across pdirs that share a target):
 - Canonical calendar ID
 - `accessRole`
-- Mirror inventory: a `map[(scope, source_event_id)] -> live mirror Event resource` containing every mirror calendar-sync currently has on this calendar
+- Mirror inventory: a `map[deterministic_mirror_id] -> live mirror Event resource` containing every mirror calendar-sync currently has on this calendar
 
 Per pdir:
 - Source canonical ID, target canonical ID
@@ -944,7 +941,7 @@ What full re-sync does refresh:
 2. Full source-list per unique source. Replace the in-memory source listings.
 3. Mirror inventory rebuild per unique target (see "Mirror inventory rebuild" below).
 4. Reconcile every source event through the classification logic against the rebuilt inventory.
-5. **Orphan walk.** For each mirror inventory entry whose `(scope, source_event_id)` was *not* visited in step 4 (i.e. its source wasn't returned by the full source-list), look up the source via `events.get?calendarId=<S>&eventId=<source_id>`:
+5. **Orphan walk.** For each mirror inventory entry whose corresponding source event ID was *not* visited in step 4 (i.e. its source wasn't returned by the full source-list), parse `calendar-sync:source` from the mirror to recover `<source_calendar_id>:<source_event_id>` and look up the source via `events.get?calendarId=<source_calendar_id>&eventId=<source_event_id>`:
    - **Source returns 404 or has `status=cancelled`**: delete the mirror. Action `delete`, reason `orphaned`.
    - **Source is non-recurring and `start > now + horizon`**: delete the mirror. Action `delete`, reason `outside_horizon`.
    - **Source is a recurring parent (has `recurrence`)**: don't trust `start` (which is the series start). Call `events.instances?calendarId=<S>&eventId=<source_id>&timeMin=<now>&timeMax=<now + horizon>&maxResults=1&showDeleted=false`. Zero instances: delete the mirror, reason `outside_horizon`.
@@ -985,7 +982,7 @@ This runs once per source event `E` per pdir `(P, D)`. Called from both startup 
 
 2. **Recurring instance.** If `E.recurringEventId` is set, route to the recurring-instance handler (see "Recurring Events"). The handler internally deals with cancelled, transparent, declined, and updated instances. Generic skip rules in steps 3-6 do NOT apply to recurring instances - the handler subsumes them.
 
-3. **Cancelled (non-recurring).** If `E.status == "cancelled"` (and step 2 didn't fire), look up the mirror in the inventory by `(scope = "<P>:<D>", source_event_id = E.id)`. If found, delete it (action `delete`, reason `source_cancelled`). If not, `skip(reason=cancelled)`.
+3. **Cancelled (non-recurring).** If `E.status == "cancelled"` (and step 2 didn't fire), compute the deterministic mirror ID from `(canonical_source_calendar_id, E.id)` and look it up in the inventory. If found, delete it (action `delete`, reason `source_cancelled`). If not, `skip(reason=cancelled)`.
 
 4. **Declined.** If the source calendar owner's attendee entry has `responseStatus=declined`, `skip(reason=declined)`. (Plus delete the mirror if one exists.)
 
@@ -997,8 +994,9 @@ This runs once per source event `E` per pdir `(P, D)`. Called from both startup 
 
    If outside horizon: `skip(reason=outside_horizon)` and delete the mirror if one exists.
 
-7. **Normal reconciliation.** Look up the mirror in the inventory by `(scope, source_event_id)`:
-   - **No mirror**: `events.insert` on `T` with the full mirror payload. Action `insert`, reason `source_updated`. Add the post-write resource to the inventory.
+7. **Normal reconciliation.** Compute the deterministic mirror ID from `(canonical_source_calendar_id, E.id)` and look it up in the inventory:
+   - **No mirror**: `events.insert` on `T` with the full mirror payload (including the deterministic `id`). Action `insert`, reason `source_updated`. Add the post-write resource to the inventory.
+     - **On HTTP 409 `duplicate`**: another process inserted the same mirror between our inventory build and our insert (e.g. concurrent `calendar-sync run` racing through the socket exclusion). `events.get?eventId=<deterministic_id>` to fetch the existing mirror. If `status=cancelled`, `events.patch` with `status=confirmed` and the full mirror payload to revive it (action `insert`, reason `source_updated`). If alive, treat as "mirror exists" and re-run normal reconciliation against the fetched resource (drift detection etc.). Either way add to inventory.
    - **Mirror exists**: compute the two drift-detection signals from "Drift detection model":
      - `source_changed = E.updated > mirror.calendar-sync:source_updated`
      - `mirror_drifted = sha256(canonical(mirror.<managed fields>)) != mirror.calendar-sync:checksum`. If `version < 2` on the mirror, derive `mirror_drifted` per the "Schema version migration" rules instead.
@@ -1049,6 +1047,7 @@ The standard drift detection covers parents and source-corresponding instances, 
 
 ```json
 {
+  "id": "cs2<base32hex_hash>",
   "summary": "<source.summary>",
   "description": "<source.description>\n\n---\nSource: <source.htmlLink>",
   "start": <source.start>,
@@ -1062,9 +1061,6 @@ The standard drift detection covers parents and source-corresponding instances, 
       "calendar-sync:source": "<S>:<E.id>",
       "calendar-sync:source_updated": "<E.updated>",
       "calendar-sync:checksum": "sha256:<hex>",
-      "calendar-sync:scope": "<P>:<D>",
-      "calendar-sync:pair": "<P>",
-      "calendar-sync:direction": "<D>",
       "calendar-sync:version": "2"
     }
   }
@@ -1105,7 +1101,7 @@ A tick that was mid-flight when sleep hit (e.g., laptop closed during an `events
 
 ### Idempotency
 
-Every API call is keyed by stable identifiers (source event ID for find, mirror event ID for patch/delete). The mirror's `calendar-sync:source` extended property is the de-duplication key: a previous reconciliation that crashed mid-insert leaves either no mirror (next pass inserts) or a mirror with the marker (next pass patches/skips). No duplicates.
+Every API call is keyed by stable identifiers (source event ID for find, deterministic mirror event ID for insert/patch/delete). The deterministic ID is the de-duplication key: a previous reconciliation that crashed mid-insert leaves either no mirror (next pass inserts cleanly) or the mirror already at its computed ID (next pass `events.get`s it via the 409-duplicate path, then patches or skips). Two processes attempting concurrent insert collide on the same Google event ID and one gets HTTP 409 `duplicate`. No duplicate mirrors are ever created.
 
 A daemon crash mid-tick is recoverable: launchd's `KeepAlive` restarts the process, the cold-start path rebuilds inventories from Google, and reconciliation converges on the same end state.
 
@@ -1308,11 +1304,11 @@ What lives in process memory:
 - Canonical calendar IDs and `accessRole`s for every calendar referenced in config (resolved at startup).
 - Per-source `syncToken` (one token per unique source calendar; pdirs sharing a source share the token).
 - Per-source last-full-sync timestamp.
-- Per-target mirror inventory (a map from `(scope, source_event_id)` to live Event resource).
+- Per-target mirror inventory (a map from deterministic mirror ID to live Event resource, supplemented by a reverse index from source event ID for the orphan walk).
 
 What survives across daemon restarts:
 
-- `extendedProperties.private` on every mirror event. The full provenance (`calendar-sync:source`, `calendar-sync:source_updated`, `calendar-sync:checksum`, `calendar-sync:scope`, etc.) is colocated with the mirror itself on Google Calendar. A cold start re-derives the in-memory inventory by running the "Mirror inventory rebuild" subroutine (two `events.list` calls per target: one for `version=2`, one for `version=1`).
+- `extendedProperties.private` on every mirror event. The provenance (`calendar-sync:source`, `calendar-sync:source_updated`, `calendar-sync:checksum`, `calendar-sync:version`) is colocated with the mirror itself on Google Calendar. A cold start re-derives the in-memory inventory by running the "Mirror inventory rebuild" subroutine (two `events.list` calls per target: one for `version=2`, one for `version=1`).
 
 A cold start (process launch, restart after crash, system reboot) walks the same path described in "Daemon lifecycle: startup": canonicalize, list, build inventory, reconcile. Wall-clock cost on a real-world calendar setup is on the order of 10-20 seconds.
 
@@ -1349,22 +1345,18 @@ The socket carries no persistent state. Its existence indicates the daemon is cu
 
 ### Mirror identification queries (recap)
 
-Find a specific mirror:
+Look up a specific mirror by deterministic ID (the common path):
 ```
-events.list?calendarId=<T>&privateExtendedProperty=calendar-sync:source=<S>:<E.id>
-```
-
-Find every mirror created by a pdir:
-```
-events.list?calendarId=<T>&privateExtendedProperty=calendar-sync:scope=<P>:<D>
+events.get?calendarId=<T>&eventId=<deterministic_mirror_id>
 ```
 
-Find every mirror calendar-sync has ever created on a calendar:
+Find every mirror calendar-sync has ever created on a calendar (used by the inventory rebuild and bulk operations):
 ```
 events.list?calendarId=<T>&privateExtendedProperty=calendar-sync:version=2
+events.list?calendarId=<T>&privateExtendedProperty=calendar-sync:version=1
 ```
 
-All are single-property queries.
+All are single-property queries (or single-event lookups).
 
 ## Out of scope
 

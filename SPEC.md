@@ -266,8 +266,6 @@ Run on every command that touches config. Failures exit with code 1 and a JSON e
 #### Minimal: one bidirectional pair
 
 ```toml
-[accounts.default]
-
 [[pairs]]
 name = "primary-pair"
 direction = "bidirectional"
@@ -361,7 +359,7 @@ Diagnostic logs. Format controlled by `settings.log_format`:
 Errors that prevent a command from running go to stderr as a single JSON object:
 
 ```json
-{"error":"config_invalid","detail":"pair 'work-personal' references undeclared account 'work'","hint":"Add an [accounts.work] section to your config","cause":"<wrapped, optional>"}
+{"error":"config_invalid","detail":"pair 'work-personal' has invalid direction 'left_to_right'","hint":"direction must be one of source_to_target, target_to_source, bidirectional","cause":"<wrapped, optional>"}
 ```
 
 ### Exit codes
@@ -479,7 +477,13 @@ The `source_updated` and `mirror_updated` fields show the timestamps that drove 
 
 #### Daemon-running detection
 
-`run` calls `launchctl print gui/<uid>/org.calendar-sync.agent` (or whichever `Label` the user installed - the binary tracks its own default label) and inspects the exit code. Non-zero means not loaded; `run` proceeds. Zero means the daemon is loaded and `run` aborts with `daemon_already_running` (exit 5) before any API calls. The intent is to prevent a manual `run` from racing with the daemon's own scheduler over the same calendars.
+`run` checks for a daemon by attempting to connect to `$TMPDIR/calendar-sync.sock` (the same socket `calendar-sync status` uses). The check works regardless of how the daemon was started (launchd-loaded, manual `calendar-sync watch` in a terminal, anything else). Three outcomes:
+
+- **Connect succeeds**: a daemon is running. Exit 5 with `daemon_already_running` before any API calls.
+- **Connect returns `ECONNREFUSED`**: the socket file exists but no process is listening. Treat as "not running" - the file is stale from a crashed daemon. `run` proceeds and the next `watch` startup will unlink the stale file before binding.
+- **Socket file does not exist**: no daemon. `run` proceeds.
+
+There's a TOCTOU window between the socket check and the start of `run`'s API calls during which a daemon could appear; this is intentionally not closed. The intent of the exclusion is to prevent the common case of `run` colliding with an already-running daemon, not to provide a hard distributed lock. If the user starts `watch` mid-`run`, the worst outcome is two processes briefly contending on the same calendars; idempotency in the classification logic prevents corruption.
 
 #### Errors
 
@@ -578,7 +582,7 @@ Stdout on success:
 
 ```
 $ calendar-sync config validate
-{"status":"ok","pairs":2,"pdirs":3,"accounts":1}
+{"status":"ok","pairs":2,"pdirs":3}
 {"_meta":{"count":1}}
 ```
 
@@ -683,38 +687,35 @@ $ calendar-sync mirror prune primary --orphaned --yes
 
 ### calendar-sync status
 
-Report whether the daemon is loaded and, if so, its current per-pdir state. The daemon doesn't persist state to disk, so this command works in two modes:
-
-- **Daemon loaded**: connects to the daemon over a Unix domain socket at `$TMPDIR/calendar-sync.sock` (per-user; macOS sets `$TMPDIR` per user). The daemon serves a `GET /status` request that returns the live in-memory state.
-- **Daemon not loaded**: reports loaded=false and exits 0. There's nothing to query.
-
-The socket is created by the daemon on startup and removed on clean shutdown. On crash or kill, the socket file may be stale; `status` handles `ECONNREFUSED` on a stale socket as "not loaded."
+Report whether the daemon is reachable via its IPC socket and, if so, its current per-pdir state. "Reachable" is intentionally distinct from "loaded by launchd": if a user runs `calendar-sync watch` directly in a terminal (supported for debugging), the socket exists and `status` reports it reachable, even though launchd didn't start it.
 
 ```
 calendar-sync status
 ```
 
-Stdout when daemon loaded:
+Stdout when daemon reachable:
 
 ```
-{"loaded":true,"pid":54321,"started_at":"2026-04-30T08:00:00Z","poll_interval":"60s","full_sync_interval":"24h","last_full_sync_at":"2026-04-30T08:00:00Z"}
+{"reachable":true,"pid":54321,"started_at":"2026-04-30T08:00:00Z","poll_interval":"60s","full_sync_interval":"24h","last_full_sync_at":"2026-04-30T08:00:00Z"}
 {"pdir":"work-personal:a_to_b","source_calendar":"alice@example.com","target_calendar":"alice.personal@example.org","mirrors":1245,"last_tick_at":"2026-04-30T20:55:30Z","last_tick_status":"ok","last_tick_inserts":0,"last_tick_patches":1,"last_tick_deletes":0,"last_tick_propagates":0,"last_tick_reverts":0,"last_tick_skips":2}
 {"pdir":"work-personal:b_to_a","source_calendar":"alice.personal@example.org","target_calendar":"alice@example.com","mirrors":782,"last_tick_at":"2026-04-30T20:55:30Z","last_tick_status":"ok","last_tick_inserts":0,"last_tick_patches":0,"last_tick_deletes":0,"last_tick_propagates":0,"last_tick_reverts":0,"last_tick_skips":1}
 {"_meta":{"count":2}}
 ```
 
-Stdout when daemon not loaded:
+Stdout when daemon not reachable:
 
 ```
-{"loaded":false}
+{"reachable":false}
 {"_meta":{"count":0}}
 ```
 
+See "IPC socket" in the State section for the full client/daemon lifecycle.
+
 #### Errors
 
-| Error code      | Exit | When                                                  |
-|-----------------|------|-------------------------------------------------------|
-| `socket_error`  | 1    | Socket file exists but I/O failed for non-`ECONNREFUSED` reasons. |
+| Error code      | Exit | When                                                              |
+|-----------------|------|-------------------------------------------------------------------|
+| `socket_error`  | 1    | Socket file exists with the wrong type, wrong permissions, or other non-`ECONNREFUSED` I/O failure. |
 
 ### calendar-sync install
 
@@ -909,20 +910,53 @@ Every `poll_interval`, the internal scheduler fires the per-tick path. For each 
    ```
    `timeMin`, `timeMax`, `updatedMin`, `q`, `iCalUID`, `orderBy`, and the `privateExtendedProperty`/`sharedExtendedProperty` filters are all rejected when sent alongside `syncToken`. Other parameters (`singleEvents`, `eventTypes`, `showDeleted`) must match the values used in the prior full sync. The daemon never changes these between full and incremental calls, so they always match.
 2. **410 GONE recovery.** If any page returns 410, the in-memory token is invalid. Schedule an immediate full re-sync for `S` (which gets a fresh token), and skip the rest of this tick for that source.
-3. **Reconcile delta.** For each event `E` in the response, for each enabled pdir whose source matches `S`, run the classification logic against the in-memory mirror inventory for that pdir's target.
-4. **Update token.** Replace the in-memory `syncToken` with the response's `nextSyncToken`.
+3. **Reconcile delta to every dependent pdir.** For each event `E` in the response, for each enabled pdir whose source matches `S`, run the classification logic against the in-memory mirror inventory for that pdir's target. Track success/failure per pdir.
+4. **Conditionally update token.** Replace the in-memory `syncToken` for `S` with the response's `nextSyncToken` *only if every pdir whose source matches `S` successfully processed every event in the delta*. If any pdir failed (a Calendar API error, rate-limit retries exhausted, etc.), leave the in-memory token unchanged. The next tick re-fetches the same delta and re-reconciles. Idempotency in the classification logic (the `unchanged` skip when `source_changed=false && mirror_drifted=false`) means successful pdirs from the previous tick re-do their work as no-ops.
+
+The conditional advancement is what protects against the original "source-keyed state loses events on partial failure" bug: a failed pdir prevents the source's token from moving past events it didn't process, so the next tick re-delivers them.
 
 Empty deltas (the common case) cost a single API call per source - measured at ~270ms for an empty incremental response.
 
 ### Daemon lifecycle: periodic full re-sync
 
-Every `full_sync_interval` (default 24h), the daemon repeats startup steps 5-8: full source list per source, mirror inventory per target, reconcile, refresh tokens. This catches:
+Every `full_sync_interval` (default 24h), the daemon repeats the work of startup, plus a follow-up orphan-cleanup walk that doesn't run during the per-tick path. The full re-sync re-runs every step of startup including config-derived bookkeeping:
+
+1. Re-canonicalize calendar IDs (in case Google reassigned a primary, though rare) and re-fetch each calendar's `accessRole` via `gws calendar calendarList get`. If a target's `accessRole` has dropped below `writer`, log an error and skip pdirs that target it for the rest of this re-sync. If a source's `accessRole` has changed, recompute the corresponding pdirs' `source_writable` flag (drift handling switches between propagate and revert accordingly).
+2. Full source-list per unique source. Replace the in-memory source listings.
+3. Mirror inventory rebuild per unique target (see "Mirror inventory rebuild" below).
+4. Reconcile every source event through the classification logic against the rebuilt inventory.
+5. **Orphan walk.** For each mirror inventory entry whose `(scope, source_event_id)` was *not* visited in step 4 (i.e. its source wasn't returned by the full source-list), look up the source via `events.get?calendarId=<S>&eventId=<source_id>`:
+   - **Source returns 404 or has `status=cancelled`**: delete the mirror. Action `delete`, reason `orphaned`.
+   - **Source is non-recurring and `start > now + horizon`**: delete the mirror. Action `delete`, reason `outside_horizon`.
+   - **Source is a recurring parent (has `recurrence`)**: don't trust `start` (which is the series start). Call `events.instances?calendarId=<S>&eventId=<source_id>&timeMin=<now>&timeMax=<now + horizon>&maxResults=1&showDeleted=false`. Zero instances: delete the mirror, reason `outside_horizon`.
+   - **Source is alive and in horizon but was filtered** (eventType excluded by Google's server-side filter, transparency=transparent, declined, etc.): delete the mirror, reason `source_filtered`. The fact that the source exists but doesn't match our query means it's no longer eligible for mirroring.
+
+Step 5 closes the gap that the per-tick path can't: incremental deltas via `syncToken` carry `status=cancelled` for source deletions only when the daemon was up to receive them. If the daemon was down (laptop closed, system rebooted) when a source was deleted, the cancellation event is consumed and lost - the next incremental delta never sees it. Periodic full re-sync's orphan walk catches what the per-tick path missed.
+
+What this catches:
 
 - **Horizon ingress.** Events that crossed into `[now, now + horizon]` simply by passage of time, without changing. Incremental sync wouldn't return them; full sync does.
-- **Mirror-only drift.** A user edited a mirror but its source hasn't changed since the last delta. The incremental delta wouldn't include the source event, so the reconciliation logic never had a chance to detect drift. Full sync visits every source event, checks every mirror, catches it.
-- **Orphans.** Mirrors whose source was deleted while the daemon was down. (When the daemon is up, the incremental delta carries `status=cancelled` for source deletions, so the reconciliation logic handles it directly.)
+- **Mirror drift on currently-eligible source events.** A user edited a mirror but its source hasn't changed since the last delta. The incremental delta wouldn't include the source event, so the classification logic never had a chance to detect drift. Full sync visits every source event, checks every mirror, catches the drift.
+- **Orphans.** Mirrors whose source was deleted, moved beyond horizon, or made ineligible (transparency, declined) while the daemon was down. The orphan walk in step 5 handles these.
+- **`accessRole` changes on calendars.** Step 1 re-fetches access roles. A target that lost writer access stops accepting writes; a source that gained writer access starts having its mirror drift propagated.
+
+What this does NOT catch (still documented limitations):
+
+- **Mirror-only recurring instance overrides** (a user-created override at a recurrence time the source has no override for). See the dedicated limitation section.
+- **Config changes.** Editing `config.toml` while the daemon is running has no effect; restart the daemon (`calendar-sync uninstall && calendar-sync install`) for changes to take effect.
 
 After each full re-sync the in-memory inventories are replaced atomically.
+
+#### Mirror inventory rebuild
+
+For each unique target, the rebuild runs two `events.list` calls in sequence:
+
+1. `privateExtendedProperty=calendar-sync:version=2` to find current-schema mirrors.
+2. `privateExtendedProperty=calendar-sync:version=1` to find legacy mirrors that haven't been migrated yet.
+
+Both responses are merged into the single in-memory inventory. v1 entries are flagged for migration; on first reconciliation each gets re-written with `version=2` and a fresh `calendar-sync:checksum` per the schema-migration rules.
+
+Without the v1 query, mirrors that were inserted before the schema bump would never appear in inventory and would never be reconciled or cleaned up - they'd become permanent zombies.
 
 ### Classification logic
 
@@ -1029,6 +1063,19 @@ Notes:
 - `calendar-sync:checksum` is set by a follow-up `events.patch` after the main write, using the post-write Event resource as the input to the hash. See "Drift detection model" / "Computing the checksum from the post-write event" for the algorithm and rationale.
 
 The `propagate` action uses a **different payload shape**: only the drifted managed fields, with the description trailer stripped, written to the **source** event. The mirror is then re-written separately with the full payload above and a fresh checksum derived from the new source state.
+
+### Sleep and wake
+
+macOS pauses long-running launchd processes (including those with `ProcessType=Interactive`) when the system sleeps and resumes them on wake. The in-memory state - syncTokens, mirror inventories, accessRoles, scheduler timers - survives sleep/wake intact. No special handling is needed for short sleeps.
+
+The daemon's internal scheduler is wall-clock-driven, not monotonic-clock-driven: each tick is computed as `next_tick = now.Truncate(poll_interval).Add(poll_interval)`, and similarly for the periodic-full-resync timer. This means after a sleep that crosses one or more tick boundaries:
+
+- The next tick fires immediately on wake (the wall-clock-derived next-tick time is already in the past).
+- The periodic full re-sync fires immediately on wake if the gap since the last completed full re-sync exceeds `full_sync_interval`.
+
+Result: a laptop that slept overnight wakes up to a single catch-up tick, and (if the sleep crossed `full_sync_interval`) a full re-sync follows. The catch-up tick uses the in-memory syncToken, which is normally still valid (Google's syncTokens have a tolerance of roughly a week before they're revoked). If the syncToken is stale, the standard 410 GONE recovery path triggers an immediate full re-sync for that source.
+
+A tick that was mid-flight when sleep hit (e.g., laptop closed during an `events.list` call) resumes from where it left off - the HTTPS connection may have been broken, in which case gws's transport layer surfaces a network error, and the daemon logs the failure and proceeds. The classification logic for events processed before the failure has already updated the in-memory mirror inventory; the affected pdir's syncToken stays at the pre-tick value (per the conditional-advancement rule), so the next tick re-fetches the delta and re-reconciles.
 
 ### Concurrency
 
@@ -1231,7 +1278,7 @@ else:
     exit 0
 ```
 
-Each pdir's state is saved independently on its own success.
+Each pdir's syncToken is advanced independently on its own success per the conditional-advancement rule.
 
 ## State
 
@@ -1252,9 +1299,34 @@ A cold start (process launch, restart after crash, system reboot) walks the same
 
 ### IPC socket
 
-The daemon binds a Unix domain socket at `$TMPDIR/calendar-sync.sock` for the `calendar-sync status` command to query live state. The socket file is created on startup, removed on clean shutdown, and treated as stale by `status` if it returns `ECONNREFUSED`. macOS sets `$TMPDIR` per-user, so the socket path is naturally scoped to one user's daemon.
+The daemon binds a Unix domain socket at `$TMPDIR/calendar-sync.sock` for the `calendar-sync status` command to query live state. macOS sets `$TMPDIR` per-user, so the path is naturally scoped to one user's daemon.
 
-The socket is the only filesystem artifact the daemon creates outside log files. It carries no persistent state - its existence is a runtime indicator, not a state record.
+#### Daemon-side lifecycle
+
+On `watch` startup, the bind sequence is:
+
+1. `stat()` the socket path. If it doesn't exist, proceed to step 4.
+2. If it exists, attempt to connect to it.
+3. **Connect succeeds** - another daemon is already running. Exit with `daemon_already_running` (a paranoia guard; launchd's `KeepAlive` should not normally produce this since it manages a single instance).
+4. **Connect returns `ECONNREFUSED` or the stat returned a non-socket file type** - the file is stale from a crashed daemon (or, weirdly, a non-socket file at the path). `unlink()` it.
+5. `bind()` and `listen()` on the socket path.
+
+On clean shutdown (SIGTERM or SIGINT received), the daemon `unlink()`s the socket before exiting. On crash (SIGKILL, panic, OS kill), the socket file remains until the next startup's stale-cleanup at step 4.
+
+If the path exists but is a non-socket file with the wrong owner or permissions, `unlink` may fail with `EACCES`/`EPERM`. The daemon logs this and exits 1; the user must remove the offending file manually. This shouldn't happen in practice since `$TMPDIR` is per-user.
+
+#### Client-side lifecycle (`status`)
+
+`calendar-sync status` connects to the socket and treats `ECONNREFUSED` (or the absence of the file) as "daemon not reachable":
+
+```json
+{"reachable":false}
+{"_meta":{"count":0}}
+```
+
+On other I/O errors (permission denied, stale stale socket file with wrong type), exits 1 with `socket_error`.
+
+The socket carries no persistent state. Its existence indicates the daemon is currently running; nothing more.
 
 ### Mirror identification queries (recap)
 

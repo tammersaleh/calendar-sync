@@ -22,6 +22,7 @@
 # Local Claude Code config (user-specific, not shared)
 CLAUDE.local.md
 .claude/CLAUDE.local.md
+.claude/scheduled_tasks.lock
 
 # Local state and crit artifacts (per-machine)
 state.json

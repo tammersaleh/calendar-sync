@@ -10,7 +10,7 @@ For each user-declared pair of calendars, calendar-sync mirrors busy events from
 - **Configuration-driven.** Every calendar pair and tunable lives in a TOML config file. No hardcoded calendars.
 - **Long-running daemon, polling under the hood.** `calendar-sync watch` runs continuously under launchd `KeepAlive`. An internal scheduler ticks every `poll_interval` and uses Google's `syncToken` for cheap incremental delta lists. Webhooks (`events.watch`) are out of scope: they require a verified HTTPS domain and an always-on host with a public endpoint, neither of which fits a laptop deployment.
 - **State on events. State in memory. Nothing on disk except config.** Mirror provenance lives in `extendedProperties.private` on each mirror event. Sync tokens, mirror inventories, and reconciliation state live in process memory and are rebuilt on a cold start. The only file under `~/.config/calendar-sync/` is `config.toml`.
-- **Single-process serialization.** Because the daemon is a single long-running process, there's no overlap window and no need for advisory locks. Manual `calendar-sync run` invocations refuse if the daemon is loaded under launchd.
+- **Single-process serialization.** Because the daemon is a single long-running process, there's no overlap window and no need for advisory locks. Manual `calendar-sync run` invocations refuse if the daemon is reachable via its IPC socket (regardless of how it was started). Deterministic mirror event IDs provide additional protection against the racey case where a daemon starts mid-`run`.
 - **Idempotent.** Reconciliation logic is keyed on stable identifiers (source event IDs, mirror checksum/source_updated). A daemon crash mid-sync or a cold restart re-derives the same state from Google.
 - **Edits flow both ways.** Source edits flow to the mirror (always). Mirror edits flow back to the source if the source is writable; otherwise the mirror is reverted to the source's values on the next sync cycle. The decision is determined by the source calendar's `accessRole` at config-load time. Read-only sources (subscribed iCal feeds, holiday calendars, `accessRole=reader` shares) are never written to. One carve-out: a user-created override on a recurring mirror with no source counterpart at the same recurrence time (i.e. the user dragged one occurrence to a different time on the mirror, and the source has no override at that occurrence) is not reconciled - see "Limitation: mirror-only instance overrides" below for the rationale.
 
@@ -82,18 +82,23 @@ mirror_id = "cs2" + lowercase(base32hex(sha256(canonical_source_calendar_id + ":
 
 The derivation depends only on source identity. Event IDs are calendar-scoped on Google's side, so `(target_calendar, mirror_id)` is already unique even if the same source event were mirrored to multiple target calendars (different targets produce different `(target_calendar, mirror_id)` tuples even with the same `mirror_id`). Pair names and directions are derived client-side from current config when needed for display; they aren't stored on the mirror, so renaming a pair touches no mirror events.
 
-This serves three purposes:
+Deterministic IDs are used **only for inserts of new mirrors**. They are not used as the inventory lookup key, because legacy mirrors (created before this design landed) have random Google-generated event IDs that don't match the deterministic derivation. Inventory is keyed by `(canonical_source_calendar_id, source_event_id)` parsed from each mirror's `calendar-sync:source` extended property, so legacy and deterministic-ID mirrors both look up identically.
 
-1. **Race-free concurrent insert.** If two processes try to mirror the same source event at the same moment (e.g. a daemon and a manual `calendar-sync run` racing through the socket-based exclusion check, or two tick handlers handling overlapping deltas), the deterministic ID makes both insert requests target the same event ID. Google rejects the second one with HTTP 409 (`reason=duplicate`); the losing process catches the conflict, fetches the existing mirror via `events.get?eventId=<computed>`, and continues as if the mirror already existed (which it now does). No duplicate mirrors, ever.
-2. **Cheap mirror lookup.** Instead of always querying `events.list?privateExtendedProperty=calendar-sync:source=...` to find a mirror, the daemon computes the expected ID and either reads it from the in-memory inventory (steady state) or does an `events.get` (warm path).
-3. **Stable across pair renames.** Renaming a pair in config doesn't change any mirror IDs because the derivation depends only on source identity. The mirror's extended properties also don't carry the pair name or direction (those are derived client-side from current config when needed for display), so there's nothing on the mirror to refresh. After a config rename and daemon restart, the existing mirrors map cleanly under the new pair name with no API writes.
+What deterministic IDs do guarantee:
 
-Cancelled-and-revived: Google retains the event ID after `events.delete` for some retention window. If a mirror was deleted (orphan cleanup, `mirror prune`) and then becomes eligible again, an `events.insert` with the same deterministic ID may return 409 with `reason=duplicate` even though `events.get?eventId=<id>` shows `status=cancelled`. The daemon handles this by:
+1. **Race-free concurrent insert for new mirrors.** When the inventory contains no entry for a given `(canonical_source_calendar_id, source_event_id)` tuple and the daemon (or a `run`) decides to insert, the deterministic ID is used as the explicit `id` in `events.insert`. If two processes race through this point with the same source event, both target the same Google event ID; Google rejects the second with HTTP 409 `duplicate`. The losing process catches the conflict, `events.get`s the just-inserted mirror, and continues. No duplicate mirrors, ever.
+2. **Stable across pair renames.** The derivation depends only on source identity; renaming a pair doesn't change anything about the mirror.
+
+Note: the duplicate-insert race is only possible for new mirrors. For source events that already have a mirror in the inventory (the steady-state common case, including all legacy mirrors), classification finds the mirror via the source-tuple key and runs in-place reconciliation against it - no insert, no race.
+
+Cancelled-and-revived: Google retains the event ID after `events.delete` for some retention window. If a mirror was deleted (orphan cleanup, `mirror prune`) and then becomes eligible again, an `events.insert` with the same deterministic ID may return 409 `duplicate` even though `events.get?eventId=<id>` shows `status=cancelled`. The daemon handles this by:
 
 1. Insert with deterministic ID.
 2. On 409 duplicate, `events.get` the ID.
 3. If the existing event is `status=cancelled`, call `events.patch?eventId=<id>` with `status=confirmed` plus the full mirror payload to revive it.
 4. If the existing event is alive, treat as "mirror already exists" and run the standard reconciliation.
+
+Legacy mirrors stay at their random Google IDs forever - calendar-sync does not migrate them to deterministic IDs. There's no functional reason to: lookup by source-tuple finds them, reconciliation works in place, drift detection works on their checksum just like any other mirror. The deterministic-ID guarantee applies only to NEW mirrors created by this version of calendar-sync onward.
 
 #### Loop prevention
 
@@ -389,7 +394,7 @@ Errors that prevent a command from running go to stderr as a single JSON object:
 | 2    | Auth error           | `gws auth status` reports unauthenticated, or 401 returned from a Calendar API call.          |
 | 3    | Rate limited         | Hit retry ceiling (5 retries, exponential backoff with jitter, respects `Retry-After`).       |
 | 4    | Network error        | DNS failure, connection refused, TLS error.                                                   |
-| 5    | Daemon already running | `calendar-sync run` was invoked while `calendar-sync watch` is loaded under launchd.        |
+| 5    | Daemon already running | `calendar-sync run` was invoked while `calendar-sync watch` is reachable on its IPC socket. |
 | 64   | Usage error          | Unknown command, missing required flag, invalid flag value.                                   |
 
 ## Global Flags
@@ -439,7 +444,7 @@ calendar-sync run [flags]
   --timeout <dur>      Wall-clock cap for the entire command. Default: 5m.
 ```
 
-`run` refuses to start if `calendar-sync watch` is loaded under launchd for the current user (detected via `launchctl print gui/<uid>/<label>`). Override is intentional friction: stop the daemon (`calendar-sync uninstall` or `launchctl unload`) before running manual reconciles. This avoids two processes racing on the same calendar pairs.
+`run` refuses to start if `calendar-sync watch` is reachable via its IPC socket at `$TMPDIR/calendar-sync.sock`. The check works regardless of how the daemon was started (launchd, manual `watch` in a terminal, anything else). The intent is intentional friction: stop the daemon (`calendar-sync uninstall` if launchd-managed, or signal the foreground daemon to exit) before running manual reconciles. Deterministic mirror IDs prevent duplicate creation in the race window where a daemon could start mid-`run`.
 
 Stdout: one JSON object per action plus `_meta`.
 
@@ -516,7 +521,7 @@ There's a TOCTOU window between the socket check and the start of `run`'s API ca
 | `rate_limited`        | 3    | 429 / 403 rateLimitExceeded / 403 userRateLimitExceeded retries exhausted.            |
 | `backend_error`       | 1    | 500 / 503 retries exhausted.                                                          |
 | `network_error`       | 4    | DNS, connection, or TLS failure beneath the gws subprocess.                           |
-| `daemon_already_running` | 5 | The `calendar-sync watch` daemon is loaded under launchd. Stop it before running a manual reconcile. |
+| `daemon_already_running` | 5 | The `calendar-sync watch` daemon is reachable on its IPC socket. Stop it before running a manual reconcile. |
 | `partial_failure`     | 1    | Some pdirs succeeded, others failed. `_meta.failures` lists them.                     |
 | `timeout`             | 1    | Exceeded `--timeout`.                                                                 |
 
@@ -868,7 +873,7 @@ Per source calendar (deduplicated across pdirs that share a source):
 Per target calendar (deduplicated across pdirs that share a target):
 - Canonical calendar ID
 - `accessRole`
-- Mirror inventory: a `map[deterministic_mirror_id] -> live mirror Event resource` containing every mirror calendar-sync currently has on this calendar
+- Mirror inventory: a `map[<canonical_source_calendar_id>:<source_event_id>] -> live mirror Event resource` containing every mirror calendar-sync currently has on this calendar. Keyed by the source-tuple parsed from each mirror's `calendar-sync:source` extended property, *not* by Google event ID. This handles legacy mirrors (created before deterministic IDs were specified) which have random Google event IDs that don't match the post-spec deterministic-ID derivation - lookups by source-tuple find them regardless.
 
 Per pdir:
 - Source canonical ID, target canonical ID
@@ -994,9 +999,9 @@ This runs once per source event `E` per pdir `(P, D)`. Called from both startup 
 
    If outside horizon: `skip(reason=outside_horizon)` and delete the mirror if one exists.
 
-7. **Normal reconciliation.** Compute the deterministic mirror ID from `(canonical_source_calendar_id, E.id)` and look it up in the inventory:
-   - **No mirror**: `events.insert` on `T` with the full mirror payload (including the deterministic `id`). Action `insert`, reason `source_updated`. Add the post-write resource to the inventory.
-     - **On HTTP 409 `duplicate`**: another process inserted the same mirror between our inventory build and our insert (e.g. concurrent `calendar-sync run` racing through the socket exclusion). `events.get?eventId=<deterministic_id>` to fetch the existing mirror. If `status=cancelled`, `events.patch` with `status=confirmed` and the full mirror payload to revive it (action `insert`, reason `source_updated`). If alive, treat as "mirror exists" and re-run normal reconciliation against the fetched resource (drift detection etc.). Either way add to inventory.
+7. **Normal reconciliation.** Look up the mirror in the inventory by `(canonical_source_calendar_id, E.id)`:
+   - **No mirror in inventory**: compute the deterministic mirror ID from `(canonical_source_calendar_id, E.id)` and `events.insert` on `T` with the full mirror payload (including the deterministic `id`). Action `insert`, reason `source_updated`. Add the post-write resource to the inventory.
+     - **On HTTP 409 `duplicate`**: another process inserted the same mirror between our inventory build and our insert (e.g. concurrent `calendar-sync run` racing through the socket exclusion, or a deleted mirror that Google still has the ID reserved for). `events.get?eventId=<deterministic_id>` to fetch the existing mirror. If `status=cancelled`, `events.patch?eventId=<deterministic_id>` with `status=confirmed` plus the full mirror payload to revive it (action `insert`, reason `source_updated`). If alive, treat as "mirror exists" and re-run normal reconciliation against the fetched resource (drift detection etc.). Either way add to inventory.
    - **Mirror exists**: compute the two drift-detection signals from "Drift detection model":
      - `source_changed = E.updated > mirror.calendar-sync:source_updated`
      - `mirror_drifted = sha256(canonical(mirror.<managed fields>)) != mirror.calendar-sync:checksum`. If `version < 2` on the mirror, derive `mirror_drifted` per the "Schema version migration" rules instead.
@@ -1105,7 +1110,7 @@ Every API call is keyed by stable identifiers (source event ID for find, determi
 
 A daemon crash mid-tick is recoverable: launchd's `KeepAlive` restarts the process, the cold-start path rebuilds inventories from Google, and reconciliation converges on the same end state.
 
-A manual `calendar-sync run` and the daemon don't interleave because `run` refuses if the daemon is loaded under launchd.
+A manual `calendar-sync run` and the daemon don't interleave: `run` refuses if the daemon is reachable via the IPC socket, and deterministic mirror IDs eliminate duplicate-insert risk if they ever did overlap (the race window between `run`'s socket check and the daemon starting is closed by Google's HTTP 409 on conflicting event IDs).
 
 ## Recurring Events
 
@@ -1232,7 +1237,7 @@ Complete list of error codes:
 | `binary_not_resolvable`  | 1    | install          | calendar-sync's own binary path can't be determined.                                                 |
 | `write_failed`           | 1    | init             | Filesystem error writing the starter config.                                                         |
 | `timeout`                | 1    | run              | Exceeded `--timeout`.                                                                                |
-| `daemon_already_running` | 5    | run              | The `watch` daemon is loaded under launchd. Stop it before running a manual reconcile.               |
+| `daemon_already_running` | 5    | run              | The `watch` daemon is reachable on its IPC socket. Stop it before running a manual reconcile.        |
 | `socket_error`           | 1    | status           | Socket file exists but I/O failed for non-`ECONNREFUSED` reasons.                                    |
 
 ### Error format on stderr
@@ -1304,7 +1309,7 @@ What lives in process memory:
 - Canonical calendar IDs and `accessRole`s for every calendar referenced in config (resolved at startup).
 - Per-source `syncToken` (one token per unique source calendar; pdirs sharing a source share the token).
 - Per-source last-full-sync timestamp.
-- Per-target mirror inventory (a map from deterministic mirror ID to live Event resource, supplemented by a reverse index from source event ID for the orphan walk).
+- Per-target mirror inventory (a map from `(canonical_source_calendar_id, source_event_id)` tuple to live Event resource).
 
 What survives across daemon restarts:
 

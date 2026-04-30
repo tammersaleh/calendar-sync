@@ -7,33 +7,45 @@ For each user-declared pair of calendars, calendar-sync mirrors busy events from
 ## Design Principles
 
 - **Google Workspace only.** No iCloud, no Outlook, no CalDAV. All Google Calendar interactions go through the `gws` CLI; calendar-sync never holds OAuth credentials directly.
-- **Configuration-driven.** Every calendar pair, account, and tunable lives in a TOML config file. No hardcoded calendars or accounts.
-- **Polling, not push.** Phase 1 uses incremental polling via Google's `syncToken`. Webhooks (`events.watch`) are deferred until cloud deployment because they need a verified HTTPS domain and an always-on host.
-- **State on events, not on disk.** Mirror provenance lives in `extendedProperties.private` on each mirror event. The on-disk state is one syncToken plus one full-sync timestamp per pair-direction.
-- **One-shot by default.** `calendar-sync run` performs a single sync and exits. macOS launchd drives the cadence. A long-running daemon mode is a non-goal for Phase 1.
-- **Idempotent and overlap-safe.** Running `calendar-sync run` twice in a row with no calendar changes is a no-op. A second invocation while one is still running exits cleanly without doing anything.
-- **Edits flow both ways.** Source edits flow to the mirror (always). Mirror edits flow back to the source if the source is writable; otherwise the mirror is reverted to the source's values on the next sync. The decision is determined by the source calendar's `accessRole` at config-load time. Read-only sources (subscribed iCal feeds, holiday calendars, `accessRole=reader` shares) are never written to. One carve-out: a user-created override on a recurring mirror with no source counterpart at the same recurrence time (i.e. the user dragged one occurrence to a different time on the mirror, and the source has no override at that occurrence) is not reconciled. See Phase 3 for the limitation and rationale.
+- **Configuration-driven.** Every calendar pair and tunable lives in a TOML config file. No hardcoded calendars.
+- **Long-running daemon, polling under the hood.** `calendar-sync watch` runs continuously under launchd `KeepAlive`. An internal scheduler ticks every `poll_interval` and uses Google's `syncToken` for cheap incremental delta lists. Webhooks (`events.watch`) are out of scope: they require a verified HTTPS domain and an always-on host with a public endpoint, neither of which fits a laptop deployment.
+- **State on events. State in memory. Nothing on disk except config.** Mirror provenance lives in `extendedProperties.private` on each mirror event. Sync tokens, mirror inventories, and reconciliation state live in process memory and are rebuilt on a cold start. The only file under `~/.config/calendar-sync/` is `config.toml`.
+- **Single-process serialization.** Because the daemon is a single long-running process, there's no overlap window and no need for advisory locks. Manual `calendar-sync run` invocations refuse if the daemon is loaded under launchd.
+- **Idempotent.** Reconciliation logic is keyed on stable identifiers (source event IDs, mirror checksum/source_updated). A daemon crash mid-sync or a cold restart re-derives the same state from Google.
+- **Edits flow both ways.** Source edits flow to the mirror (always). Mirror edits flow back to the source if the source is writable; otherwise the mirror is reverted to the source's values on the next sync cycle. The decision is determined by the source calendar's `accessRole` at config-load time. Read-only sources (subscribed iCal feeds, holiday calendars, `accessRole=reader` shares) are never written to. One carve-out: a user-created override on a recurring mirror with no source counterpart at the same recurrence time (i.e. the user dragged one occurrence to a different time on the mirror, and the source has no override at that occurrence) is not reconciled - see "Limitation: mirror-only instance overrides" below for the rationale.
 
 ## Architecture
 
 ### Components
 
 ```
-+--------------------+     +----------------+     +---------------------+
-|  calendar-sync run | --> | gws (subproc)  | --> | Google Calendar API |
-+--------------------+     +----------------+     +---------------------+
+                   launchd (KeepAlive)
+                          |
+                          v
++----------------------+     +----------------+     +---------------------+
+|  calendar-sync watch | --> | gws (subproc)  | --> | Google Calendar API |
+|   (long-running)     |     +----------------+     +---------------------+
++----------------------+
          |
-         |  reads/writes
+         |  reads (config only)
          v
 +----------------------------+
 | ~/.config/calendar-sync/   |
 |   config.toml              |
-|   state.json (per-pdir)    |
-|   <state_file>.lock        |
 +----------------------------+
+
+  in-memory state:
+    canonical calendar IDs
+    accessRole per calendar
+    sync_token per pdir
+    mirror inventory per target
 ```
 
 calendar-sync is a Go binary that shells out to `gws calendar events ...` for every Calendar API operation. It does not use a Go SDK for Google APIs. Auth and OAuth concerns stay inside `gws` where the user has already invested setup.
+
+The primary deployment is `calendar-sync watch`, a long-running daemon launchd starts at user login and restarts on crash via `KeepAlive`. The daemon owns all sync state in memory; it persists nothing except via mirror events on Google Calendar themselves.
+
+`calendar-sync run` exists as a one-shot for manual catch-up, CI, and testing. It refuses to run while `watch` is loaded by launchd.
 
 ### The unit of sync: pair-direction
 
@@ -63,7 +75,7 @@ Google's events.list documentation is internally inconsistent about whether mult
 
 #### Canonical calendar IDs
 
-The `calendar-sync:source` property uses the **canonical** calendar ID, never the alias `primary`. At config-load time, calendar-sync resolves every calendar reference (including `primary`) to its canonical ID via `gws calendar calendarList get`. Canonicalized IDs are used everywhere downstream: state file keys, extended properties, log fields. This survives config reorderings and Phase-2 multi-account migration.
+The `calendar-sync:source` property uses the **canonical** calendar ID, never the alias `primary`. At config-load time, calendar-sync resolves every calendar reference (including `primary`) to its canonical ID via `gws calendar calendarList get`. Canonicalized IDs are used everywhere downstream: in-memory state keys, extended properties, log fields. This survives config edits where the user swaps `primary` for the explicit email or vice versa.
 
 #### Loop prevention
 
@@ -186,64 +198,49 @@ horizon = "365d"
 full_sync_interval = "24h"
 log_level = "info"
 log_format = "json"
-state_file = "~/.config/calendar-sync/state.json"
-
-# Phase 1 supports a single account named "default". The [accounts]
-# section is keyed in anticipation of Phase 2 multi-account.
-[accounts.default]
-gws_config_dir = "~/.config/gws"
 
 [[pairs]]
 name = "work-personal"
 direction = "bidirectional"
-source = { account = "default", calendar = "alice@example.com" }
-target = { account = "default", calendar = "primary" }
+source = "alice@example.com"
+target = "primary"
 
 [[pairs]]
 name = "work-family"
 direction = "source_to_target"
-source = { account = "default", calendar = "alice@example.com" }
-target = { account = "default", calendar = "family@group.calendar.google.com" }
+source = "alice@example.com"
+target = "family@group.calendar.google.com"
 ```
+
+calendar-sync uses whatever account `gws auth status` reports. Multi-account support is out of scope; the user is responsible for ensuring the `gws`-authenticated account has appropriate access to every calendar referenced in config (typically achieved by sharing each calendar with the gws-authenticated account in Google Calendar's UI).
 
 ### Schema
 
 #### `[settings]`
 
-| Field                | Type     | Default                              | Description                                                                                                       |
-|----------------------|----------|--------------------------------------|-------------------------------------------------------------------------------------------------------------------|
-| `poll_interval`      | duration | `60s`                                | Cadence for the launchd plist. Used by `calendar-sync install`. Min `30s`.                                        |
-| `horizon`            | duration | `365d`                               | How far ahead to mirror. Source events with `start > now + horizon` are skipped at apply time.                    |
-| `full_sync_interval` | duration | `24h`                                | Force a full re-list (ignoring saved syncToken) at least this often per pdir. Bounds the sliding-horizon problem. |
-| `log_level`          | string   | `info`                               | One of `debug`, `info`, `warn`, `error`.                                                                          |
-| `log_format`         | string   | `json`                               | One of `json` (JSONL to stderr), `text` (human-readable to stderr).                                               |
-| `state_file`         | path     | `~/.config/calendar-sync/state.json` | Where to persist per-pdir state. Tilde-expanded; parent directory created on demand.                              |
-| `dry_run`            | bool     | `false`                              | If true, log what would change but make no API writes. Equivalent to passing `--dry-run` to every `run`.          |
+| Field                | Type     | Default | Description                                                                                                                  |
+|----------------------|----------|---------|------------------------------------------------------------------------------------------------------------------------------|
+| `poll_interval`      | duration | `60s`   | Internal scheduler cadence inside the daemon. Min `15s`.                                                                     |
+| `horizon`            | duration | `365d`  | How far ahead to mirror. Source events with `start > now + horizon` are skipped at apply time.                               |
+| `full_sync_interval` | duration | `24h`   | How often the daemon does an internal full re-sync per pdir (rebuilds source inventory, refreshes `syncToken`, catches horizon ingress). Min `1h`, max `30d`. |
+| `log_level`          | string   | `info`  | One of `debug`, `info`, `warn`, `error`.                                                                                     |
+| `log_format`         | string   | `json`  | One of `json` (JSONL to stderr), `text` (human-readable to stderr).                                                          |
+| `dry_run`            | bool     | `false` | If true, log what would change but make no API writes. Reads still happen.                                                   |
 
 Duration strings follow Go's `time.ParseDuration` syntax (`30s`, `5m`, `24h`) plus `d` (days) which calendar-sync adds.
 
-#### `[accounts.<name>]`
-
-Each entry under `[accounts]` declares a gws identity.
-
-| Field            | Type | Default          | Description                                                                                              |
-|------------------|------|------------------|----------------------------------------------------------------------------------------------------------|
-| `gws_config_dir` | path | `~/.config/gws`  | Directory passed to `gws` via the `XDG_CONFIG_HOME` environment override when invoked for this account.  |
-
-Phase 1 honors only the account named `default`. Pairs that reference any other account name fail validation. Phase 2 lifts this.
-
 #### `[[pairs]]`
 
-| Field         | Type     | Required  | Description                                                                                                                                                       |
-|---------------|----------|-----------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `name`        | string   | yes       | Unique. Used as the `calendar-sync:pair` extended property and in logs. Must match `^[a-z0-9][a-z0-9-]{0,62}$`.                                                  |
-| `direction`   | string   | yes       | One of `source_to_target`, `target_to_source`, `bidirectional`.                                                                                                   |
-| `source`      | table    | yes       | `{ account = "<name>", calendar = "<id>" }`. The "left" calendar.                                                                                                 |
-| `target`      | table    | yes       | `{ account = "<name>", calendar = "<id>" }`. The "right" calendar.                                                                                                |
-| `enabled`     | bool     | no (true) | If false, the pair is skipped entirely.                                                                                                                           |
-| `time_zone`   | string   | no        | IANA name (e.g. `America/New_York`). Used as the `timeZone` on mirrored events when the source event is all-day. Defaults to the destination calendar's default. |
+| Field       | Type   | Required  | Description                                                                                                                                                  |
+|-------------|--------|-----------|--------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `name`      | string | yes       | Unique. Used as the `calendar-sync:pair` extended property and in logs. Must match `^[a-z0-9][a-z0-9-]{0,62}$`.                                            |
+| `direction` | string | yes       | One of `source_to_target`, `target_to_source`, `bidirectional`.                                                                                              |
+| `source`    | string | yes       | Calendar ID for the "left" calendar.                                                                                                                         |
+| `target`    | string | yes       | Calendar ID for the "right" calendar.                                                                                                                        |
+| `enabled`   | bool   | no (true) | If false, the pair is skipped entirely.                                                                                                                      |
+| `time_zone` | string | no        | IANA name (e.g. `America/New_York`). Used as the `timeZone` on mirrored events when the source event is all-day. Defaults to the destination calendar's default. |
 
-Calendar IDs accepted: a calendar email (`alice@example.com`), the literal `primary` (which calendar-sync resolves to its canonical ID), or a group calendar ID (`<hash>@group.calendar.google.com`).
+Calendar IDs accepted: an email address (`alice@example.com`), the literal `primary` (which calendar-sync resolves to its canonical ID), or a group calendar ID (`<hash>@group.calendar.google.com`).
 
 #### Validation rules
 
@@ -251,10 +248,9 @@ Run on every command that touches config. Failures exit with code 1 and a JSON e
 
 - `name` is unique across all pairs.
 - `direction` is one of the three allowed values (case-sensitive).
-- `source.account` and `target.account` are both declared in `[accounts]`.
-- After canonicalization, `source.calendar != target.calendar`. Mirroring a calendar to itself is rejected.
+- After canonicalization, `source != target`. Mirroring a calendar to itself is rejected.
 - After canonicalization and pdir expansion, no two pdirs share the same `(canonical_source, canonical_target, direction)` triple. Two pdirs writing identical mirrors to the same calendar is a configuration bug.
-- `poll_interval >= 30s`.
+- `poll_interval >= 15s`.
 - `horizon` is between `1d` and `730d` inclusive.
 - `full_sync_interval` is between `1h` and `30d` inclusive.
 - `log_level` is one of the four allowed values.
@@ -275,8 +271,8 @@ Run on every command that touches config. Failures exit with code 1 and a JSON e
 [[pairs]]
 name = "primary-pair"
 direction = "bidirectional"
-source = { account = "default", calendar = "alice@example.com" }
-target = { account = "default", calendar = "primary" }
+source = "alice@example.com"
+target = "primary"
 ```
 
 #### Three pairs, mixed directions
@@ -286,25 +282,23 @@ target = { account = "default", calendar = "primary" }
 poll_interval = "60s"
 horizon = "365d"
 
-[accounts.default]
-
 [[pairs]]
 name = "work-personal"
 direction = "bidirectional"
-source = { account = "default", calendar = "alice@example.com" }
-target = { account = "default", calendar = "primary" }
+source = "alice@example.com"
+target = "primary"
 
 [[pairs]]
 name = "work-family"
 direction = "source_to_target"
-source = { account = "default", calendar = "alice@example.com" }
-target = { account = "default", calendar = "family@group.calendar.google.com" }
+source = "alice@example.com"
+target = "family@group.calendar.google.com"
 
 [[pairs]]
 name = "personal-family"
 direction = "source_to_target"
-source = { account = "default", calendar = "primary" }
-target = { account = "default", calendar = "family@group.calendar.google.com" }
+source = "primary"
+target = "family@group.calendar.google.com"
 enabled = false
 ```
 
@@ -312,19 +306,13 @@ enabled = false
 
 calendar-sync delegates all authentication to `gws`.
 
-### Phase 1 (single account)
-
 - The user runs `gws auth login` once.
 - `~/.config/gws/credentials.enc` holds the encrypted token; `gws` refreshes it transparently.
 - calendar-sync invokes `gws` as a subprocess. Whatever account `gws auth status` reports is what calendar-sync uses.
 
-The user is responsible for ensuring this single account has **read+write access to every calendar referenced in the config**. For the typical mixed work/personal use case, this means sharing the personal Google calendar with the work account (or vice versa) via Google Calendar's calendar-sharing UI before configuring calendar-sync.
+The user is responsible for ensuring this single `gws`-authenticated account has **appropriate access to every calendar referenced in the config** (`accessRole >= reader` for sources, `>= writer` for targets). For the typical mixed work/personal use case, this means sharing the personal Google calendar with the work account (or vice versa) via Google Calendar's calendar-sharing UI before configuring calendar-sync.
 
-`calendar-sync run` calls `gws auth status` once at startup and exits with code 2 if it returns non-zero.
-
-### Phase 2 (multi-account)
-
-Each `[accounts.<name>]` entry declares its own `gws_config_dir`. calendar-sync sets `XDG_CONFIG_HOME=<dir>` when shelling out for that account. The user runs `XDG_CONFIG_HOME=<dir> gws auth login` once per account, or uses the wrapper `calendar-sync auth login --account <name>`.
+`calendar-sync watch` and `calendar-sync run` both call `gws auth status` at startup and exit with code 2 if it returns non-zero.
 
 ## Privacy and the mirror payload
 
@@ -334,7 +322,7 @@ This is intentional: the user creating the pairs controls the destination calend
 
 There's a related caveat for **`reader`-access source calendars**: per Google's sharing model, events with `visibility=private` on a source where the user only has `reader` access have their `summary`, `description`, and other details hidden. Such events come back from `events.list` with empty or stripped fields. calendar-sync mirrors what Google returns, so a private source event on a reader-access calendar produces a mirror with an empty title and description (still marked busy and at the right time). For TripIt and other public-by-default subscriptions this isn't an issue; for shared calendars where the sharer marks events private, the mirror won't carry details. Workaround: ask the source calendar owner for `writer` access.
 
-Phase 2 will offer redaction modes (`title_template`, `redact_description`) for users who need them.
+Redaction modes (`title_template`, `redact_description`) are out of scope for this version.
 
 ### Edits flow back too
 
@@ -348,8 +336,8 @@ Most commands produce JSONL (newline-delimited JSON) ending with a `_meta` trail
 
 ```
 $ calendar-sync pair list
-{"name":"work-personal","direction":"bidirectional","source":{"account":"default","calendar":"alice@example.com"},"target":{"account":"default","calendar":"primary"},"enabled":true}
-{"name":"work-family","direction":"source_to_target","source":{"account":"default","calendar":"alice@example.com"},"target":{"account":"default","calendar":"family@group.calendar.google.com"},"enabled":true}
+{"name":"work-personal","direction":"bidirectional","source":"alice@example.com","target":"primary","enabled":true}
+{"name":"work-family","direction":"source_to_target","source":"alice@example.com","target":"family@group.calendar.google.com","enabled":true}
 {"_meta":{"count":2}}
 ```
 
@@ -380,12 +368,12 @@ Errors that prevent a command from running go to stderr as a single JSON object:
 
 | Code | Meaning              | When                                                                                          |
 |------|----------------------|-----------------------------------------------------------------------------------------------|
-| 0    | Success              | Command ran to completion. For `run`, all pdirs synced or the lock-already-held shortcut hit. |
+| 0    | Success              | Command ran to completion.                                                                    |
 | 1    | General error        | Config invalid, gws subprocess failed for non-auth reasons, partial sync failure.             |
 | 2    | Auth error           | `gws auth status` reports unauthenticated, or 401 returned from a Calendar API call.          |
 | 3    | Rate limited         | Hit retry ceiling (5 retries, exponential backoff with jitter, respects `Retry-After`).       |
 | 4    | Network error        | DNS failure, connection refused, TLS error.                                                   |
-| 5    | State corrupt        | `state.json` is unreadable or malformed and `--reset-state` was not passed.                   |
+| 5    | Daemon already running | `calendar-sync run` was invoked while `calendar-sync watch` is loaded under launchd.        |
 | 64   | Usage error          | Unknown command, missing required flag, invalid flag value.                                   |
 
 ## Global Flags
@@ -406,19 +394,36 @@ Precedence: CLI flag > env var > config file > built-in default.
 
 ## Commands
 
+### calendar-sync watch
+
+The primary deployment. Long-running daemon that owns sync state in process memory. launchd starts it at user login (`RunAtLoad=true`) and restarts it on crash (`KeepAlive=true`).
+
+```
+calendar-sync watch [flags]
+  --timeout <dur>      Wall-clock cap for any single source-list or mirror-list call. Default: 5m. (Process itself runs forever.)
+```
+
+The daemon does a full startup sync, then ticks every `poll_interval` for incremental deltas, with a periodic full re-sync every `full_sync_interval` (see "Sync Algorithm"). Logs each tick's actions to stdout as JSONL and operational events to stderr.
+
+`watch` is normally started indirectly via `calendar-sync install`, which writes the launchd plist. Running `calendar-sync watch` directly in a terminal is supported for debugging - it foregrounds the same code path.
+
+#### Errors
+
+Same set as `run` below, plus the daemon exits non-zero on unrecoverable startup errors (config invalid, gws_auth_failed, etc.). launchd's `KeepAlive` will restart it; if the same error persists, launchd applies its standard exponential-backoff between restarts.
+
 ### calendar-sync run
 
-Perform one sync pass across all enabled pdirs and exit. This is the command launchd invokes.
+A one-shot full reconcile. Useful for: testing config changes before installing the daemon, manual catch-up, CI/automation. Equivalent to running the startup path of `watch` once and exiting.
 
 ```
 calendar-sync run [flags]
-  --pair <name>        Sync only the named pair. May be repeated. Default: all enabled pairs.
+  --pair <name>        Reconcile only the named pair. May be repeated. Default: all enabled pairs.
   --direction <dir>    Limit to one direction within each pair. One of a_to_b, b_to_a. Default: both where applicable.
   --dry-run            Plan and print actions but make no API writes. Reads still happen.
-  --reset-state        Discard saved syncTokens before running. Forces a full re-list of every relevant pdir.
-  --no-prune           Skip the orphaned-mirror cleanup pass.
   --timeout <dur>      Wall-clock cap for the entire command. Default: 5m.
 ```
+
+`run` refuses to start if `calendar-sync watch` is loaded under launchd for the current user (detected via `launchctl print gui/<uid>/<label>`). Override is intentional friction: stop the daemon (`calendar-sync uninstall` or `launchctl unload`) before running manual reconciles. This avoids two processes racing on the same calendar pairs.
 
 Stdout: one JSON object per action plus `_meta`.
 
@@ -472,13 +477,9 @@ Possible `msg` values:
 
 The `source_updated` and `mirror_updated` fields show the timestamps that drove the newer-wins decision (omitted on `migration_source_won` since v1 mirrors have no comparable timestamp), so the user can verify it was the call they wanted.
 
-#### Overlap protection
+#### Daemon-running detection
 
-`run` acquires an advisory lock via `flock(LOCK_EX | LOCK_NB)` immediately after argument parsing. The lock file lives at `<state_file>.lock` (so it sits next to the state file - default `~/.config/calendar-sync/state.json.lock`). Scoping the lock to the state file means two unrelated calendar-sync configs (different `--config`, different `state_file`) on the same machine don't serialize each other.
-
-If the lock is held by another `calendar-sync run` process for the same state file, the new invocation logs `already_running` to stderr at level `info` and exits **0** (this is normal, not a failure). The launchd cycle just lost a tick; the next tick picks up.
-
-The lock is released automatically when the process exits, including on crash.
+`run` calls `launchctl print gui/<uid>/org.calendar-sync.agent` (or whichever `Label` the user installed - the binary tracks its own default label) and inspects the exit code. Non-zero means not loaded; `run` proceeds. Zero means the daemon is loaded and `run` aborts with `daemon_already_running` (exit 5) before any API calls. The intent is to prevent a manual `run` from racing with the daemon's own scheduler over the same calendars.
 
 #### Errors
 
@@ -493,28 +494,27 @@ The lock is released automatically when the process exits, including on crash.
 | `rate_limited`        | 3    | 429 / 403 rateLimitExceeded / 403 userRateLimitExceeded retries exhausted.            |
 | `backend_error`       | 1    | 500 / 503 retries exhausted.                                                          |
 | `network_error`       | 4    | DNS, connection, or TLS failure beneath the gws subprocess.                           |
-| `state_corrupt`       | 5    | `state.json` is unreadable. Use `--reset-state` to discard.                           |
+| `daemon_already_running` | 5 | The `calendar-sync watch` daemon is loaded under launchd. Stop it before running a manual reconcile. |
 | `partial_failure`     | 1    | Some pdirs succeeded, others failed. `_meta.failures` lists them.                     |
 | `timeout`             | 1    | Exceeded `--timeout`.                                                                 |
 
-`run` does not abort on the first error. Each pdir is tried independently. A single pdir failure causes exit 1 at the end with `partial_failure`, but every other pdir gets its chance and saves its own state on success.
+`run` does not abort on the first error. Each pdir is tried independently. A single pdir failure causes exit 1 at the end with `partial_failure`, but every other pdir gets its chance.
 
 #### Examples
 
 ```
-# Normal launchd-driven invocation
-calendar-sync run
-
 # Test config without writing
 calendar-sync run --dry-run
 
-# Force a full re-list everywhere
-calendar-sync run --reset-state
+# Manual catch-up (with daemon stopped first)
+calendar-sync uninstall
+calendar-sync run
+calendar-sync install
 
-# Sync only one pair
+# Reconcile only one pair
 calendar-sync run --pair work-personal
 
-# Sync only one direction of one pair
+# Reconcile only one direction of one pair
 calendar-sync run --pair work-personal --direction a_to_b
 ```
 
@@ -557,7 +557,7 @@ Stdout:
 
 ```
 $ calendar-sync config show
-{"settings":{"poll_interval":"60s","horizon":"365d","full_sync_interval":"24h","log_level":"info","log_format":"json","state_file":"~/.config/calendar-sync/state.json","dry_run":false},"accounts":{"default":{"gws_config_dir":"~/.config/gws"}},"pairs":[{"name":"work-personal","direction":"bidirectional","source":{"account":"default","calendar":"alice@example.com"},"target":{"account":"default","calendar":"primary"},"enabled":true}]}
+{"settings":{"poll_interval":"60s","horizon":"365d","full_sync_interval":"24h","log_level":"info","log_format":"json","dry_run":false},"pairs":[{"name":"work-personal","direction":"bidirectional","source":"alice@example.com","target":"primary","enabled":true}]}
 {"_meta":{"count":1}}
 ```
 
@@ -600,7 +600,7 @@ calendar-sync pair list [flags]
 
 ```
 $ calendar-sync pair list
-{"name":"work-personal","direction":"bidirectional","source":{"account":"default","calendar":"alice@example.com"},"target":{"account":"default","calendar":"primary"},"enabled":true}
+{"name":"work-personal","direction":"bidirectional","source":"alice@example.com","target":"primary","enabled":true}
 {"_meta":{"count":1}}
 ```
 
@@ -628,7 +628,6 @@ List mirror events on a calendar.
 
 ```
 calendar-sync mirror list <calendar> [flags]
-  --account <name>     Account that owns the calendar. Default: default.
   --pair <name>        Only mirrors created by this pair (any direction).
   --direction <dir>    With --pair, limit to a_to_b or b_to_a.
   --orphaned           Only mirrors whose source no longer exists. Triggers per-mirror source lookup.
@@ -657,7 +656,6 @@ Delete mirror events from a calendar.
 
 ```
 calendar-sync mirror prune <calendar> [flags]
-  --account <name>     Account that owns the calendar. Default: default.
   --pair <name>        Only delete mirrors created by this pair.
   --direction <dir>    With --pair, limit to a_to_b or b_to_a.
   --orphaned           Only delete mirrors whose source no longer exists.
@@ -683,66 +681,47 @@ $ calendar-sync mirror prune primary --orphaned --yes
 | `selector_required`      | 1    | None of `--pair`, `--orphaned`, `--all` provided.       |
 | `confirmation_required`  | 1    | Non-TTY without `--yes`.                                |
 
-### calendar-sync state show
+### calendar-sync status
+
+Report whether the daemon is loaded and, if so, its current per-pdir state. The daemon doesn't persist state to disk, so this command works in two modes:
+
+- **Daemon loaded**: connects to the daemon over a Unix domain socket at `$TMPDIR/calendar-sync.sock` (per-user; macOS sets `$TMPDIR` per user). The daemon serves a `GET /status` request that returns the live in-memory state.
+- **Daemon not loaded**: reports loaded=false and exits 0. There's nothing to query.
+
+The socket is created by the daemon on startup and removed on clean shutdown. On crash or kill, the socket file may be stale; `status` handles `ECONNREFUSED` on a stale socket as "not loaded."
 
 ```
-calendar-sync state show
+calendar-sync status
 ```
 
-Stdout:
+Stdout when daemon loaded:
 
 ```
-$ calendar-sync state show
-{"pdir":"work-personal:a_to_b","source_calendar":"alice@example.com","target_calendar":"alice.personal@example.org","checkpoint":{"sync_token":"CPDC...","full_sync_at":"2026-04-29T03:00:00Z","query_fingerprint":"sha256:abc..."},"last_attempt_at":"2026-04-29T23:00:00Z","last_synced_at":"2026-04-29T23:00:00Z","last_status":"ok","last_error":null}
-{"pdir":"work-personal:b_to_a","source_calendar":"alice.personal@example.org","target_calendar":"alice@example.com","checkpoint":{"sync_token":"CMD3...","full_sync_at":"2026-04-29T03:00:00Z","query_fingerprint":"sha256:abc..."},"last_attempt_at":"2026-04-29T23:00:00Z","last_synced_at":"2026-04-29T23:00:00Z","last_status":"ok","last_error":null}
+{"loaded":true,"pid":54321,"started_at":"2026-04-30T08:00:00Z","poll_interval":"60s","full_sync_interval":"24h","last_full_sync_at":"2026-04-30T08:00:00Z"}
+{"pdir":"work-personal:a_to_b","source_calendar":"alice@example.com","target_calendar":"alice.personal@example.org","mirrors":1245,"last_tick_at":"2026-04-30T20:55:30Z","last_tick_status":"ok","last_tick_inserts":0,"last_tick_patches":1,"last_tick_deletes":0,"last_tick_propagates":0,"last_tick_reverts":0,"last_tick_skips":2}
+{"pdir":"work-personal:b_to_a","source_calendar":"alice.personal@example.org","target_calendar":"alice@example.com","mirrors":782,"last_tick_at":"2026-04-30T20:55:30Z","last_tick_status":"ok","last_tick_inserts":0,"last_tick_patches":0,"last_tick_deletes":0,"last_tick_propagates":0,"last_tick_reverts":0,"last_tick_skips":1}
 {"_meta":{"count":2}}
 ```
 
-If `state.json` does not exist: just `{"_meta":{"count":0}}`. Exit 0.
-
-#### Errors
-
-| Error code      | Exit | When                                  |
-|-----------------|------|---------------------------------------|
-| `state_corrupt` | 5    | `state.json` exists but won't parse.  |
-
-### calendar-sync state reset
-
-Clear saved sync state.
+Stdout when daemon not loaded:
 
 ```
-calendar-sync state reset [flags]
-  --pair <name>     Only clear pdirs of this pair.
-  --direction <dir> With --pair, limit to a_to_b or b_to_a.
-  --pdir <id>       Clear a specific pdir, e.g. "work-personal:a_to_b". May be repeated.
-  --yes, -y         Skip the interactive confirmation (required on non-TTY).
-```
-
-Without selectors, every entry in `state.json` is cleared. Confirmation is required.
-
-```
-$ calendar-sync state reset --pair work-personal --yes
-{"pdir":"work-personal:a_to_b","cleared":true}
-{"pdir":"work-personal:b_to_a","cleared":true}
-{"_meta":{"count":2}}
+{"loaded":false}
+{"_meta":{"count":0}}
 ```
 
 #### Errors
 
-| Error code              | Exit | When                                                      |
-|-------------------------|------|-----------------------------------------------------------|
-| `pair_not_found`        | 1    | `--pair <name>` doesn't match.                            |
-| `pdir_not_found`        | 1    | `--pdir <id>` doesn't match a configured pdir.            |
-| `confirmation_required` | 1    | Non-TTY without `--yes`.                                  |
-| `state_corrupt`         | 5    | Existing `state.json` won't parse and reset isn't full.   |
+| Error code      | Exit | When                                                  |
+|-----------------|------|-------------------------------------------------------|
+| `socket_error`  | 1    | Socket file exists but I/O failed for non-`ECONNREFUSED` reasons. |
 
 ### calendar-sync install
 
-Install the launchd agent.
+Install the launchd agent that runs `calendar-sync watch`.
 
 ```
 calendar-sync install [flags]
-  --interval <dur>   Override settings.poll_interval. Min 30s.
   --log-dir <path>   Where launchd writes stdout/stderr. Default: ~/Library/Logs/calendar-sync/.
   --label <id>       launchd Label. Default: org.calendar-sync.agent.
   --force            Overwrite an existing plist.
@@ -751,11 +730,37 @@ calendar-sync install [flags]
 
 ```
 $ calendar-sync install
-{"plist":"/Users/alice/Library/LaunchAgents/org.calendar-sync.agent.plist","interval":"60s","loaded":true}
+{"plist":"/Users/alice/Library/LaunchAgents/org.calendar-sync.agent.plist","loaded":true}
 {"_meta":{"count":1}}
 ```
 
-The plist sets `StartInterval` to the resolved interval (in seconds), `ProgramArguments` to `[<absolute path to calendar-sync>, "run"]`, and `EnvironmentVariables` includes `PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin` so `gws` is found.
+The plist generated:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>org.calendar-sync.agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/calendar-sync</string>
+        <string>watch</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>StandardOutPath</key><string>/Users/alice/Library/Logs/calendar-sync/calendar-sync.out.log</string>
+    <key>StandardErrorPath</key><string>/Users/alice/Library/Logs/calendar-sync/calendar-sync.err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
+```
+
+`KeepAlive=true` makes launchd restart the daemon if it crashes (with launchd's standard exponential-backoff between restarts). `RunAtLoad=true` starts it at user login. `ProcessType=Interactive` keeps it from being aggressively suspended on system sleep. There is no `StartInterval`; the daemon's own internal scheduler drives the polling cadence (see `settings.poll_interval`).
 
 #### Errors
 
@@ -829,74 +834,105 @@ The `eventTypes` filter is part of the **query fingerprint** stored alongside th
 
 The atomic unit is the pdir. The algorithm runs once per pdir, independently. Failure of one pdir does not affect others.
 
-### Inputs
+### In-memory state
 
-For pdir `(P, D)`:
-- Canonical source calendar ID `S`.
-- Canonical target calendar ID `T`.
-- `source_writable: bool`, derived from `S`'s `accessRole` at config canonicalization. Used by drift handling: `propagate` if true, `revert` if false.
-- `state.json["<P>:<D>"].checkpoint`: `sync_token`, `full_sync_at`, `query_fingerprint`. The whole `checkpoint` object may be absent (first run) or present with empty `sync_token` (Google didn't return one on the previous full sync).
-- `settings.horizon`, `settings.full_sync_interval`.
-- The current query fingerprint = SHA-256 of the canonical concatenation of `S`, `sorted(eventTypes)`, and `horizon` as exact nanoseconds. Any change to any input invalidates a saved syncToken.
+The daemon holds these in process memory only. Nothing is persisted to disk between runs. A cold start (daemon launch, restart after crash, system reboot) re-derives all of it from Google.
 
-### Sliding-horizon protection
+Per source calendar (deduplicated across pdirs that share a source):
+- Canonical calendar ID
+- `accessRole` (`reader` / `writer` / `owner`)
+- Current `syncToken` (from the most recent `events.list` for that source)
+- Last full-sync timestamp
 
-A naïve syncToken loop misses events that enter the horizon by *passage of time*, not by being modified. calendar-sync handles this with a periodic forced full re-sync:
+Per target calendar (deduplicated across pdirs that share a target):
+- Canonical calendar ID
+- `accessRole`
+- Mirror inventory: a `map[(scope, source_event_id)] -> live mirror Event resource` containing every mirror calendar-sync currently has on this calendar
 
-A pdir runs in **full-sync mode** if any of these are true:
-- `state["<P>:<D>"]` is absent or has no `checkpoint`.
-- `--reset-state` was passed.
-- `state["<P>:<D>"].checkpoint.sync_token` is empty.
-- `state["<P>:<D>"].checkpoint.query_fingerprint != current fingerprint` (config changed in a way that affects the source query).
-- `now - state["<P>:<D>"].checkpoint.full_sync_at > settings.full_sync_interval` (default 24h).
+Per pdir:
+- Source canonical ID, target canonical ID
+- `source_writable: bool` derived from the source's `accessRole`
+- Direction
+- Pair name
 
-Otherwise, **incremental mode** uses the saved syncToken.
+The mirror inventory and source listings are grown and pruned in place as the daemon makes inserts/patches/deletes. On a `propagate` followed by mirror re-write, the inventory entry is replaced with the fresh post-write resource.
 
-### Phase 1: list source events
+### Daemon lifecycle: startup
 
-#### Full-sync mode
+`calendar-sync watch` does this exactly once at process start, and again whenever the periodic full re-sync timer fires:
 
-```
-gws calendar events list --params '{
-  "calendarId": "<S>",
-  "timeMin": "<now (RFC3339)>",
-  "timeMax": "<now + horizon (RFC3339)>",
-  "singleEvents": false,
-  "showDeleted": true,
-  "eventTypes": ["default", "outOfOffice", "focusTime"],
-  "maxResults": 250
-}' --page-all
-```
+1. Load and validate config from `config.toml`.
+2. Run `gws auth status`. Exit code 2 on failure.
+3. Resolve every distinct calendar ID referenced in config to its canonical form via `gws calendar calendarList get`. Cache `accessRole` for each.
+4. Run config validation (collision rules, accessRole minimums).
+5. **Full source-list per unique source.** For each distinct source calendar `S` in any enabled pdir:
+   ```
+   gws calendar events list --params '{
+     "calendarId": "<S>",
+     "timeMin": "<now (RFC3339)>",
+     "timeMax": "<now + horizon (RFC3339)>",
+     "singleEvents": false,
+     "showDeleted": true,
+     "eventTypes": ["default", "outOfOffice", "focusTime"],
+     "maxResults": 250
+   }' --page-all
+   ```
+   Capture `nextSyncToken` from the final page. If it's missing (Google omits it for very long lists), leave the in-memory token empty - the next cycle will full-sync again.
+6. **Mirror inventory per unique target.** For each distinct target calendar `T`:
+   ```
+   gws calendar events list --params '{
+     "calendarId": "<T>",
+     "privateExtendedProperty": ["calendar-sync:version=2"],
+     "showDeleted": false,
+     "maxResults": 250
+   }' --page-all
+   ```
+   Build the in-memory inventory keyed by `(scope, source_event_id)`. Note: `version=1` mirrors don't appear in this list. They're encountered (and migrated) when the classification logic processes their corresponding source event.
+7. **Reconcile.** For each enabled pdir `(P, D)` with source `S` and target `T`, walk the in-memory list of source events for `S`. For each event, run the classification logic (see below) using the `T` mirror inventory to look up existing mirrors.
+8. **Schedule.** Set the per-tick timer (`poll_interval`) and the periodic-full-resync timer (`full_sync_interval`).
 
-After all pages succeed, capture `nextSyncToken` from the last page. If it's missing (which Google can do for very long full lists), record `sync_token = ""` so the next run is also a full sync.
+Startup wall-clock cost on real-world calendars (1-year horizon, ~1000 events per source): on the order of 10-20s for a typical multi-pdir setup. Mostly Google API latency.
 
-#### Incremental mode
+### Daemon lifecycle: per-tick reconciliation
 
-```
-gws calendar events list --params '{
-  "calendarId": "<S>",
-  "syncToken": "<saved>",
-  "showDeleted": true,
-  "eventTypes": ["default", "outOfOffice", "focusTime"],
-  "maxResults": 250
-}' --page-all
-```
+Every `poll_interval`, the internal scheduler fires the per-tick path. For each unique source `S`:
 
-`timeMin`, `timeMax`, `updatedMin`, `q`, `iCalUID`, `orderBy`, and the `privateExtendedProperty` / `sharedExtendedProperty` filters are all rejected by Google when sent alongside `syncToken`. Other parameters (including `singleEvents`, `eventTypes`, `showDeleted`) must match the values used in the initial full sync that produced the token. If they differ, behavior is undefined per Google; calendar-sync's `query_fingerprint` invalidation prevents this by forcing a full re-sync on any change.
+1. **Incremental delta.**
+   ```
+   gws calendar events list --params '{
+     "calendarId": "<S>",
+     "syncToken": "<in-memory token for S>",
+     "showDeleted": true,
+     "eventTypes": ["default", "outOfOffice", "focusTime"],
+     "maxResults": 250
+   }' --page-all
+   ```
+   `timeMin`, `timeMax`, `updatedMin`, `q`, `iCalUID`, `orderBy`, and the `privateExtendedProperty`/`sharedExtendedProperty` filters are all rejected when sent alongside `syncToken`. Other parameters (`singleEvents`, `eventTypes`, `showDeleted`) must match the values used in the prior full sync. The daemon never changes these between full and incremental calls, so they always match.
+2. **410 GONE recovery.** If any page returns 410, the in-memory token is invalid. Schedule an immediate full re-sync for `S` (which gets a fresh token), and skip the rest of this tick for that source.
+3. **Reconcile delta.** For each event `E` in the response, for each enabled pdir whose source matches `S`, run the classification logic against the in-memory mirror inventory for that pdir's target.
+4. **Update token.** Replace the in-memory `syncToken` with the response's `nextSyncToken`.
 
-If any page returns 410 GONE, abort the syncToken path, switch to full-sync mode, and retry within the same `run`. Don't surface 410 to the user as an error.
+Empty deltas (the common case) cost a single API call per source - measured at ~270ms for an empty incremental response.
 
-`singleEvents=false` is critical: recurring events return as a single parent (with `recurrence` set), not as N expanded instances. Modified instances come back as separate items with `recurringEventId` and `originalStartTime` set.
+### Daemon lifecycle: periodic full re-sync
 
-### Phase 2: classify and reconcile
+Every `full_sync_interval` (default 24h), the daemon repeats startup steps 5-8: full source list per source, mirror inventory per target, reconcile, refresh tokens. This catches:
 
-For each event `E` returned, in `events.list` order:
+- **Horizon ingress.** Events that crossed into `[now, now + horizon]` simply by passage of time, without changing. Incremental sync wouldn't return them; full sync does.
+- **Mirror-only drift.** A user edited a mirror but its source hasn't changed since the last delta. The incremental delta wouldn't include the source event, so the reconciliation logic never had a chance to detect drift. Full sync visits every source event, checks every mirror, catches it.
+- **Orphans.** Mirrors whose source was deleted while the daemon was down. (When the daemon is up, the incremental delta carries `status=cancelled` for source deletions, so the reconciliation logic handles it directly.)
+
+After each full re-sync the in-memory inventories are replaced atomically.
+
+### Classification logic
+
+This runs once per source event `E` per pdir `(P, D)`. Called from both startup (over the full source list) and per-tick (over the delta).
 
 1. **Already a mirror.** If `E.extendedProperties.private["calendar-sync:source"]` is set, `skip(reason=is_mirror)`. This is the bidirectional loop guard.
 
 2. **Recurring instance.** If `E.recurringEventId` is set, route to the recurring-instance handler (see "Recurring Events"). The handler internally deals with cancelled, transparent, declined, and updated instances. Generic skip rules in steps 3-6 do NOT apply to recurring instances - the handler subsumes them.
 
-3. **Cancelled (non-recurring).** If `E.status == "cancelled"` (and step 2 didn't fire), look up the mirror by `calendar-sync:source = "<S>:<E.id>"` on `T`. If found, delete it (`reason=source_cancelled`). If not, `skip(reason=cancelled)`.
+3. **Cancelled (non-recurring).** If `E.status == "cancelled"` (and step 2 didn't fire), look up the mirror in the inventory by `(scope = "<P>:<D>", source_event_id = E.id)`. If found, delete it (action `delete`, reason `source_cancelled`). If not, `skip(reason=cancelled)`.
 
 4. **Declined.** If the source calendar owner's attendee entry has `responseStatus=declined`, `skip(reason=declined)`. (Plus delete the mirror if one exists.)
 
@@ -905,92 +941,56 @@ For each event `E` returned, in `events.list` order:
 6. **Outside horizon.** Compute the horizon-eligibility for this event:
    - For non-recurring: the event is in horizon if `start <= now + horizon` (where `start = E.start.dateTime || E.start.date`).
    - For recurring parents (`E.recurrence` is set): the event is in horizon if **any instance falls in `[now, now + horizon]`**. To check, call `events.instances?eventId=<E.id>&calendarId=<S>&timeMin=<now>&timeMax=<now + horizon>&maxResults=1&showDeleted=false`. If the response has at least one instance, the parent is in horizon. If empty, treat as outside_horizon.
-   
+
    If outside horizon: `skip(reason=outside_horizon)` and delete the mirror if one exists.
 
-7. **Normal reconciliation.** Look up the existing mirror by `calendar-sync:source = "<S>:<E.id>"`:
-   - **No mirror**: `events.insert` on `T` with the full mirror payload. Action `insert`, reason `source_updated`. (No reason `created`; the trigger is "source has an event we haven't mirrored yet.")
+7. **Normal reconciliation.** Look up the mirror in the inventory by `(scope, source_event_id)`:
+   - **No mirror**: `events.insert` on `T` with the full mirror payload. Action `insert`, reason `source_updated`. Add the post-write resource to the inventory.
    - **Mirror exists**: compute the two drift-detection signals from "Drift detection model":
      - `source_changed = E.updated > mirror.calendar-sync:source_updated`
-     - `mirror_drifted = sha256(canonical(mirror.<managed fields>)) != mirror.calendar-sync:checksum`. If `version < 2` on the mirror, derive `mirror_drifted` per the "Schema version migration" rules instead (compare live managed fields to desired-from-source).
-   
-     Then apply the four-way outcome table:
+     - `mirror_drifted = sha256(canonical(mirror.<managed fields>)) != mirror.calendar-sync:checksum`. If `version < 2` on the mirror, derive `mirror_drifted` per the "Schema version migration" rules instead.
+
+     Apply the four-way outcome table:
      - `!source_changed && !mirror_drifted`: `skip(reason=unchanged)`.
-     - `source_changed && !mirror_drifted`: `events.patch` on `T` with the full mirror payload. Action `patch`, reason `source_updated`. The patch covers a changed source `recurrence` array implicitly.
+     - `source_changed && !mirror_drifted`: `events.patch` on `T` with the full mirror payload. Action `patch`, reason `source_updated`. Replace the inventory entry with the post-write resource.
      - `!source_changed && mirror_drifted`: drift handling (see below). If `pdir.source_writable`: action `propagate`, reason `target_edited`. Else: action `revert`, reason `target_edited`.
-     - `source_changed && mirror_drifted`: newer-wins. Compare `E.updated` to `mirror.updated` (the live mirror's `updated` field, not our recorded `source_updated`). Source wins on ties.
-       - Source newer (or equal): `events.patch` on `T` with the full mirror payload. Action `patch`, reason `source_updated`. A `warn` log records `conflict_source_won` so the user sees that mirror edits were overwritten.
-       - Mirror newer: drift handling as above. A `warn` log records `conflict_target_won` so the user sees that source updates were overwritten.
+     - `source_changed && mirror_drifted`: newer-wins. Compare `E.updated` to the mirror inventory entry's `updated` field. Source wins on ties.
+       - Source newer (or equal): action `patch`, reason `source_updated`. A `warn` log records `conflict_source_won`.
+       - Mirror newer: drift handling as above. A `warn` log records `conflict_target_won`.
 
 #### Drift handling
 
-When a `propagate` is selected for a mirror with drifted managed fields:
+When `propagate` is selected:
 
 1. Compute the desired payload from the source.
 2. For each managed field, determine if the live mirror's value differs from the desired value. The set of fields that differ is the "drifted set."
-3. For `description`, strip the `\n\n---\nSource: ` trailer from the mirror's value before adding it to the patch (so we don't write the trailer to the source).
-4. `events.patch` on the **source calendar** (not the target) with `eventId=<source.id>`, body containing only the drifted fields' (post-trailer-strip) values.
-5. After Google returns the patched source, take its new `updated` timestamp and re-write the mirror with the full mirror payload, updated `calendar-sync:source_updated`, and a fresh `calendar-sync:checksum`. This ensures the next reconciliation sees the mirror as "clean."
+3. For `description`, strip the `\n\n---\nSource: ` trailer from the mirror's value (per the strict regex in "Description trailer handling") before adding it to the patch.
+4. `events.patch` on the **source calendar** with `eventId=<source.id>`, body containing only the drifted fields' values.
+5. After Google returns the patched source, take its new `updated` timestamp and re-write the mirror with the full mirror payload, the new `calendar-sync:source_updated`, and a fresh `calendar-sync:checksum`. Replace the inventory entry with the post-write resource.
 
-When a `revert` is selected:
+When `revert` is selected:
 
-1. `events.patch` on the **target calendar** with the full mirror payload, fresh `calendar-sync:checksum`, and the existing `calendar-sync:source_updated` (since the source hasn't changed).
-2. The user's edits on the mirror are gone after this. By design - a read-only source means we have no place to put their edits.
+1. `events.patch` on the **target calendar** with the full mirror payload, fresh `calendar-sync:checksum`, and the existing `calendar-sync:source_updated` (the source hasn't changed).
+2. Replace the inventory entry with the post-write resource.
 
-In both cases the action JSON includes a `fields` array listing the drifted field names so the user can see what moved:
+In both cases the action JSON includes a `fields` array listing the drifted field names:
 
 ```json
 {"action":"propagate","pair":"work-personal","direction":"a_to_b","source_event":"abc","target_event":"def","reason":"target_edited","fields":["summary","start","end"]}
 {"action":"revert","pair":"tripit-personal","direction":"a_to_b","source_event":"xyz","target_event":"def","reason":"target_edited","fields":["summary"]}
 ```
 
-The order of 3-6 doesn't change correctness for non-recurring events (the rules are non-overlapping for the cases that matter), but step 2's early branch is critical: a transparent or declined recurring instance must reach the recurring-instance handler so the mirror instance gets deleted, not skipped.
+### Limitation: mirror-only recurring instance overrides
 
-### Phase 3: prune orphans and catch mirror-only drift
+If a user moves or cancels an *individual occurrence* of a recurring mirror (creating an override on the mirror side that has no source counterpart), the daemon does not detect or reconcile it. The reasons:
 
-Skipped if `--no-prune` was passed or the run was incremental-only (incremental responses include cancellations explicitly, so orphans can't accumulate; drift on a mirror whose source hasn't changed is invisible to incremental sync and is the other reason this phase exists).
-
-In full-sync mode after Phase 2:
-
-1. List every mirror on `T` for this pdir: `events.list?calendarId=<T>&privateExtendedProperty=calendar-sync:scope=<P>:<D>&showDeleted=false&maxResults=250` (paginated, all pages). Single-property query, safe.
-2. Build a set of source IDs Phase 2 actually visited this run.
-3. For each mirror in the list:
-   - If its source ID *was* visited by Phase 2, skip (already reconciled, including any drift).
-   - Otherwise parse `calendar-sync:source` to recover `<source_id>` and look up the source via `events.get?calendarId=<S>&eventId=<source_id>`:
-     - **Source returns 404 or has `status=cancelled`**: delete the mirror. Action `delete`, reason `orphaned`.
-     - **Source is non-recurring and `start > now + horizon`**: delete the mirror. Action `delete`, reason `outside_horizon`.
-     - **Source is a recurring parent (has `recurrence`)**: don't trust `start` (which is the series start). Call `events.instances?calendarId=<S>&eventId=<source_id>&timeMin=<now>&timeMax=<now + horizon>&maxResults=1&showDeleted=false`. If the response has zero instances, the series no longer generates anything in our window: delete the mirror. Action `delete`, reason `outside_horizon`.
-     - **Source exists and is in horizon**: run the same drift-detection model from Phase 2 step 7 on the mirror. Possible outcomes: `skip(unchanged)`, `patch(source_updated)`, `propagate(target_edited)`, `revert(target_edited)`, or a conflict. This catches user edits to mirrors whose source hasn't changed.
-Source lookups during prune (`events.get` and any follow-up `events.instances`) fan out with a semaphore of 5. Drift handling within prune uses the same fan-out limit.
-
-#### Limitation: mirror-only instance overrides
-
-If a user moves or cancels an *individual occurrence* of a recurring mirror (creating an override on the mirror side that has no source counterpart), Phase 1 does not detect or reconcile it. The reasons:
-
-- Phase 2 iterates over source events; with no corresponding source override at the same `originalStartTime`, there's nothing to compare against.
+- The classification logic iterates over source events; with no corresponding source override at the same `originalStartTime`, there's nothing to compare against.
 - Listing all materialized instances on the mirror side via `events.instances` doesn't cleanly distinguish user-modified overrides from auto-generated occurrences without round-trip comparison against the parent's RRULE projection - and Google does not document a "delete this override to restore the auto-generated occurrence" semantic, so a `revert` primitive isn't safely available.
 - Drift on the recurring **parent** itself (summary, description, start/end, recurrence rule, etc.) IS detected by the standard reconciliation path. Drift on instances that the source also overrides IS detected by the recurring-instance handler.
 
 Consequence: a mirror-only instance override persists until either (a) the source's parent recurrence changes (which triggers a parent re-reconciliation, but doesn't directly clean up the override), (b) the user manually deletes it, or (c) the user runs `calendar-sync mirror prune <calendar> --pair <name>` to remove all of that pdir's mirrors and let them regenerate.
 
-This is a documented Phase 1 limitation. The standard drift detection covers parents and source-corresponding instances, which together cover the vast majority of practical edits.
-
-### Phase 4: persist state
-
-Always written for every pdir attempted, success or failure:
-- `state["<P>:<D>"].last_attempt_at = now`.
-- `state["<P>:<D>"].last_status = "ok"` on success, otherwise the error code.
-- `state["<P>:<D>"].last_error = null` on success, otherwise the error JSON.
-
-Written only on success of Phase 1, 2, and 3:
-- `state["<P>:<D>"].checkpoint.sync_token = nextSyncToken` (may be empty if Google didn't return one; next run will re-do a full sync).
-- If full-sync mode: `state["<P>:<D>"].checkpoint.full_sync_at = now`.
-- `state["<P>:<D>"].checkpoint.query_fingerprint = current fingerprint`.
-- `state["<P>:<D>"].last_synced_at = now`.
-
-The split is deliberate. The attempt log lets `state show` answer "did the last sync work?" without needing a separate status file. The checkpoint only advances on success, so a failed pdir retries from the same starting point on the next run.
-
-State is written via tempfile + fsync + rename. There's exactly one `state.json` write at the end of `run`, after every pdir has been processed.
+The standard drift detection covers parents and source-corresponding instances, which together cover the vast majority of practical edits.
 
 ### Mirror event payload (insert and patch)
 
@@ -1030,17 +1030,20 @@ Notes:
 
 The `propagate` action uses a **different payload shape**: only the drifted managed fields, with the description trailer stripped, written to the **source** event. The mirror is then re-written separately with the full payload above and a fresh checksum derived from the new source state.
 
-### Concurrency within a run
+### Concurrency
 
-- Pdirs in this run are processed serially in Phase 1. (Parallelism is a Phase 2 optimization once we have wall-clock numbers.)
-- Within a pdir, events are processed serially.
-- Orphan-prune source lookups fan out with a semaphore of 5.
+- Source-list and mirror-inventory builds during startup or periodic full re-sync run sequentially per source/target. Parallelization is not done; wall-clock is dominated by Google API latency, not local CPU.
+- During a single tick or startup pass, events are processed serially. Each event's reconciliation is a single critical section over the in-memory inventory.
+- Orphan-detection lookups (when a mirror's source ID isn't found in the source list and we need to confirm via `events.get`) fan out with a semaphore of 5.
+- The daemon is single-process by design; there's no in-process scheduler concurrency between ticks (a tick won't fire while the previous tick is still running - the scheduler holds the next tick until the current one completes).
 
 ### Idempotency
 
-Every API call is keyed by stable identifiers (source event ID for find, mirror event ID for patch/delete). The mirror's `calendar-sync:source` extended property is the de-duplication key: a previous run that crashed mid-insert leaves either no mirror (next run inserts) or a mirror with the marker (next run patches/skips). No duplicates.
+Every API call is keyed by stable identifiers (source event ID for find, mirror event ID for patch/delete). The mirror's `calendar-sync:source` extended property is the de-duplication key: a previous reconciliation that crashed mid-insert leaves either no mirror (next pass inserts) or a mirror with the marker (next pass patches/skips). No duplicates.
 
-The advisory lock guarantees no two `run` invocations interleave on the same machine. If a user invokes `run` while launchd's instance is in flight, the second invocation exits 0 with `already_running` and does nothing.
+A daemon crash mid-tick is recoverable: launchd's `KeepAlive` restarts the process, the cold-start path rebuilds inventories from Google, and reconciliation converges on the same end state.
+
+A manual `calendar-sync run` and the daemon don't interleave because `run` refuses if the daemon is loaded under launchd.
 
 ## Recurring Events
 
@@ -1052,13 +1055,13 @@ A recurring source event with no overrides comes back from `events.list?singleEv
 
 ### The recurring-instance handler
 
-When Phase 2 step 2 routes a recurring instance here, this is the full reconciliation algorithm. It internally handles cancelled, transparent, declined, and modified cases - all the skip rules that step 2 bypassed for the generic path.
+When the classification logic's recurring-instance branch routes here, this is the full reconciliation algorithm. It internally handles cancelled, transparent, declined, and modified cases - all the skip rules that the early-branch bypassed for the generic path.
 
 #### Step 1: find or repair the mirror parent
 
 Look up the mirror parent by `calendar-sync:source = "<S>:<E.recurringEventId>"` on `T`.
 
-If absent (incremental sync can return only the exception when only the exception changed), fetch the source parent via `events.get?calendarId=<S>&eventId=<E.recurringEventId>` and reconcile it as a normal event first using Phase 2's step 7 logic. After that succeeds, the mirror parent exists and we proceed.
+If absent (incremental sync can return only the exception when only the exception changed), fetch the source parent via `events.get?calendarId=<S>&eventId=<E.recurringEventId>` and reconcile it through the classification logic's normal-reconciliation step. After that succeeds, the mirror parent exists and we proceed.
 
 If the source parent is now ineligible (status=cancelled, transparency=transparent, declined, or outside_horizon when checked via `events.instances`), record `skip(reason=parent_not_eligible)` and stop. The mirror parent isn't created, and any prior mirror instance for this exception will be cleaned up by the orphan-prune pass.
 
@@ -1094,7 +1097,7 @@ Apply these rules in order to the source exception `E`. The "user-facing action"
    Apply the four-way matrix:
    - `!source_changed && !mirror_drifted`: `skip(reason=unchanged)`.
    - `source_changed && !mirror_drifted`: `events.patch` the mirror instance with the full mirror-instance payload. Action `patch`, reason `source_updated`.
-   - `!source_changed && mirror_drifted`: drift handling. The source instance always exists in this frame (we got here because Phase 1's `events.list?singleEvents=false` returned `E` as a source override). If `pdir.source_writable`, `events.patch` the **source instance** with the drifted fields. Action `propagate`, reason `target_edited`. Then re-write the mirror instance with the full payload, fresh checksum, and the source instance's new `updated`. Else `events.patch` the mirror instance to overwrite the user's edits. Action `revert`, reason `target_edited`.
+   - `!source_changed && mirror_drifted`: drift handling. The source instance always exists in this frame (we got here because the source-list call with `singleEvents=false` returned `E` as a source override). If `pdir.source_writable`, `events.patch` the **source instance** with the drifted fields. Action `propagate`, reason `target_edited`. Then re-write the mirror instance with the full payload, fresh checksum, and the source instance's new `updated`. Else `events.patch` the mirror instance to overwrite the user's edits. Action `revert`, reason `target_edited`.
    - `source_changed && mirror_drifted`: newer-wins by `E.updated` vs `mirror_instance.updated`. Source wins on equal. Source-newer: action `patch`, reason `source_updated`, with a `warn` log `conflict_source_won`. Mirror-newer: drift handling as above, with a `warn` log `conflict_target_won`.
 
 The mirror payload for an instance patch (used by `patch`, `revert`, and the post-`propagate` re-write) is the same shape as for non-recurring events with two differences:
@@ -1104,30 +1107,30 @@ The mirror payload for an instance patch (used by `patch`, `revert`, and the pos
 
 The checksum on a mirror instance is computed over the same managed fields as on a non-recurring event, with `recurrence` always omitted.
 
-#### Mirror-only instance overrides (Phase 1 limitation)
+#### Mirror-only instance overrides (limitation)
 
-If the user creates an override on the mirror side with no source counterpart (e.g. dragging one occurrence of a recurring mirror to a new time), Phase 1 does not reconcile it. See "Limitation: mirror-only instance overrides" in Phase 3 for the full justification. Drift on the recurring parent and on instances that the source also overrides is fully detected.
+If the user creates an override on the mirror side with no source counterpart (e.g. dragging one occurrence of a recurring mirror to a new time), the daemon does not reconcile it. See "Limitation: mirror-only recurring instance overrides" in the Sync Algorithm section for the full justification. Drift on the recurring parent and on instances that the source also overrides is fully detected.
 
 #### What this handler does *not* cover
 
-- The source parent itself when it changes. That's Phase 2 step 7's normal reconciliation. The handler only gets called for instances (events with `recurringEventId` set).
-- Source-level recurrence rule changes. Those reach Phase 2 step 7 as a `source_updated` patch on the parent. See "Parent recurrence rule changes" below.
+- The source parent itself when it changes. That's the classification logic's normal-reconciliation step. The handler only gets called for instances (events with `recurringEventId` set).
+- Source-level recurrence rule changes. Those reach normal reconciliation as a `source_updated` patch on the parent. See "Parent recurrence rule changes" below.
 
 ### Parent recurrence rule changes
 
-When a source parent's `recurrence` array changes, Phase 2 patches the mirror parent with the new recurrence as part of a regular `source_updated` patch. That's the entire reconciliation step for the parent.
+When a source parent's `recurrence` array changes, the classification logic patches the mirror parent with the new recurrence as part of a regular `source_updated` patch. That's the entire reconciliation step for the parent.
 
 There is no separate instance-fanout pass on a recurrence change. Justification:
 
 - Auto-generated instances (those with no override) are not standalone resources. They're materialized by the parent's recurrence rule. When the parent's `recurrence` changes, the set of auto-generated instances changes for free, on both the source and the mirror.
 - Standalone instance resources (modified or cancelled overrides) are independent events that persist through a parent rule change. Source-side they continue to live as overrides; mirror-side our existing overrides also continue to live. If a source override is at a recurrence time the new rule no longer generates, Google keeps it as an attached one-off; the mirror's override behaves the same. This is consistent with how Google itself behaves.
-- Future changes to source overrides arrive via the regular incremental stream and are reconciled by the modified-instance path in Phase 2. No special pass needed at recurrence-change time.
+- Future changes to source overrides arrive via the regular incremental stream and are reconciled by the recurring-instance handler. No special pass needed at recurrence-change time.
 
 The `events.instances` endpoint returns all materialized instances (override and synthetic) within an optional time window; it's used in this spec only for the bounded targeted lookup in modified-instance reconciliation, not for unbounded scans during recurrence-change handling.
 
 ### Parent timezone changes
 
-A source parent whose `start.timeZone` (or whose recurrence implicit timezone via `DTSTART;TZID=`) changes is reconciled by the same parent-patch path. The mirror parent's `start.timeZone` is updated alongside `recurrence` whenever Phase 2 detects a source-updated patch.
+A source parent whose `start.timeZone` (or whose recurrence implicit timezone via `DTSTART;TZID=`) changes is reconciled by the same parent-patch path. The mirror parent's `start.timeZone` is updated alongside `recurrence` whenever the classification logic detects a source-updated patch.
 
 ### `UNTIL` clauses past the horizon
 
@@ -1159,9 +1162,7 @@ Complete list of error codes:
 | `rate_limited`           | 3    | API              | Retries exhausted on 429, 403 `rateLimitExceeded`, or 403 `userRateLimitExceeded`.                   |
 | `backend_error`          | 1    | API              | Retries exhausted on 500 or 503.                                                                     |
 | `network_error`          | 4    | Subprocess       | gws reports a network failure.                                                                       |
-| `state_corrupt`          | 5    | State            | `state.json` exists but won't parse.                                                                 |
-| `state_write_failed`     | 1    | State            | Filesystem error writing `state.json`.                                                               |
-| `partial_failure`        | 1    | `run`            | At least one pdir failed but others succeeded. Final exit; details in `_meta.failures`.              |
+| `partial_failure`        | 1    | `run`/`watch`    | At least one pdir failed but others succeeded. Final exit; details in `_meta.failures`.              |
 | `not_macos`              | 1    | install/uninstall| Running on Linux/Windows.                                                                            |
 | `plist_exists`           | 1    | install          | Plist exists and `--force` not set.                                                                  |
 | `plist_not_found`        | 1    | uninstall        | Plist not present.                                                                                   |
@@ -1169,7 +1170,8 @@ Complete list of error codes:
 | `binary_not_resolvable`  | 1    | install          | calendar-sync's own binary path can't be determined.                                                 |
 | `write_failed`           | 1    | init             | Filesystem error writing the starter config.                                                         |
 | `timeout`                | 1    | run              | Exceeded `--timeout`.                                                                                |
-| `already_running`        | 0    | run              | Lock held by another `run` invocation. Logged at info, exit 0.                                       |
+| `daemon_already_running` | 5    | run              | The `watch` daemon is loaded under launchd. Stop it before running a manual reconcile.               |
+| `socket_error`           | 1    | status           | Socket file exists but I/O failed for non-`ECONNREFUSED` reasons.                                    |
 
 ### Error format on stderr
 
@@ -1215,7 +1217,7 @@ If `gws` writes a JSON error to stderr (it does, on most failures), that message
 `run` does not abort on the first error. Execution model:
 
 ```
-acquire <state_file>.lock or exit(0, already_running)
+refuse if `calendar-sync watch` is loaded (exit 5, daemon_already_running)
 load and validate config
 canonicalize calendar IDs
 expand pairs to pdirs (skip enabled=false)
@@ -1231,82 +1233,30 @@ else:
 
 Each pdir's state is saved independently on its own success.
 
-## State Management
+## State
 
-### `state.json`
+calendar-sync persists nothing to disk except `config.toml`. All sync state lives in process memory inside `calendar-sync watch`. There's no `state.json`, no lock file, no per-pdir checkpoint file.
 
-Path: `settings.state_file` (default `~/.config/calendar-sync/state.json`).
+What lives in process memory:
 
-Shape:
+- Canonical calendar IDs and `accessRole`s for every calendar referenced in config (resolved at startup).
+- Per-source `syncToken` (one token per unique source calendar; pdirs sharing a source share the token).
+- Per-source last-full-sync timestamp.
+- Per-target mirror inventory (a map from `(scope, source_event_id)` to live Event resource).
 
-```json
-{
-  "version": 1,
-  "pdirs": {
-    "work-personal:a_to_b": {
-      "source_calendar": "alice@example.com",
-      "target_calendar": "alice.personal@example.org",
-      "checkpoint": {
-        "sync_token": "CPDC...",
-        "full_sync_at": "2026-04-29T03:00:00Z",
-        "query_fingerprint": "sha256:abc123..."
-      },
-      "last_attempt_at": "2026-04-29T23:00:00Z",
-      "last_synced_at": "2026-04-29T23:00:00Z",
-      "last_status": "ok",
-      "last_error": null
-    },
-    "work-personal:b_to_a": {
-      "source_calendar": "alice.personal@example.org",
-      "target_calendar": "alice@example.com",
-      "checkpoint": {
-        "sync_token": "CMD3...",
-        "full_sync_at": "2026-04-29T03:00:00Z",
-        "query_fingerprint": "sha256:abc123..."
-      },
-      "last_attempt_at": "2026-04-29T23:00:00Z",
-      "last_synced_at": "2026-04-29T23:00:00Z",
-      "last_status": "ok",
-      "last_error": null
-    },
-    "work-family:a_to_b": {
-      "source_calendar": "alice@example.com",
-      "target_calendar": "family@group.calendar.google.com",
-      "checkpoint": {
-        "sync_token": "",
-        "full_sync_at": "2026-04-28T03:00:00Z",
-        "query_fingerprint": "sha256:abc123..."
-      },
-      "last_attempt_at": "2026-04-29T23:00:00Z",
-      "last_synced_at": "2026-04-28T03:00:00Z",
-      "last_status": "rate_limited",
-      "last_error": {"error": "rate_limited", "detail": "Rate limited after 5 retries", "endpoint": "events.list"}
-    }
-  }
-}
-```
+What survives across daemon restarts:
 
-The state for each pdir is split into two parts that are written under different rules:
+- `extendedProperties.private` on every mirror event. The full provenance (`calendar-sync:source`, `calendar-sync:source_updated`, `calendar-sync:checksum`, `calendar-sync:scope`, etc.) is colocated with the mirror itself on Google Calendar. A cold start re-derives the in-memory inventory by listing every mirror via `privateExtendedProperty=calendar-sync:version=2`.
 
-- **`checkpoint`** (sync_token, full_sync_at, query_fingerprint). Updated only when Phase 1, 2, and 3 all succeeded for that pdir. This is the durable "where to resume" state.
-- **`last_attempt_at`, `last_synced_at`, `last_status`, `last_error`**. The attempt log. Always written at the end of every `run` for every pdir we tried, success or failure. `last_synced_at` only advances on success; the attempt log advances regardless. This is what `state show` and the future Phase 2 `status` command read to answer "did the last sync work?".
+A cold start (process launch, restart after crash, system reboot) walks the same path described in "Daemon lifecycle: startup": canonicalize, list, build inventory, reconcile. Wall-clock cost on a real-world calendar setup is on the order of 10-20 seconds.
 
-Notes:
-- Keys are `<pair>:<direction>`.
-- `last_status` is `"ok"` or an error code from the table.
-- `last_error` is null on success, otherwise a JSON error object identical to what would have gone to stderr.
-- Written atomically: tempfile + fsync + rename.
-- The advisory `<state_file>.lock` prevents concurrent writers on the same config (see "Lock file" below).
+### IPC socket
 
-### Lock file
+The daemon binds a Unix domain socket at `$TMPDIR/calendar-sync.sock` for the `calendar-sync status` command to query live state. The socket file is created on startup, removed on clean shutdown, and treated as stale by `status` if it returns `ECONNREFUSED`. macOS sets `$TMPDIR` per-user, so the socket path is naturally scoped to one user's daemon.
 
-Path: `<settings.state_file>.lock` (default `~/.config/calendar-sync/state.json.lock`).
+The socket is the only filesystem artifact the daemon creates outside log files. It carries no persistent state - its existence is a runtime indicator, not a state record.
 
-A zero-byte file used purely as a `flock(2)` target. Acquired non-blocking at the start of `run`. Released on process exit (even on crash, by the kernel).
-
-Scoping the lock to the state file rather than to a fixed path means a user can run two calendar-sync configs against disjoint calendars in parallel by passing `--config` and a different `state_file` to each.
-
-### Mirror identification (recap)
+### Mirror identification queries (recap)
 
 Find a specific mirror:
 ```
@@ -1318,45 +1268,24 @@ Find every mirror created by a pdir:
 events.list?calendarId=<T>&privateExtendedProperty=calendar-sync:scope=<P>:<D>
 ```
 
-Both are single-property queries.
+Find every mirror calendar-sync has ever created on a calendar:
+```
+events.list?calendarId=<T>&privateExtendedProperty=calendar-sync:version=2
+```
 
-## Phasing
+All are single-property queries.
 
-### Phase 1 (initial release)
+## Out of scope
 
-- TOML config with single account, multiple pairs, three directions.
-- Calendar ID canonicalization at config load.
-- `accessRole` validation at config load (rejects read-only targets, `freeBusyReader` either side, bidirectional pairs that aren't writable both ways).
-- `calendar-sync run` with full and incremental sync, recurring events, modified and cancelled instances, recurrence-rule changes.
-- Sliding-horizon protection via `full_sync_interval`.
-- Overlap protection via `flock` on `<state_file>.lock`.
-- Per-pdir state with `query_fingerprint` invalidation.
-- **Drift detection on every mirror** (parents and instances that have source counterparts): two-signal model (`source_changed` from `calendar-sync:source_updated`, `mirror_drifted` from `calendar-sync:checksum`) with newer-wins conflict resolution. Mirror drift on writable-source pdirs `propagate`s back to the source; on read-only-source pdirs (subscribed iCal feeds, holiday calendars) it `revert`s. Mirror-only recurring instance overrides (a user-created override at a recurrence time the source has no override for) are not reconciled - documented limitation.
-- `init`, `config show`, `config validate`.
-- `pair list`, `pair test`.
-- `mirror list`, `mirror prune`.
-- `state show`, `state reset`.
-- `install`, `uninstall`.
-- `skill`, `version`.
-- JSONL stdout, JSONL or text stderr.
-- launchd plist generation.
-- Homebrew tap distribution via release-please + GoReleaser.
+The following are intentionally not part of this version. None require structural changes to the spec to add later, but each is a deliberate non-goal here:
 
-### Phase 2 (multi-account, ergonomics)
-
-- Multiple `[accounts.<name>]` entries; per-account `gws_config_dir`.
-- `calendar-sync auth login --account <name>`, `auth status [--account <name>]`.
-- Long-running `calendar-sync watch` (alternative to launchd).
-- Parallel pdir execution.
-- Per-pair redaction modes (`title_template`, `redact_description`).
-- `calendar-sync status` summary command.
-- Per-source-calendar list deduplication (one `events.list` per source calendar shared across pdirs).
-
-### Phase 3 (push)
-
-- `events.watch` integration for push notifications.
-- Hosted webhook receiver (cloud deployment).
-- Dynamic interval (poll fallback when watch channel is down).
+- **Multi-account support.** calendar-sync uses whatever account `gws auth status` reports. No `[accounts.<name>]` config table, no `--account` flag. Users with calendars across multiple Google accounts share calendars between accounts (Google Calendar's sharing UI) so a single `gws`-authenticated account has access to everything.
+- **Webhook push notifications via `events.watch`.** Requires a verified HTTPS domain in Google Search Console and a publicly-reachable always-on endpoint. Doesn't fit a laptop deployment. Polling with `syncToken` gets near-real-time latency at low API cost on a long-running daemon, which is sufficient.
+- **Per-pair redaction modes.** Mirror events copy source title and description verbatim. There are no `title_template`, `redact_description`, or similar config knobs. Users who need redaction control writer access to the destination calendar instead.
+- **Mirror-only recurring instance overrides.** A user dragging one occurrence of a recurring mirror to a different time creates an override the source doesn't have. The daemon does not detect or reconcile these. Workaround: `calendar-sync mirror prune <calendar> --pair <name>` and let the next sync regenerate. See "Limitation: mirror-only recurring instance overrides" in Sync Algorithm.
+- **Parallel pdir execution.** Each tick processes pdirs sequentially. Wall-clock cost is dominated by Google API latency, not local CPU; parallelism would reduce latency at the cost of complexity.
+- **Multi-machine sync coordination.** A single user running `watch` on multiple machines simultaneously would have both machines making redundant API calls. Don't do this; pick one host. There's no state arbitration to make multi-host correct.
+- **Linux/Windows.** `install`/`uninstall` write a launchd plist; running on non-Darwin platforms exits with `not_macos`. The sync engine itself is portable Go and could be built on Linux for ad-hoc `run` invocations, but no service-installation story is provided for non-macOS hosts.
 
 ## Dependencies
 

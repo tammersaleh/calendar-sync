@@ -12,7 +12,7 @@ For each user-declared pair of calendars, calendar-sync mirrors busy events from
 - **State on events, not on disk.** Mirror provenance lives in `extendedProperties.private` on each mirror event. The on-disk state is one syncToken plus one full-sync timestamp per pair-direction.
 - **One-shot by default.** `calendar-sync run` performs a single sync and exits. macOS launchd drives the cadence. A long-running daemon mode is a non-goal for Phase 1.
 - **Idempotent and overlap-safe.** Running `calendar-sync run` twice in a row with no calendar changes is a no-op. A second invocation while one is still running exits cleanly without doing anything.
-- **Read-only on source calendars.** The tool reads source events but never writes to them. Mirror events live exclusively on destination calendars.
+- **Edits flow both ways.** Source edits flow to the mirror (always). Mirror edits flow back to the source if the source is writable; otherwise the mirror is reverted to the source's values on the next sync. The decision is determined by the source calendar's `accessRole` at config-load time. Read-only sources (subscribed iCal feeds, holiday calendars, `accessRole=reader` shares) are never written to. One carve-out: a user-created override on a recurring mirror with no source counterpart at the same recurrence time (i.e. the user dragged one occurrence to a different time on the mirror, and the source has no override at that occurrence) is not reconciled. See Phase 3 for the limitation and rationale.
 
 ## Architecture
 
@@ -49,12 +49,13 @@ Every mirror event carries these private extended properties (`extendedPropertie
 
 | Key                            | Value example                              | Purpose                                                                                                          |
 |--------------------------------|--------------------------------------------|------------------------------------------------------------------------------------------------------------------|
-| `calendar-sync:source`         | `alice@example.com:abc123def456`        | `<canonical_source_calendar_id>:<source_event_id>`. Unique on a target calendar. Used to find a specific mirror. |
-| `calendar-sync:source_updated` | `2026-04-29T23:00:00Z`                     | The source event's `updated` field at the time of the last reconciliation. Drift heuristic.                      |
+| `calendar-sync:source`         | `alice@example.com:abc123def456`           | `<canonical_source_calendar_id>:<source_event_id>`. Unique on a target calendar. Used to find a specific mirror. |
+| `calendar-sync:source_updated` | `2026-04-29T23:00:00Z`                     | The source event's `updated` field at the time of the last reconciliation. The "did source change?" signal.      |
+| `calendar-sync:checksum`       | `sha256:c3a4...e891`                       | SHA-256 over a canonical serialization of the fields calendar-sync manages on the mirror. The "did mirror drift?" signal. (See "Drift detection model" below.) |
 | `calendar-sync:scope`          | `work-personal:a_to_b`                     | `<pair>:<direction>`. Composite for bulk listing by pdir. (See "Why composite" below.)                           |
 | `calendar-sync:pair`           | `work-personal`                            | Pair name. Stored separately for human-readable output.                                                          |
 | `calendar-sync:direction`      | `a_to_b`                                   | Direction. Stored separately for human-readable output.                                                          |
-| `calendar-sync:version`        | `1`                                        | Schema version. Bump if the property layout changes.                                                             |
+| `calendar-sync:version`        | `2`                                        | Schema version. Current version is `2`. Bump if the property layout changes.                                     |
 
 #### Why composite `scope`
 
@@ -67,6 +68,98 @@ The `calendar-sync:source` property uses the **canonical** calendar ID, never th
 #### Loop prevention
 
 A source event is "already a mirror" if it carries `calendar-sync:source` in its extended properties. Such events are skipped when scanning a calendar as a *source*. This prevents bidirectional pairs from re-mirroring their own output.
+
+#### Drift detection model
+
+calendar-sync supports user edits on either side: edits to the source flow into the mirror (always), and edits to the mirror flow back into the source (when source is writable) or get reverted (when source is read-only, like a TripIt subscription or a holiday calendar).
+
+Distinguishing "source changed" from "mirror was edited externally" requires recording, on the mirror itself, what the tool last wrote. Two extended properties cooperate:
+
+- `calendar-sync:source_updated` answers **did the source change since our last write?** It records the source event's `updated` field at the moment we wrote the mirror. Comparing it to the source event's current `updated` is the "source changed" signal.
+- `calendar-sync:checksum` answers **did the mirror change since our last write?** At write time we compute SHA-256 over a canonical serialization of the fields we manage on the mirror (see "Managed fields and the checksum" below) and store it on the mirror. On the next read, we recompute the hash from the mirror's current content and compare. Any difference is "mirror drifted".
+
+Together they give us an unambiguous classification of every mirror at reconciliation time:
+
+| `source_changed` | `mirror_drifted` | Outcome                                                                                                            |
+|------------------|------------------|--------------------------------------------------------------------------------------------------------------------|
+| no               | no               | `skip(reason=unchanged)`                                                                                           |
+| yes              | no               | `patch` mirror from source. Reason `source_updated`.                                                                |
+| no               | yes              | Drift handling. If source is writable: `propagate` mirror's edits to source. Else `revert` mirror to source values. Reason `target_edited`. |
+| yes              | yes              | Conflict. Newer-wins by Google's `updated` timestamps: compare `source.updated` vs `mirror.updated`. If source is newer (or equal), `patch` mirror from source (reason `source_updated`); a `warn` log records that user edits were overwritten. If mirror is newer, drift handling as in the previous row; a `warn` log records that source updates were overwritten. |
+
+Equal timestamps tiebreak to source. Google reports `updated` to milliseconds; concurrent edits within the same millisecond are vanishingly rare in practice.
+
+#### Managed fields and the checksum
+
+These are the fields calendar-sync writes when it creates or patches a mirror, and (with one exception) the fields it watches for drift. The checksum is over their canonical serialization:
+
+- `summary` (string, possibly empty)
+- `description` (string, including the `\n\n---\nSource: <htmlLink>` trailer that calendar-sync appends)
+- `start` (object with `dateTime` xor `date`, plus optional `timeZone`)
+- `end` (same shape as `start`)
+- `recurrence` (array of RRULE/RDATE/EXDATE strings; sorted alphabetically before hashing for stability; omitted entirely for non-recurring events and for instance overrides)
+- `transparency` (always `"opaque"` on a clean mirror)
+- `visibility` (always `"private"` on a clean mirror)
+
+The canonical serialization is JSON with object keys sorted, no whitespace, RFC 8259 form. The checksum value is `sha256:<hex>`.
+
+**`reminders` is deliberately *not* in the checksum** even though we write `{"useDefault": false}` on every mirror payload. Two reasons: (1) Google does not bump the event's `updated` timestamp when only `reminders` change, so newer-wins conflict resolution would be unreliable for any drift signal that includes `reminders`. (2) Whether reminders fire on the mirror is a personal preference that's reasonable for the user to override. We set the safe default on creation; we don't fight subsequent changes.
+
+Other fields (attendees, location, conferenceData, organizer, eventType, etc.) are also not hashed. calendar-sync doesn't manage them on the mirror, and we don't fight the user if they edit them.
+
+#### Computing the checksum from the post-write event
+
+The checksum is computed from the **Event resource Google returns after the write**, not from the outbound request payload. Google normalizes some fields on write (timezone canonicalization, RRULE re-formatting, whitespace folding in description, etc.). Hashing the outbound payload risks a false-drift signal on the next read because the mirror's actual stored representation differs from the request body.
+
+Concretely, the algorithm for any insert/patch/propagate-followup write is:
+
+1. Compute the desired payload (without `calendar-sync:checksum`).
+2. Send `events.insert` or `events.patch` with that payload.
+3. Read the response: it's the canonical Event resource as Google now stores it.
+4. Compute the checksum over the response's managed fields.
+5. Send a follow-up `events.patch` that sets only `extendedProperties.private["calendar-sync:checksum"]` to the computed hash.
+
+This costs one extra round-trip per write, which is acceptable. The follow-up patch only touches `extendedProperties.private["calendar-sync:checksum"]`; it does not modify any managed field.
+
+Whether Google bumps the event's `updated` timestamp on an extended-property-only patch is not explicitly documented. calendar-sync does not depend on the answer:
+
+- The drift-detection signals use `calendar-sync:source_updated` (recorded source `updated`) and `calendar-sync:checksum` directly, not the mirror's live `updated`.
+- The mirror's `updated` is only consulted in the conflict-resolution clock (newer-wins). If Google does bump `updated` on the follow-up patch, the inflation is at most a few hundred milliseconds (the latency of the follow-up RPC). A user edit that lands precisely in that window can be misattributed to "newer than our follow-up write" rather than "user-edit time"; in the absolute worst case the user's edit propagates to source even though source's update was technically newer. This is a small race window we accept rather than fight.
+
+#### Description trailer handling
+
+The description `propagate` writes to the source has the trailer stripped. The strip uses a strict pattern that matches the exact format calendar-sync writes: a description ending with `\n\n---\nSource: <htmlLink>` where `<htmlLink>` is `https://www.google.com/calendar/event?eid=<base64url>` (Google's auto-populated `htmlLink` format).
+
+The recognizer regex (Go syntax): `\n\n---\nSource: https://(?:www\.google\.com|calendar\.google\.com)/calendar/event\?eid=[A-Za-z0-9_\-=]+\s*$`.
+
+Three cases:
+
+- **Trailer matches the regex**: strip everything from the leading `\n\n` of the trailer to end of string; propagate the remainder to source.
+- **Trailer is absent** (user removed it cleanly): propagate the entire description to source.
+- **Trailer is partially edited** (user mangled the trailer text or pasted text after it, breaking the regex match): the regex doesn't match. We don't attempt to recover; we propagate the entire description (with whatever fragment the user left). A `warn` log records `trailer_unrecognized` so the user can see we couldn't safely strip. The next reconciliation re-adds a fresh trailer to the mirror, so subsequent syncs return to the normal pattern.
+
+This is a deliberate trade-off: trying to repair a partial trailer risks corrupting the source description in unpredictable ways. Surfacing the issue to the user via a warning is the safest behavior.
+
+#### Field-level propagate
+
+`propagate` only writes the fields that actually drifted, not the whole payload. The `events.patch` request to the source carries just those fields. This keeps fields the source has that calendar-sync doesn't manage (attendees, location, conferenceData) untouched.
+
+#### Schema version migration
+
+A mirror with `calendar-sync:version=1` predates the checksum property. We can't simply assume `mirror_drifted=false` on first encounter - the user may have edited the v1 mirror at some point, and we'd silently adopt that edit as the new baseline.
+
+On first encounter of a `version=1` mirror, calendar-sync derives `mirror_drifted` by comparing the live mirror's managed fields to the desired payload computed from the source:
+
+- `mirror_drifted = (any managed field on the mirror differs from the desired-from-source value)`.
+
+Then the four-way matrix runs as usual:
+
+- `!source_changed && !mirror_drifted`: no drift, just upgrade. Re-write the mirror with `version=2` and a fresh checksum. Action `patch`, reason `migration_upgrade`. The patch only touches the extended-property layout - no managed field changes.
+- `!source_changed && mirror_drifted`: drift handling as normal (`propagate` or `revert`).
+- `source_changed && !mirror_drifted`: `patch` from source as normal.
+- `source_changed && mirror_drifted`: source wins by default during migration (more conservative than newer-wins, since v1 mirrors have no reliable user-edit timestamp). A `warn` log records `migration_source_won` so the user knows v1 mirror edits may have been overwritten.
+
+After this single migration write, the mirror is `version=2` and subsequent reconciliations use the standard drift detection model.
 
 ## Configuration
 
@@ -166,6 +259,11 @@ Run on every command that touches config. Failures exit with code 1 and a JSON e
 - `full_sync_interval` is between `1h` and `30d` inclusive.
 - `log_level` is one of the four allowed values.
 - `log_format` is `json` or `text`.
+- **Access role** (resolved during canonicalization via `gws calendar calendarList get` for each unique calendar reference; the response's `accessRole` field is one of `freeBusyReader`, `reader`, `writer`, `owner`):
+  - The source calendar's `accessRole` is `>= reader` (i.e. `reader`, `writer`, or `owner`). `freeBusyReader` is rejected because we cannot read event details.
+  - The target calendar's `accessRole` is `>= writer` (`writer` or `owner`). A read-only target means we can never write mirrors there.
+  - For `direction = bidirectional`, both calendars are `>= writer` (each is a target in one of the two pdirs).
+  - The pdir's `source_writable` flag (used by drift handling) is `true` iff the source's `accessRole` is `>= writer`. A `source_writable=false` pdir can still mirror events from source to target; it just `revert`s any mirror drift instead of `propagate`ing.
 
 ### Examples
 
@@ -234,7 +332,13 @@ By design, mirror events copy the source event's title and description verbatim.
 
 This is intentional: the user creating the pairs controls the destination calendars and the people who have writer access to them. In the typical case (mirroring between calendars the user owns), the only readers are the user and people they've explicitly shared with. If the user mirrors to a calendar with broader writer access, the leak is the user's responsibility.
 
+There's a related caveat for **`reader`-access source calendars**: per Google's sharing model, events with `visibility=private` on a source where the user only has `reader` access have their `summary`, `description`, and other details hidden. Such events come back from `events.list` with empty or stripped fields. calendar-sync mirrors what Google returns, so a private source event on a reader-access calendar produces a mirror with an empty title and description (still marked busy and at the right time). For TripIt and other public-by-default subscriptions this isn't an issue; for shared calendars where the sharer marks events private, the mirror won't carry details. Workaround: ask the source calendar owner for `writer` access.
+
 Phase 2 will offer redaction modes (`title_template`, `redact_description`) for users who need them.
+
+### Edits flow back too
+
+Because mirror edits propagate to writable sources (see "Drift detection model"), edits to a mirror's title or description are **also visible to the source's other readers** after the next sync. If the user edits a work-mirrored event on their personal calendar to add private notes, those notes flow back to the work calendar where colleagues will see them. The user should treat their own mirror edits as if they were editing the source directly when the source is writable.
 
 ## Output and Logging
 
@@ -320,33 +424,53 @@ Stdout: one JSON object per action plus `_meta`.
 
 ```
 $ calendar-sync run
-{"action":"insert","pair":"work-personal","direction":"a_to_b","source_event":"abc123","target_event":"def456","summary":"Standup"}
+{"action":"insert","pair":"work-personal","direction":"a_to_b","source_event":"abc123","target_event":"def456","summary":"Standup","reason":"source_updated"}
 {"action":"patch","pair":"work-personal","direction":"a_to_b","source_event":"abc124","target_event":"def457","reason":"source_updated"}
+{"action":"propagate","pair":"work-personal","direction":"a_to_b","source_event":"abc126","target_event":"def460","reason":"target_edited","fields":["summary","start","end"]}
+{"action":"revert","pair":"tripit-personal","direction":"a_to_b","source_event":"flight-AA-123","target_event":"def461","reason":"target_edited","fields":["summary"]}
 {"action":"delete","pair":"work-personal","direction":"a_to_b","target_event":"def458","reason":"source_cancelled"}
 {"action":"skip","pair":"work-personal","direction":"a_to_b","source_event":"abc125","reason":"transparency_transparent"}
-{"_meta":{"pdirs":2,"events_processed":18,"inserts":1,"patches":1,"deletes":1,"skips":15,"duration_ms":1842}}
+{"_meta":{"pdirs":2,"events_processed":18,"inserts":1,"patches":1,"propagates":1,"reverts":1,"deletes":1,"skips":13,"duration_ms":1842}}
 ```
 
-A given `reason` is paired with one of four `action` values: `insert`, `patch`, `delete`, `skip`. Some reasons can produce different actions depending on whether a mirror exists. The following table is exhaustive.
+A given `reason` is paired with one of six `action` values: `insert`, `patch`, `delete`, `propagate`, `revert`, `skip`. Some reasons can produce different actions depending on the state of the mirror. The following table is exhaustive.
 
-| `reason`                  | Possible `action` values | Trigger                                                                                                                                  |
-|---------------------------|--------------------------|------------------------------------------------------------------------------------------------------------------------------------------|
-| `is_mirror`               | `skip`                   | Source already carries `calendar-sync:source` (bidirectional loop guard).                                                                |
-| `cancelled`               | `skip`                   | Source `status=cancelled` and no mirror exists to delete.                                                                                |
-| `source_cancelled`        | `delete`                 | Source `status=cancelled` and a mirror exists.                                                                                           |
-| `declined`                | `skip` or `delete`       | Source calendar owner's `responseStatus=declined`. `delete` if a mirror exists, `skip` if not.                                           |
-| `transparency_transparent`| `skip` or `delete`       | Source `transparency=transparent`. `delete` if a mirror exists, `skip` if not.                                                           |
-| `outside_horizon`         | `skip` or `delete`       | Non-recurring source `start > now + horizon`, or recurring source has no instance in `[now, now + horizon]`. `delete` if mirror exists.  |
-| `parent_not_eligible`     | `skip`                   | A recurring instance arrived but its source parent is itself filtered out (cancelled, transparent, declined, outside_horizon).           |
-| `unchanged`               | `skip`                   | Mirror is up-to-date relative to source.                                                                                                  |
-| `pair_disabled`           | `skip`                   | The pdir is `enabled=false`. Emitted only when the user explicitly named the pair via `--pair`.                                          |
-| `instance_unmaterializable`| `skip`                  | Recurring-instance lookup returned zero results even after re-patching the mirror parent (rare; see "Zero-result instance lookup" below). |
-| `source_updated`          | `insert` or `patch`      | Source `updated` moved past the recorded value, or no mirror exists yet (then `insert`). Covers source-side recurrence-rule changes too - the parent patch carries the new `recurrence`.  |
-| `orphaned`                | `delete`                 | Prune pass found a mirror whose source no longer exists.                                                                                 |
+| `reason`                   | Possible `action` values    | Trigger                                                                                                                                  |
+|----------------------------|-----------------------------|------------------------------------------------------------------------------------------------------------------------------------------|
+| `is_mirror`                | `skip`                      | Source already carries `calendar-sync:source` (bidirectional loop guard).                                                                |
+| `cancelled`                | `skip`                      | Source `status=cancelled` and no mirror exists to delete.                                                                                |
+| `source_cancelled`         | `delete`                    | Source `status=cancelled` and a mirror exists.                                                                                           |
+| `declined`                 | `skip` or `delete`          | Source calendar owner's `responseStatus=declined`. `delete` if a mirror exists, `skip` if not.                                           |
+| `transparency_transparent` | `skip` or `delete`          | Source `transparency=transparent`. `delete` if a mirror exists, `skip` if not.                                                           |
+| `outside_horizon`          | `skip` or `delete`          | Non-recurring source `start > now + horizon`, or recurring source has no instance in `[now, now + horizon]`. `delete` if mirror exists.  |
+| `parent_not_eligible`      | `skip`                      | A recurring instance arrived but its source parent is itself filtered out (cancelled, transparent, declined, outside_horizon).           |
+| `unchanged`                | `skip`                      | Both drift signals false: mirror up-to-date and unmodified relative to source.                                                            |
+| `pair_disabled`            | `skip`                      | The pdir is `enabled=false`. Emitted only when the user explicitly named the pair via `--pair`.                                          |
+| `instance_unmaterializable`| `skip`                      | Recurring-instance lookup returned zero results even after re-patching the mirror parent (rare; see "Zero-result instance lookup").       |
+| `source_updated`           | `insert` or `patch`         | `source_changed=true && mirror_drifted=false`, or no mirror exists yet (then `insert`). Also covers `source_changed && mirror_drifted` resolved to source-wins (see `conflict_source_won` below). |
+| `target_edited`            | `propagate` or `revert`     | `mirror_drifted=true && source_changed=false`, or `source_changed && mirror_drifted` resolved to mirror-wins. `propagate` if `pdir.source_writable`, else `revert`. |
+| `migration_upgrade`        | `patch`                     | A v1 mirror with no source change and no drift, re-written to add the `calendar-sync:checksum` and bump `version` to 2. One-time per pre-existing mirror. |
+| `orphaned`                 | `delete`                    | Prune pass found a mirror whose source no longer exists.                                                                                 |
 
 Server-side `eventTypes` filtering means events of excluded types (`birthday`, `fromGmail`, `workingLocation`) never appear on the wire and so don't produce a `skip` event.
 
-The recurring-instance handler uses `events.patch` (with `status=cancelled`) under the hood for cancellation cases, but at the CLI layer those still report as `action=delete`. The user-facing action describes effect on the mirror, not the API primitive.
+The recurring-instance handler uses `events.patch` (with `status=cancelled`) under the hood for cancellation cases, but at the CLI layer those still report as `action=delete`. The user-facing action describes effect, not the API primitive.
+
+#### Conflict logging
+
+When both `source_changed` and `mirror_drifted` are true at the same reconciliation, calendar-sync logs one extra `warn` line on stderr in addition to the normal action line on stdout:
+
+```json
+{"ts":"...","level":"warn","msg":"conflict_source_won","pair":"work-personal","direction":"a_to_b","source_event":"abc","target_event":"def","source_updated":"...","mirror_updated":"..."}
+```
+
+Possible `msg` values:
+
+- `conflict_source_won` - both signals true, source's `updated` won (or tied) and the mirror was patched from source. The accompanying stdout action carries `reason=source_updated`.
+- `conflict_target_won` - both signals true, mirror's `updated` won and drift handling fired. The accompanying stdout action carries `reason=target_edited`.
+- `migration_source_won` - same as `conflict_source_won` but during the v1→v2 migration, where there was no reliable user-edit timestamp to compare against; source wins by default. The action carries `reason=source_updated`.
+
+The `source_updated` and `mirror_updated` fields show the timestamps that drove the newer-wins decision (omitted on `migration_source_won` since v1 mirrors have no comparable timestamp), so the user can verify it was the call they wanted.
 
 #### Overlap protection
 
@@ -710,6 +834,7 @@ The atomic unit is the pdir. The algorithm runs once per pdir, independently. Fa
 For pdir `(P, D)`:
 - Canonical source calendar ID `S`.
 - Canonical target calendar ID `T`.
+- `source_writable: bool`, derived from `S`'s `accessRole` at config canonicalization. Used by drift handling: `propagate` if true, `revert` if false.
 - `state.json["<P>:<D>"].checkpoint`: `sync_token`, `full_sync_at`, `query_fingerprint`. The whole `checkpoint` object may be absent (first run) or present with empty `sync_token` (Google didn't return one on the previous full sync).
 - `settings.horizon`, `settings.full_sync_interval`.
 - The current query fingerprint = SHA-256 of the canonical concatenation of `S`, `sorted(eventTypes)`, and `horizon` as exact nanoseconds. Any change to any input invalidates a saved syncToken.
@@ -784,27 +909,71 @@ For each event `E` returned, in `events.list` order:
    If outside horizon: `skip(reason=outside_horizon)` and delete the mirror if one exists.
 
 7. **Normal reconciliation.** Look up the existing mirror by `calendar-sync:source = "<S>:<E.id>"`:
-   - **No mirror**: `events.insert` on `T` with the mirror payload. Action: `insert`.
-   - **Mirror exists, source updated**: if `E.updated > mirror.extendedProperties.private["calendar-sync:source_updated"]`, `events.patch` on `T` with the full mirror payload (`reason=source_updated`). Action: `patch`. If the source's `recurrence` array differs from the mirror's, the patch covers it; no separate fanout is needed (see "Recurring Events" / "Parent recurrence rule changes").
-   - **Mirror exists, unchanged**: `skip(reason=unchanged)`.
+   - **No mirror**: `events.insert` on `T` with the full mirror payload. Action `insert`, reason `source_updated`. (No reason `created`; the trigger is "source has an event we haven't mirrored yet.")
+   - **Mirror exists**: compute the two drift-detection signals from "Drift detection model":
+     - `source_changed = E.updated > mirror.calendar-sync:source_updated`
+     - `mirror_drifted = sha256(canonical(mirror.<managed fields>)) != mirror.calendar-sync:checksum`. If `version < 2` on the mirror, derive `mirror_drifted` per the "Schema version migration" rules instead (compare live managed fields to desired-from-source).
+   
+     Then apply the four-way outcome table:
+     - `!source_changed && !mirror_drifted`: `skip(reason=unchanged)`.
+     - `source_changed && !mirror_drifted`: `events.patch` on `T` with the full mirror payload. Action `patch`, reason `source_updated`. The patch covers a changed source `recurrence` array implicitly.
+     - `!source_changed && mirror_drifted`: drift handling (see below). If `pdir.source_writable`: action `propagate`, reason `target_edited`. Else: action `revert`, reason `target_edited`.
+     - `source_changed && mirror_drifted`: newer-wins. Compare `E.updated` to `mirror.updated` (the live mirror's `updated` field, not our recorded `source_updated`). Source wins on ties.
+       - Source newer (or equal): `events.patch` on `T` with the full mirror payload. Action `patch`, reason `source_updated`. A `warn` log records `conflict_source_won` so the user sees that mirror edits were overwritten.
+       - Mirror newer: drift handling as above. A `warn` log records `conflict_target_won` so the user sees that source updates were overwritten.
+
+#### Drift handling
+
+When a `propagate` is selected for a mirror with drifted managed fields:
+
+1. Compute the desired payload from the source.
+2. For each managed field, determine if the live mirror's value differs from the desired value. The set of fields that differ is the "drifted set."
+3. For `description`, strip the `\n\n---\nSource: ` trailer from the mirror's value before adding it to the patch (so we don't write the trailer to the source).
+4. `events.patch` on the **source calendar** (not the target) with `eventId=<source.id>`, body containing only the drifted fields' (post-trailer-strip) values.
+5. After Google returns the patched source, take its new `updated` timestamp and re-write the mirror with the full mirror payload, updated `calendar-sync:source_updated`, and a fresh `calendar-sync:checksum`. This ensures the next reconciliation sees the mirror as "clean."
+
+When a `revert` is selected:
+
+1. `events.patch` on the **target calendar** with the full mirror payload, fresh `calendar-sync:checksum`, and the existing `calendar-sync:source_updated` (since the source hasn't changed).
+2. The user's edits on the mirror are gone after this. By design - a read-only source means we have no place to put their edits.
+
+In both cases the action JSON includes a `fields` array listing the drifted field names so the user can see what moved:
+
+```json
+{"action":"propagate","pair":"work-personal","direction":"a_to_b","source_event":"abc","target_event":"def","reason":"target_edited","fields":["summary","start","end"]}
+{"action":"revert","pair":"tripit-personal","direction":"a_to_b","source_event":"xyz","target_event":"def","reason":"target_edited","fields":["summary"]}
+```
 
 The order of 3-6 doesn't change correctness for non-recurring events (the rules are non-overlapping for the cases that matter), but step 2's early branch is critical: a transparent or declined recurring instance must reach the recurring-instance handler so the mirror instance gets deleted, not skipped.
 
-### Phase 3: prune orphans
+### Phase 3: prune orphans and catch mirror-only drift
 
-Skipped if `--no-prune` was passed or the run was incremental-only (incremental responses include cancellations explicitly, so orphans can't accumulate).
+Skipped if `--no-prune` was passed or the run was incremental-only (incremental responses include cancellations explicitly, so orphans can't accumulate; drift on a mirror whose source hasn't changed is invisible to incremental sync and is the other reason this phase exists).
 
 In full-sync mode after Phase 2:
 
-1. List every mirror on `T` for this pdir: `events.list?calendarId=<T>&privateExtendedProperty=calendar-sync:scope=<P>:<D>&maxResults=250` (paginated, all pages). Single-property query, safe.
-2. Build a set of source IDs the run actually saw in Phase 2.
-3. For each mirror not in that set, parse `calendar-sync:source` to recover `<source_id>` and look up the source via `events.get?calendarId=<S>&eventId=<source_id>`:
-   - **Source returns 404 or has `status=cancelled`**: delete the mirror (`reason=orphaned`).
-   - **Source is non-recurring and `start > now + horizon`**: delete the mirror (`reason=outside_horizon`).
-   - **Source is a recurring parent (has `recurrence`)**: don't trust `start` (which is the series start). Call `events.instances?calendarId=<S>&eventId=<source_id>&timeMin=<now>&timeMax=<now + horizon>&maxResults=1&showDeleted=false`. If the response has zero instances, the series no longer generates anything in our window: delete the mirror (`reason=outside_horizon`). If it has at least one instance, leave the mirror alone.
-   - **Source exists and is in horizon**: leave the mirror alone. (Defensive: a non-overlapping race could explain why Phase 2 didn't see it; the next full sync re-checks.)
+1. List every mirror on `T` for this pdir: `events.list?calendarId=<T>&privateExtendedProperty=calendar-sync:scope=<P>:<D>&showDeleted=false&maxResults=250` (paginated, all pages). Single-property query, safe.
+2. Build a set of source IDs Phase 2 actually visited this run.
+3. For each mirror in the list:
+   - If its source ID *was* visited by Phase 2, skip (already reconciled, including any drift).
+   - Otherwise parse `calendar-sync:source` to recover `<source_id>` and look up the source via `events.get?calendarId=<S>&eventId=<source_id>`:
+     - **Source returns 404 or has `status=cancelled`**: delete the mirror. Action `delete`, reason `orphaned`.
+     - **Source is non-recurring and `start > now + horizon`**: delete the mirror. Action `delete`, reason `outside_horizon`.
+     - **Source is a recurring parent (has `recurrence`)**: don't trust `start` (which is the series start). Call `events.instances?calendarId=<S>&eventId=<source_id>&timeMin=<now>&timeMax=<now + horizon>&maxResults=1&showDeleted=false`. If the response has zero instances, the series no longer generates anything in our window: delete the mirror. Action `delete`, reason `outside_horizon`.
+     - **Source exists and is in horizon**: run the same drift-detection model from Phase 2 step 7 on the mirror. Possible outcomes: `skip(unchanged)`, `patch(source_updated)`, `propagate(target_edited)`, `revert(target_edited)`, or a conflict. This catches user edits to mirrors whose source hasn't changed.
+Source lookups during prune (`events.get` and any follow-up `events.instances`) fan out with a semaphore of 5. Drift handling within prune uses the same fan-out limit.
 
-Source lookups during prune (both `events.get` and any follow-up `events.instances`) fan out with a semaphore of 5.
+#### Limitation: mirror-only instance overrides
+
+If a user moves or cancels an *individual occurrence* of a recurring mirror (creating an override on the mirror side that has no source counterpart), Phase 1 does not detect or reconcile it. The reasons:
+
+- Phase 2 iterates over source events; with no corresponding source override at the same `originalStartTime`, there's nothing to compare against.
+- Listing all materialized instances on the mirror side via `events.instances` doesn't cleanly distinguish user-modified overrides from auto-generated occurrences without round-trip comparison against the parent's RRULE projection - and Google does not document a "delete this override to restore the auto-generated occurrence" semantic, so a `revert` primitive isn't safely available.
+- Drift on the recurring **parent** itself (summary, description, start/end, recurrence rule, etc.) IS detected by the standard reconciliation path. Drift on instances that the source also overrides IS detected by the recurring-instance handler.
+
+Consequence: a mirror-only instance override persists until either (a) the source's parent recurrence changes (which triggers a parent re-reconciliation, but doesn't directly clean up the override), (b) the user manually deletes it, or (c) the user runs `calendar-sync mirror prune <calendar> --pair <name>` to remove all of that pdir's mirrors and let them regenerate.
+
+This is a documented Phase 1 limitation. The standard drift detection covers parents and source-corresponding instances, which together cover the vast majority of practical edits.
 
 ### Phase 4: persist state
 
@@ -839,10 +1008,11 @@ State is written via tempfile + fsync + rename. There's exactly one `state.json`
     "private": {
       "calendar-sync:source": "<S>:<E.id>",
       "calendar-sync:source_updated": "<E.updated>",
+      "calendar-sync:checksum": "sha256:<hex>",
       "calendar-sync:scope": "<P>:<D>",
       "calendar-sync:pair": "<P>",
       "calendar-sync:direction": "<D>",
-      "calendar-sync:version": "1"
+      "calendar-sync:version": "2"
     }
   }
 }
@@ -853,9 +1023,12 @@ Notes:
 - `description` always ends with a blank line, `---`, and `Source: <htmlLink>`. If source description is empty, just the trailer.
 - `start`, `end` preserve the source's `dateTime`/`date` distinction and `timeZone`.
 - `transparency` forced to `opaque`. `visibility` forced to `private`.
-- `recurrence` is the source's array of RRULE/RDATE/EXDATE strings, omitted for non-recurring events.
+- `recurrence` is the source's array of RRULE/RDATE/EXDATE strings, omitted for non-recurring events. Omitted on mirror *instances* even when the parent has it.
 - `reminders.useDefault = false` is mandatory. Omitting it lets the destination calendar's default reminders fire on every mirror, which is wrong: mirrors should be silent.
 - `attendees`, `location`, `conferenceData` are deliberately omitted.
+- `calendar-sync:checksum` is set by a follow-up `events.patch` after the main write, using the post-write Event resource as the input to the hash. See "Drift detection model" / "Computing the checksum from the post-write event" for the algorithm and rationale.
+
+The `propagate` action uses a **different payload shape**: only the drifted managed fields, with the description trailer stripped, written to the **source** event. The mirror is then re-written separately with the full payload above and a fresh checksum derived from the new source state.
 
 ### Concurrency within a run
 
@@ -907,19 +1080,33 @@ Repair path:
 3. Retry the `events.instances` lookup.
 4. If still empty, the exception falls outside the mirror's recurrence even after refresh. `skip(reason=instance_unmaterializable)` and log at level `warn` with both the source parent's and mirror parent's recurrence arrays. The next full sync (within `full_sync_interval`) re-checks the parent and usually self-heals.
 
-#### Step 3: decide insert/patch/delete
+#### Step 3: decide insert/patch/delete/propagate/revert
 
 Apply these rules in order to the source exception `E`. The "user-facing action" reported on stdout is shown alongside.
 
-1. **Cancelled** - If `E.status == "cancelled"`: if the mirror instance is already cancelled, `skip(reason=unchanged)`. Otherwise call `events.patch` on the mirror instance with `{"status": "cancelled"}` (`action=delete`, `reason=source_cancelled`). The API primitive is `patch`, but the effect on the mirror is removal of the busy block, so we report `delete`.
-2. **Declined** - If the source calendar owner's attendee entry on `E` has `responseStatus=declined`: if the mirror instance is already cancelled, `skip(reason=unchanged)`. Otherwise patch the mirror instance to `status=cancelled` (`action=delete`, `reason=declined`).
-3. **Transparent** - If `E.transparency == "transparent"`: if the mirror instance is already cancelled, `skip(reason=unchanged)`. Otherwise patch the mirror instance to `status=cancelled` (`action=delete`, `reason=transparency_transparent`).
-4. **Modified, content changed** - Otherwise compare `E.updated` to the mirror instance's `calendar-sync:source_updated` (via the mirror instance's extended properties). If `E.updated >` the recorded value, `events.patch` the mirror instance with the full mirror payload (`action=patch`, `reason=source_updated`).
-5. **Otherwise** `skip(reason=unchanged)`.
+1. **Cancelled** - If `E.status == "cancelled"`: if the mirror instance is already cancelled, `skip(reason=unchanged)`. Otherwise call `events.patch` on the mirror instance with `{"status": "cancelled"}`. Action `delete`, reason `source_cancelled`. The API primitive is `patch`, but the effect on the mirror is removal of the busy block, so we report `delete`.
+2. **Declined** - If the source calendar owner's attendee entry on `E` has `responseStatus=declined`: if the mirror instance is already cancelled, `skip(reason=unchanged)`. Otherwise patch the mirror instance to `status=cancelled`. Action `delete`, reason `declined`.
+3. **Transparent** - If `E.transparency == "transparent"`: if the mirror instance is already cancelled, `skip(reason=unchanged)`. Otherwise patch the mirror instance to `status=cancelled`. Action `delete`, reason `transparency_transparent`.
+4. **Drift detection on the instance.** Compute the same two signals as for non-recurring events, but on the instance:
+   - `source_changed = E.updated > mirror_instance.calendar-sync:source_updated`
+   - `mirror_drifted = sha256(canonical(mirror_instance.<managed fields>)) != mirror_instance.calendar-sync:checksum`. If `version < 2` on the mirror instance, derive `mirror_drifted` per the "Schema version migration" rules instead (compare live managed fields to desired-from-source).
 
-The mirror payload for an instance patch is the same shape as for non-recurring events except:
+   Apply the four-way matrix:
+   - `!source_changed && !mirror_drifted`: `skip(reason=unchanged)`.
+   - `source_changed && !mirror_drifted`: `events.patch` the mirror instance with the full mirror-instance payload. Action `patch`, reason `source_updated`.
+   - `!source_changed && mirror_drifted`: drift handling. The source instance always exists in this frame (we got here because Phase 1's `events.list?singleEvents=false` returned `E` as a source override). If `pdir.source_writable`, `events.patch` the **source instance** with the drifted fields. Action `propagate`, reason `target_edited`. Then re-write the mirror instance with the full payload, fresh checksum, and the source instance's new `updated`. Else `events.patch` the mirror instance to overwrite the user's edits. Action `revert`, reason `target_edited`.
+   - `source_changed && mirror_drifted`: newer-wins by `E.updated` vs `mirror_instance.updated`. Source wins on equal. Source-newer: action `patch`, reason `source_updated`, with a `warn` log `conflict_source_won`. Mirror-newer: drift handling as above, with a `warn` log `conflict_target_won`.
+
+The mirror payload for an instance patch (used by `patch`, `revert`, and the post-`propagate` re-write) is the same shape as for non-recurring events with two differences:
+
 - `recurrence` is omitted (instances don't have their own recurrence; they belong to the parent).
-- `extendedProperties.private["calendar-sync:source"]` is updated to `"<S>:<E.id>"` (the exception's own ID, not the parent's) so a direct lookup later finds the right instance.
+- `extendedProperties.private["calendar-sync:source"]` is `"<S>:<E.id>"` (the exception's own ID, not the parent's) so a direct lookup later finds the right instance.
+
+The checksum on a mirror instance is computed over the same managed fields as on a non-recurring event, with `recurrence` always omitted.
+
+#### Mirror-only instance overrides (Phase 1 limitation)
+
+If the user creates an override on the mirror side with no source counterpart (e.g. dragging one occurrence of a recurring mirror to a new time), Phase 1 does not reconcile it. See "Limitation: mirror-only instance overrides" in Phase 3 for the full justification. Drift on the recurring parent and on instances that the source also overrides is fully detected.
 
 #### What this handler does *not* cover
 
@@ -959,6 +1146,7 @@ Complete list of error codes:
 | `pdir_not_found`         | 1    | CLI              | `--pdir <id>` does not match any configured pdir.                                                    |
 | `calendar_not_found`     | 1    | API              | Calendar ID returned 404.                                                                            |
 | `calendar_canonicalize_failed` | 1 | API           | Could not resolve a configured calendar ID (including `primary`) to its canonical ID.                |
+| `access_role_insufficient` | 1 | Config         | A calendar's `accessRole` is too low for its declared role (`reader` for a target, or `freeBusyReader` for either side, or `bidirectional` with one side `<= reader`). |
 | `selector_required`      | 1    | `mirror prune`   | None of `--pair`, `--orphaned`, `--all` provided.                                                    |
 | `confirmation_required`  | 1    | Interactive      | Non-TTY and `--yes` not provided for a destructive command.                                          |
 | `gws_not_found`          | 1    | Subprocess       | `gws` not on `$PATH`.                                                                                |
@@ -1138,10 +1326,12 @@ Both are single-property queries.
 
 - TOML config with single account, multiple pairs, three directions.
 - Calendar ID canonicalization at config load.
+- `accessRole` validation at config load (rejects read-only targets, `freeBusyReader` either side, bidirectional pairs that aren't writable both ways).
 - `calendar-sync run` with full and incremental sync, recurring events, modified and cancelled instances, recurrence-rule changes.
 - Sliding-horizon protection via `full_sync_interval`.
 - Overlap protection via `flock` on `<state_file>.lock`.
 - Per-pdir state with `query_fingerprint` invalidation.
+- **Drift detection on every mirror** (parents and instances that have source counterparts): two-signal model (`source_changed` from `calendar-sync:source_updated`, `mirror_drifted` from `calendar-sync:checksum`) with newer-wins conflict resolution. Mirror drift on writable-source pdirs `propagate`s back to the source; on read-only-source pdirs (subscribed iCal feeds, holiday calendars) it `revert`s. Mirror-only recurring instance overrides (a user-created override at a recurrence time the source has no override for) are not reconciled - documented limitation.
 - `init`, `config show`, `config validate`.
 - `pair list`, `pair test`.
 - `mirror list`, `mirror prune`.
@@ -1152,13 +1342,12 @@ Both are single-property queries.
 - launchd plist generation.
 - Homebrew tap distribution via release-please + GoReleaser.
 
-### Phase 2 (multi-account, drift, ergonomics)
+### Phase 2 (multi-account, ergonomics)
 
 - Multiple `[accounts.<name>]` entries; per-account `gws_config_dir`.
 - `calendar-sync auth login --account <name>`, `auth status [--account <name>]`.
 - Long-running `calendar-sync watch` (alternative to launchd).
 - Parallel pdir execution.
-- Mirror drift detection: compute desired payload for every existing mirror and patch on diff, not just on `source.updated` change. New action reason: `mirror_drift`.
 - Per-pair redaction modes (`title_template`, `redact_description`).
 - `calendar-sync status` summary command.
 - Per-source-calendar list deduplication (one `events.list` per source calendar shared across pdirs).

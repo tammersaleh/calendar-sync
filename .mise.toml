@@ -1,0 +1,30 @@
+[tools]
+go = "1.25"
+"go:github.com/golangci/golangci-lint/cmd/golangci-lint" = "1.64.8"
+
+[tasks.build]
+description = "Build the calendar-sync binary"
+run = "go build -o calendar-sync ./cmd/calendar-sync"
+
+[tasks.skill]
+description = "Regenerate the Claude skill file from the installed binary"
+run = """
+mkdir -p ~/.claude/skills/calendar-sync
+calendar-sync skill > ~/.claude/skills/calendar-sync/SKILL.md
+"""
+
+[tasks.test]
+description = "Run all tests"
+run = "go test ./..."
+
+[tasks.lint]
+description = "Run golangci-lint"
+run = "golangci-lint run ./..."
+
+[tasks.setup-hooks]
+description = "Configure git to use .githooks/"
+run = "git config core.hooksPath .githooks"
+
+[tasks.check]
+description = "Run test and lint (matches pre-push hook)"
+depends = ["test", "lint"]

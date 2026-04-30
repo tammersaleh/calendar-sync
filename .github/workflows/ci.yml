@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v2
+
+      - name: Verify go.mod is tidy
+        run: go mod tidy && git diff --exit-code go.mod go.sum
+
+      - name: Build
+        run: mise run build
+
+      - name: Test
+        run: mise run test
+
+      - name: Lint
+        run: mise run lint
+
+      - name: GoReleaser config check
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: check
+
+      - name: GoReleaser snapshot build
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --snapshot --clean --skip=publish

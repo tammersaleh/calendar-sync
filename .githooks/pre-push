@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Running pre-push checks (mise run check)..."
+mise run check

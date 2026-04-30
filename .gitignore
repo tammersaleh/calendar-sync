@@ -1,0 +1,29 @@
+# Binary
+/calendar-sync
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Local Claude Code config (user-specific, not shared)
+CLAUDE.local.md
+.claude/CLAUDE.local.md
+
+# Local state and crit artifacts (per-machine)
+state.json
+state.json.lock
+.crit/

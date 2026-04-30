@@ -987,7 +987,7 @@ This runs once per source event `E` per pdir `(P, D)`. Called from both startup 
 
 2. **Recurring instance.** If `E.recurringEventId` is set, route to the recurring-instance handler (see "Recurring Events"). The handler internally deals with cancelled, transparent, declined, and updated instances. Generic skip rules in steps 3-6 do NOT apply to recurring instances - the handler subsumes them.
 
-3. **Cancelled (non-recurring).** If `E.status == "cancelled"` (and step 2 didn't fire), compute the deterministic mirror ID from `(canonical_source_calendar_id, E.id)` and look it up in the inventory. If found, delete it (action `delete`, reason `source_cancelled`). If not, `skip(reason=cancelled)`.
+3. **Cancelled (non-recurring).** If `E.status == "cancelled"` (and step 2 didn't fire), look up the mirror in the inventory by `(canonical_source_calendar_id, E.id)`. If found, delete it (action `delete`, reason `source_cancelled`). If not, `skip(reason=cancelled)`.
 
 4. **Declined.** If the source calendar owner's attendee entry has `responseStatus=declined`, `skip(reason=declined)`. (Plus delete the mirror if one exists.)
 
@@ -1284,7 +1284,7 @@ If `gws` writes a JSON error to stderr (it does, on most failures), that message
 `run` does not abort on the first error. Execution model:
 
 ```
-refuse if `calendar-sync watch` is loaded (exit 5, daemon_already_running)
+refuse if `calendar-sync watch` is reachable via the IPC socket (exit 5, daemon_already_running)
 load and validate config
 canonicalize calendar IDs
 expand pairs to pdirs (skip enabled=false)

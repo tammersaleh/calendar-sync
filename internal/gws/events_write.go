@@ -44,7 +44,7 @@ func (c *Client) EventsInsert(ctx context.Context, calendarID string, body *Even
 		return nil, err
 	}
 	if exit != 0 {
-		return nil, fmt.Errorf("gws events.insert: exit %d: %s", exit, string(stderr))
+		return nil, classifyError(stdout, stderr, exit, "events.insert")
 	}
 
 	var out Event
@@ -90,7 +90,7 @@ func (c *Client) EventsPatch(ctx context.Context, calendarID, eventID string, bo
 		return nil, err
 	}
 	if exit != 0 {
-		return nil, fmt.Errorf("gws events.patch: exit %d: %s", exit, string(stderr))
+		return nil, classifyError(stdout, stderr, exit, "events.patch")
 	}
 
 	var out Event
@@ -124,12 +124,12 @@ func (c *Client) EventsDelete(ctx context.Context, calendarID, eventID string) e
 		"--format", "json",
 	}
 
-	_, stderr, exit, err := c.execute(ctx, args)
+	stdout, stderr, exit, err := c.execute(ctx, args)
 	if err != nil {
 		return err
 	}
 	if exit != 0 {
-		return fmt.Errorf("gws events.delete: exit %d: %s", exit, string(stderr))
+		return classifyError(stdout, stderr, exit, "events.delete")
 	}
 	return nil
 }

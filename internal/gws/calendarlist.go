@@ -39,7 +39,7 @@ func (c *Client) CalendarListGet(ctx context.Context, calendarID string) (*Calen
 		return nil, err
 	}
 	if exit != 0 {
-		return nil, fmt.Errorf("gws calendarList.get: exit %d: %s", exit, string(stderr))
+		return nil, classifyError(stdout, stderr, exit, "calendarList.get")
 	}
 
 	var entry CalendarListEntry

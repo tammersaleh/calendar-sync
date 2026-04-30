@@ -70,7 +70,7 @@ func (c *Client) EventsList(ctx context.Context, params EventsListParams) (event
 		return nil, "", err
 	}
 	if exit != 0 {
-		return nil, "", fmt.Errorf("gws events.list: exit %d: %s", exit, string(stderr))
+		return nil, "", classifyError(stdout, stderr, exit, "events.list")
 	}
 
 	pages, err := parseNDJSONPages(stdout)
@@ -109,7 +109,7 @@ func (c *Client) EventsGet(ctx context.Context, calendarID, eventID string) (*Ev
 		return nil, err
 	}
 	if exit != 0 {
-		return nil, fmt.Errorf("gws events.get: exit %d: %s", exit, string(stderr))
+		return nil, classifyError(stdout, stderr, exit, "events.get")
 	}
 
 	var event Event
@@ -156,7 +156,7 @@ func (c *Client) EventsInstances(ctx context.Context, params EventsInstancesPara
 		return nil, err
 	}
 	if exit != 0 {
-		return nil, fmt.Errorf("gws events.instances: exit %d: %s", exit, string(stderr))
+		return nil, classifyError(stdout, stderr, exit, "events.instances")
 	}
 
 	pages, err := parseNDJSONPages(stdout)

@@ -2,6 +2,7 @@ package gws_test
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -94,6 +95,40 @@ func TestEventsInsert_NonZeroExitReturnsError(t *testing.T) {
 	})
 	if gotErr == nil {
 		t.Fatal("expected error on non-zero exit")
+	}
+}
+
+func TestEventsInsert_409SurfacesAsTypedAPIConflict(t *testing.T) {
+	// SPEC.md "Mirror identification" / cancelled-and-revived: the sync
+	// layer must distinguish 409 from other errors so it can fetch the
+	// existing event and revive it. The wrapper exposes 409 via the
+	// ErrAPIConflict sentinel.
+	scenario := testhelpers.Scenario{
+		Calls: []testhelpers.ScenarioCall{
+			{
+				Stderr: `{"error":{"code":409,"message":"duplicate","errors":[{"reason":"duplicate"}]}}`,
+				Exit:   1,
+			},
+		},
+	}
+	var gotErr error
+	testhelpers.WithFakeGWS(t, scenario, func() {
+		_, gotErr = gws.New().EventsInsert(context.Background(), "alice@example.com",
+			&gws.Event{ID: "cs2dup", Summary: "x"})
+	})
+
+	if !errors.Is(gotErr, gws.ErrAPIConflict) {
+		t.Fatalf("expected errors.Is(err, ErrAPIConflict) to be true; got %v", gotErr)
+	}
+	var typed *gws.Error
+	if !errors.As(gotErr, &typed) {
+		t.Fatalf("error not *gws.Error: %v", gotErr)
+	}
+	if typed.HTTPStatus != 409 {
+		t.Errorf("HTTPStatus = %d, want 409", typed.HTTPStatus)
+	}
+	if typed.Op != "events.insert" {
+		t.Errorf("Op = %q, want events.insert", typed.Op)
 	}
 }
 

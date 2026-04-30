@@ -1,0 +1,99 @@
+// Package gws wraps the `gws` CLI as a subprocess. Every Calendar API
+// operation calendar-sync needs flows through here; nothing else in the
+// codebase knows that gws (or any external binary) exists. The single test
+// boundary for the project lives at this layer - see internal/testhelpers
+// for the fake-gws harness.
+package gws
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os/exec"
+)
+
+// Client invokes gws as a subprocess. Construct with New; methods correspond
+// one-to-one to the Calendar API calls SPEC.md uses.
+type Client struct {
+	binPath string
+}
+
+// Option configures a Client.
+type Option func(*Client)
+
+// WithBinary overrides the path to the gws binary. Default is "gws", which
+// relies on PATH; tests use this with a fully-qualified path to the fake.
+func WithBinary(path string) Option {
+	return func(c *Client) { c.binPath = path }
+}
+
+// New returns a Client. Without options it invokes gws by name, picking up
+// whatever is first on PATH.
+func New(opts ...Option) *Client {
+	c := &Client{binPath: "gws"}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}
+
+// execute runs `<binPath> <args...>` and returns stdout, stderr, exit code,
+// and a wrapping error reserved for non-exit failures: binary missing,
+// signal-killed by the context, or any other launch-time failure. A non-zero
+// exit code is NOT a Go error here - callers must inspect exitCode and
+// stderr to map to the SPEC's error taxonomy. That mapping lives in
+// errors.go (added in a later commit); for now the per-method wrappers do
+// their own minimal checks.
+//
+// When ctx is canceled or its deadline exceeded, the returned err wraps
+// ctx.Err() so callers can errors.Is(err, context.Canceled) or
+// context.DeadlineExceeded. The exit code in that case is reported as -1.
+func (c *Client) execute(ctx context.Context, args []string) (stdout, stderr []byte, exitCode int, err error) {
+	cmd := exec.CommandContext(ctx, c.binPath, args...)
+
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+
+	runErr := cmd.Run()
+	stdout = outBuf.Bytes()
+	stderr = errBuf.Bytes()
+
+	if runErr == nil {
+		return stdout, stderr, 0, nil
+	}
+
+	// Context errors take precedence over ExitError: when the context kills
+	// the subprocess, os/exec surfaces the kill as an ExitError with a
+	// signal-derived exit code, but the user-meaningful error is "your
+	// context fired". Without this check, errors.Is(err, context.Canceled)
+	// is always false for a context that fired after the subprocess started.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return stdout, stderr, -1, fmt.Errorf("gws subprocess: %w", ctxErr)
+	}
+
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		return stdout, stderr, exitErr.ExitCode(), nil
+	}
+
+	if errors.Is(runErr, fs.ErrNotExist) || isExecNotFound(runErr) {
+		return stdout, stderr, -1, fmt.Errorf("gws binary not found at %q: %w", c.binPath, runErr)
+	}
+
+	return stdout, stderr, -1, fmt.Errorf("gws subprocess failed: %w", runErr)
+}
+
+// isExecNotFound recognizes the "executable file not found in $PATH" error
+// returned by os/exec when the binary lookup fails. exec.Error wraps
+// fs.ErrNotExist via Unwrap, but only on Go versions where the wrapping was
+// added; this guard catches both.
+func isExecNotFound(err error) bool {
+	var execErr *exec.Error
+	if errors.As(err, &execErr) {
+		return errors.Is(execErr.Err, exec.ErrNotFound) || errors.Is(execErr, fs.ErrNotExist)
+	}
+	return false
+}

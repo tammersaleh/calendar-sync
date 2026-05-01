@@ -192,6 +192,18 @@ The wrapper exposes `nextSyncToken` from the LAST NDJSON page (or empty string i
 
 Source-cancelled / declined / tentative / transparent all patch the mirror instance with `{status: cancelled}` and stop. No follow-up `calendar-sync:checksum` write happens because no managed field changed; the existing checksum on the mirror is still accurate. This is one of two write paths in the recurring handler that bypass `patchMirrorWithChecksum` (the other is the source-side patch in `propagate`, which writes to the source, not a mirror).
 
+### `config.CompactDuration` is the single source of truth for wire durations
+
+Both SPEC line 588 (`config show`) and SPEC line 725 (IPC `status`) format durations the same way: `60s` (whole seconds) or `24h` (whole hours), but never Go's verbose `1m0s` / `24h0m0s`. The implementation lives in `internal/config/duration.go` as `CompactDuration(time.Duration) string` with a `Duration.Compact()` method for the typed wrapper. The daemon's `compactDuration` in `internal/daemon/socket.go` is a thin delegate so the two layers can't drift.
+
+### `gws.ErrGWSNotFound` is *gws.Error, not fs.ErrNotExist
+
+When `gws` is not on PATH, `internal/gws/client.go` returns `&Error{Code: CodeGWSNotFound, ...}` directly rather than wrapping the underlying `fs.ErrNotExist`. This is intentional: MapError's `fs.ErrNotExist` branch routes config-load failures to `config_not_found` via a substring heuristic. If the gws-binary error were also `fs.ErrNotExist`-shaped it would either be misclassified or require a more brittle heuristic. The typed sentinel sidesteps the question - `errors.Is(err, gws.ErrGWSNotFound)` matches by Code only and gets its own branch in MapError before any fs.ErrNotExist matching happens.
+
+### Partial-failure path always emits `_meta`
+
+`run.go` no longer returns on the first PDirResult.Err. Per SPEC §"Partial failure semantics" (lines 1287-1303) every pdir runs to completion; failures are collected, the meta line is emitted with `failures: [...]`, and only THEN does `cmdError(partial_failure)` get returned. Tests should assert on the meta line (last stdout line) plus the MapError code, not on early termination.
+
 ## Sandbox
 
 `mise run` commands work fine in sandboxed processes. Network access required during `go mod tidy` (first run) and during `go test` for any test that pulls a module.

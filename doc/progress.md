@@ -17,6 +17,7 @@ Session-handoff state. Read this on session start (after `SPEC.md` and `CLAUDE.m
 | 5 | `internal/recurring` handler (steps 1-3) + v1 migration cells (migration_upgrade, migration_source_won) | `4185541` |
 | 6.A | `internal/sync` inventory + classification (parent path with recurring delegation) + drift + v1 parent migration + 409 handling | `a2280e8` |
 | 6.B | `internal/sync` orphan walk + concurrent events.get fan-out (semaphore of 5) + per-entry error accumulation | `d3e00bf` |
+| 6.C | `internal/sync` Reconciler entrypoint (FullSync + Tick), conditional syncToken advancement, lastFullSync stamping, 410 GONE → NeedsFullResync signaling | `8a0e6ec` |
 
 Plus: `2ce11b6` (gitignore tweak), `523fa76` (docs: filter tentative responseStatus alongside declined), `8e5013d` (docs: subagent-per-layer + push policies).
 
@@ -26,7 +27,6 @@ Layer 6.A also extracted three helpers from recurring → mirror (since both lay
 
 | Layer | Package | Notes |
 |---|---|---|
-| 6.C | `internal/sync` (Reconciler entrypoint) | FullSync + Tick methods: orchestrate the source-list / inventory-rebuild / classify-all / orphan-walk / token-management dance. Per-source events.list calls, conditional syncToken advancement, 410 GONE recovery signaling to the daemon. |
 | 7 | `internal/daemon` | Lifecycle, scheduler (per-tick + periodic full re-sync), IPC socket, signal handling. |
 | 8 | `internal/launchd` | Plist generation, launchctl wrappers. |
 | 9 | `cmd/` | kong CLI struct + each subcommand. Lift `slack-cli`'s `internal/output` for the JSONL printer (see `next.md`'s now-deleted "Reuse" section). |
@@ -52,24 +52,29 @@ All captured in `CLAUDE.md` "Architecture decisions and gotchas". Highlights:
 - sync layer mutates the per-target Inventory in place after every write; the same map survives across pdirs that share a target.
 - Orphan walk's eventType filter is an allowlist ({default, outOfOffice, focusTime}); future Google types prune rather than silently retain.
 - Orphan walk fan-out is concurrent (semaphore of 5); inventory + Output mutations happen serially after the fan-out drains. stubAPI gained a sync.Mutex to support this.
+- Reconciler.FullSync stamps lastFullSync per source on full-source-list success regardless of whether Google returned a syncToken; gating on token advancement would loop FullSync indefinitely on a no-token source.
+- Reconciler.Tick passes nil to runClassifyLoop's visited param; FullSync passes a non-nil map. The orphan walk only runs in FullSync.
+- Tick's first call (empty in-memory token) signals NeedsFullResync without marking pdirs as failed - "no work to do" isn't a failure.
 
 ## Push status at session end
 
-The user's SSH agent disconnected during session 1, so 15 commits are now stacked locally but not pushed. The user pushes manually when they return - per CLAUDE.md "Push policy", future sessions don't block on push.
+The user's SSH agent disconnected during session 1, so 17 commits are now stacked locally but not pushed. The user pushes manually when they return - per CLAUDE.md "Push policy", future sessions don't block on push.
 
 ## Pointers for the next session
 
-When picking up layer 6.C (Reconciler entrypoint):
+When picking up layer 7 (`internal/daemon`):
 
 1. Read `SPEC.md` end-to-end (still mandatory).
 2. Read this file + the relevant `Architecture decisions and gotchas` entries in `CLAUDE.md`.
 3. Per `CLAUDE.md` "Implementation strategy", spawn a `general-purpose` subagent.
-4. 6.C's scope: SPEC §"Daemon lifecycle: startup" + §"per-tick reconciliation" + §"periodic full re-sync". Provides `Reconciler` struct holding per-source syncTokens + per-target inventories, with `FullSync(ctx)` and `Tick(ctx)` methods. FullSync rebuilds inventories, full source-list per source, classify all, orphan walk, conditional token advancement. Tick does incremental events.list with syncToken, classify the delta, conditional advancement. Both produce per-pdir results so layer 7 can decide which tokens to commit.
-5. 410 GONE on Tick → set a flag in the result so the daemon schedules an immediate full re-sync for the affected source. Don't try to recover inside Tick (the daemon owns the timer).
-6. The Classifier (6.A) mutates Inventory in place during classify; the orphan walk (6.B) needs a `visited map[mirror.SourceTuple]bool` populated during classify. The simplest hookup: FullSync iterates the source list, tracks visited tuples as it calls Classify, then runs OrphanWalker.Walk with the populated set.
-7. Per `CLAUDE.md` "Workflow" step 6, spawn `feature-dev:code-reviewer` after the layer; address findings; re-review for the clean second pass.
-8. Commit per-layer; don't worry about push.
-9. Update this file after the layer ships.
+4. 7's scope: SPEC §"Daemon lifecycle" timer-driven loop, IPC socket (`$TMPDIR/calendar-sync.sock`) for `calendar-sync status`, SIGTERM/SIGINT signal handling, `gws auth status` startup probe.
+5. The daemon constructs ONE `sync.Reconciler` at startup, calls `FullSync` once at launch, then schedules `Tick` every `poll_interval` and `FullSync` every `full_sync_interval`. On a `Tick` result with `NeedsFullResync=true` for any source, schedule an immediate FullSync (don't wait for the timer).
+6. Per SPEC §"Sleep and wake" (lines 1090-1101), the wall-clock-driven scheduler computes next-tick as `now.Truncate(poll_interval).Add(poll_interval)`, so a sleep that crosses tick boundaries fires a single catch-up tick on wake.
+7. The IPC socket emits a JSON snapshot of per-pdir state on connect (per SPEC §"calendar-sync status" stdout shape). The daemon owns the bind/cleanup lifecycle (SPEC §"IPC socket" - daemon-side lifecycle).
+8. Output: the daemon wires `r.Output = func(o sync.Outcome) { jsonl.Emit(o) }` to a JSONL printer (probably the `internal/output` package per CLAUDE.md project structure).
+9. Per `CLAUDE.md` "Workflow" step 6, spawn `feature-dev:code-reviewer` after the layer; address findings; re-review for the clean second pass.
+10. Commit per-layer; don't worry about push.
+11. Update this file after the layer ships.
 
 ### Conventions established this session
 

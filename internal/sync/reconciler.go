@@ -48,6 +48,14 @@ type Reconciler struct {
 	// "semaphore of 5" (line 1107) is the default when this is <= 0.
 	OrphanConcurrency int
 
+	// PropagateTargetEdits gates the SPEC §"Drift detection model" propagate
+	// path. When false, drift on a writable-source pdir routes to revert
+	// instead of propagate; the source is never modified. When true,
+	// SPEC's two-way behavior is in effect. Defaults to false so a fresh
+	// install runs one-way until the operator opts in via
+	// `[settings].propagate_target_edits = true`.
+	PropagateTargetEdits bool
+
 	// In-memory state. SPEC §"In-memory state" lists these as the only
 	// pieces that survive across ticks. A cold start (daemon restart, system
 	// reboot) starts with all three empty and re-derives them via FullSync.
@@ -81,6 +89,12 @@ func WithOrphanConcurrency(n int) Option {
 // WithOutput sets the Outcome sink.
 func WithOutput(out Output) Option {
 	return func(r *Reconciler) { r.Output = out }
+}
+
+// WithPropagateTargetEdits flips the safety gate. See
+// Reconciler.PropagateTargetEdits for semantics.
+func WithPropagateTargetEdits(enabled bool) Option {
+	return func(r *Reconciler) { r.PropagateTargetEdits = enabled }
 }
 
 // New constructs a Reconciler with empty in-memory state. Required fields
@@ -613,6 +627,15 @@ func (r *Reconciler) buildClassifier(
 ) (*Classifier, Output) {
 	wrapped := wrapOutput(r.Output, counts)
 
+	// Effective writability gates SPEC's drift-handling propagate path.
+	// pd.SourceWritable reflects the calendar's accessRole (the API
+	// permission); r.PropagateTargetEdits is the operator's safety toggle.
+	// Both must be true for drift to flow back to source. When the gate is
+	// off, drift routes to revert even on a writable source - matching the
+	// SPEC's read-only-source behavior so the operator can verify the
+	// one-way path before opting into bidirectional sync.
+	effectiveSourceWritable := pd.SourceWritable && r.PropagateTargetEdits
+
 	c := &Classifier{
 		API:              r.API,
 		Now:              r.Now,
@@ -621,7 +644,7 @@ func (r *Reconciler) buildClassifier(
 		Direction:        pd.Direction,
 		SourceCalendarID: pd.SourceCalendar,
 		TargetCalendarID: pd.TargetCalendar,
-		SourceWritable:   pd.SourceWritable,
+		SourceWritable:   effectiveSourceWritable,
 		Inventory:        inv,
 		Output:           wrapped,
 	}
@@ -635,7 +658,7 @@ func (r *Reconciler) buildClassifier(
 		API:              r.API,
 		SourceCalendarID: pd.SourceCalendar,
 		TargetCalendarID: pd.TargetCalendar,
-		SourceWritable:   pd.SourceWritable,
+		SourceWritable:   effectiveSourceWritable,
 		LookupMirrorParent: func(s mirror.SourceTuple) (*gws.Event, bool) {
 			return inv.Lookup(s)
 		},

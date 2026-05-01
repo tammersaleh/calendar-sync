@@ -33,6 +33,14 @@ log_level          = "info"
 log_format         = "json"
 dry_run            = false
 
+# Two-way sync gate. Defaults to false: source-side edits flow into
+# mirrors, but mirror-side edits get reverted on the next tick (the
+# source is never modified). Flip to true once you've confirmed the
+# one-way path behaves as expected and you actually want bidirectional
+# sync. Pdirs whose source is read-only (accessRole < writer) always
+# revert regardless of this setting.
+# propagate_target_edits = true
+
 [[pairs]]
 name      = "work-personal"
 direction = "bidirectional"

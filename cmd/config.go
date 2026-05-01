@@ -27,12 +27,13 @@ func (c *ConfigShowCmd) Run(rt *Runtime) error {
 
 	body := configShowPayload{
 		Settings: settingsPayload{
-			PollInterval:     cfg.Settings.PollInterval.Compact(),
-			Horizon:          cfg.Settings.Horizon.Compact(),
-			FullSyncInterval: cfg.Settings.FullSyncInterval.Compact(),
-			LogLevel:         cfg.Settings.LogLevel,
-			LogFormat:        cfg.Settings.LogFormat,
-			DryRun:           cfg.Settings.DryRun,
+			PollInterval:         cfg.Settings.PollInterval.Compact(),
+			Horizon:              cfg.Settings.Horizon.Compact(),
+			FullSyncInterval:     cfg.Settings.FullSyncInterval.Compact(),
+			LogLevel:             cfg.Settings.LogLevel,
+			LogFormat:            cfg.Settings.LogFormat,
+			DryRun:               cfg.Settings.DryRun,
+			PropagateTargetEdits: cfg.Settings.PropagateTargetEdits,
 		},
 	}
 
@@ -142,12 +143,13 @@ type configShowPayload struct {
 // example exactly. Compact is shared with the daemon's IPC status response
 // (SPEC line 725) so both wire shapes agree.
 type settingsPayload struct {
-	PollInterval     string `json:"poll_interval"`
-	Horizon          string `json:"horizon"`
-	FullSyncInterval string `json:"full_sync_interval"`
-	LogLevel         string `json:"log_level"`
-	LogFormat        string `json:"log_format"`
-	DryRun           bool   `json:"dry_run"`
+	PollInterval         string `json:"poll_interval"`
+	Horizon              string `json:"horizon"`
+	FullSyncInterval     string `json:"full_sync_interval"`
+	LogLevel             string `json:"log_level"`
+	LogFormat            string `json:"log_format"`
+	DryRun               bool   `json:"dry_run"`
+	PropagateTargetEdits bool   `json:"propagate_target_edits"`
 }
 
 // pairPayload is the wire shape for one pair entry in `config show` and

@@ -18,12 +18,13 @@ type Config struct {
 // Settings is the [settings] block. Every field has a default applied
 // after parsing so an absent [settings] block produces a usable Config.
 type Settings struct {
-	PollInterval     Duration `toml:"poll_interval"`
-	Horizon          Duration `toml:"horizon"`
-	FullSyncInterval Duration `toml:"full_sync_interval"`
-	LogLevel         string   `toml:"log_level"`
-	LogFormat        string   `toml:"log_format"`
-	DryRun           bool     `toml:"dry_run"`
+	PollInterval         Duration `toml:"poll_interval"`
+	Horizon              Duration `toml:"horizon"`
+	FullSyncInterval     Duration `toml:"full_sync_interval"`
+	LogLevel             string   `toml:"log_level"`
+	LogFormat            string   `toml:"log_format"`
+	DryRun               bool     `toml:"dry_run"`
+	PropagateTargetEdits bool     `toml:"propagate_target_edits"`
 }
 
 // Pair is one [[pairs]] entry. Enabled is a *bool so an unset value

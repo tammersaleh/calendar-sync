@@ -107,6 +107,11 @@ func TestConfigShowCmd_EmitsResolvedSettings(t *testing.T) {
 	if payload.Settings.FullSyncInterval != "24h" {
 		t.Errorf("full_sync_interval = %q, want 24h", payload.Settings.FullSyncInterval)
 	}
+	// propagate_target_edits defaults to false (one-way sync); the wire
+	// shape MUST surface it so operators can confirm at a glance.
+	if payload.Settings.PropagateTargetEdits {
+		t.Errorf("propagate_target_edits = true; default must be false until opted in")
+	}
 	if len(payload.Pairs) != 1 || payload.Pairs[0].Name != "work-personal" {
 		t.Errorf("pairs = %+v, want one pair named work-personal", payload.Pairs)
 	}

@@ -83,12 +83,13 @@ target = "primary"
 	}
 
 	wantSettings := Settings{
-		PollInterval:     Duration(60 * time.Second),
-		Horizon:          Duration(365 * 24 * time.Hour),
-		FullSyncInterval: Duration(24 * time.Hour),
-		LogLevel:         LogLevelInfo,
-		LogFormat:        LogFormatJSON,
-		DryRun:           false,
+		PollInterval:         Duration(60 * time.Second),
+		Horizon:              Duration(365 * 24 * time.Hour),
+		FullSyncInterval:     Duration(24 * time.Hour),
+		LogLevel:             LogLevelInfo,
+		LogFormat:            LogFormatJSON,
+		DryRun:               false,
+		PropagateTargetEdits: false, // SPEC: defaults off; one-way sync until opted in.
 	}
 	if !reflect.DeepEqual(cfg.Settings, wantSettings) {
 		t.Errorf("Settings = %#v\nwant     %#v", cfg.Settings, wantSettings)
@@ -116,6 +117,7 @@ full_sync_interval = "12h"
 log_level = "debug"
 log_format = "text"
 dry_run = true
+propagate_target_edits = true
 
 [[pairs]]
 name = "p1"
@@ -150,6 +152,9 @@ enabled = false
 	}
 	if !cfg.Settings.DryRun {
 		t.Errorf("DryRun = %v, want true", cfg.Settings.DryRun)
+	}
+	if !cfg.Settings.PropagateTargetEdits {
+		t.Errorf("PropagateTargetEdits = %v, want true", cfg.Settings.PropagateTargetEdits)
 	}
 	if cfg.Pairs[0].IsEnabled() {
 		t.Errorf("explicit enabled=false ignored")

@@ -124,6 +124,8 @@ Together they give us an unambiguous classification of every mirror at reconcili
 
 Equal timestamps tiebreak to source. Google reports `updated` to milliseconds; concurrent edits within the same millisecond are vanishingly rare in practice.
 
+"Source is writable" in the table above means BOTH the source calendar's `accessRole >= writer` AND `[settings].propagate_target_edits = true`. The setting defaults to false: a fresh install runs one-way (mirror edits revert) until the operator opts in. A read-only source can never propagate regardless of the setting.
+
 #### Managed fields and the checksum
 
 These are the fields calendar-sync writes when it creates or patches a mirror, and (with one exception) the fields it watches for drift. The checksum is over their canonical serialization:
@@ -249,6 +251,7 @@ calendar-sync uses whatever account `gws auth status` reports. Multi-account sup
 | `log_level`          | string   | `info`  | One of `debug`, `info`, `warn`, `error`.                                                                                     |
 | `log_format`         | string   | `json`  | One of `json` (JSONL to stderr), `text` (human-readable to stderr).                                                          |
 | `dry_run`            | bool     | `false` | If true, log what would change but make no API writes. Reads still happen.                                                   |
+| `propagate_target_edits` | bool | `false` | Two-way sync gate. When false (default), drift on a writable-source pdir routes to `revert` instead of `propagate` - the source is never modified. When true, SPEC's two-way behavior in §"Drift detection model" is in effect. Pdirs whose source is read-only (`accessRole < writer`) always revert regardless. The default-off posture lets operators verify the one-way path before opting into bidirectional sync. |
 
 Duration strings follow Go's `time.ParseDuration` syntax (`30s`, `5m`, `24h`) plus `d` (days) which calendar-sync adds.
 

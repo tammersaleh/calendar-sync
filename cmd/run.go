@@ -84,6 +84,7 @@ func (c *RunCmd) run(rt *Runtime, canonical *config.Canonical, count *int) error
 	p := rt.printer()
 	rec := syncpkg.New(api, scopedCanonical,
 		syncpkg.WithHorizon(canonical.Settings.Horizon.Duration()),
+		syncpkg.WithPropagateTargetEdits(canonical.Settings.PropagateTargetEdits),
 		syncpkg.WithOutput(func(o syncpkg.Outcome) {
 			p.Emit(outcomeRow{Outcome: o})
 			*count++

@@ -204,6 +204,16 @@ When `gws` is not on PATH, `internal/gws/client.go` returns `&Error{Code: CodeGW
 
 `run.go` no longer returns on the first PDirResult.Err. Per SPEC §"Partial failure semantics" (lines 1287-1303) every pdir runs to completion; failures are collected, the meta line is emitted with `failures: [...]`, and only THEN does `cmdError(partial_failure)` get returned. Tests should assert on the meta line (last stdout line) plus the MapError code, not on early termination.
 
+### `propagate_target_edits` gates two-way sync at the Reconciler
+
+`config.Settings.PropagateTargetEdits` (default false) is ANDed with `pd.SourceWritable` inside `Reconciler.buildClassifier` to produce the effective writability the Classifier and recurring.Handler see. The downstream drift-matrix code is unchanged - it still consumes `SourceWritable` as before. This means:
+
+- Default install: even a calendar with `accessRole=writer` is treated as read-only by the drift-matrix; mirror-side edits revert.
+- `[settings].propagate_target_edits = true`: SPEC's two-way behavior is in effect.
+- A read-only source (`accessRole < writer`) can never propagate regardless of the setting; the gate is a SUBSET, not an override.
+
+The gate lives in the Reconciler rather than in mirror.Classify so Classify stays a pure function of `(signal, sourceWritable, ...)`. Tests that exercise the matrix directly (classify_test.go) bypass the gate by constructing a Classifier with explicit SourceWritable; tests that want to pin the gate (reconciler_test.go's TestBuildClassifier_Gate*) drive `Reconciler.buildClassifier` directly.
+
 ## Sandbox
 
 `mise run` commands work fine in sandboxed processes. Network access required during `go mod tidy` (first run) and during `go test` for any test that pulls a module.

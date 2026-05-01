@@ -33,6 +33,7 @@ func (c *WatchCmd) Run(rt *Runtime) error {
 	api := rt.gwsClient()
 	reconciler := syncpkg.New(api, canonical,
 		syncpkg.WithHorizon(canonical.Settings.Horizon.Duration()),
+		syncpkg.WithPropagateTargetEdits(canonical.Settings.PropagateTargetEdits),
 	)
 
 	d := &daemon.Daemon{

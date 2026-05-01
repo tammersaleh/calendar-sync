@@ -1150,3 +1150,55 @@ func TestInventorySize_ReflectsInventoryEntries(t *testing.T) {
 		t.Errorf("InventorySize after delete = %d, want 1", got)
 	}
 }
+
+// ---------- PropagateTargetEdits safety gate ----------
+
+// buildClassifier ANDs PropagateTargetEdits with pd.SourceWritable so a
+// freshly installed daemon never propagates mirror edits back to source.
+// These tests pin the gate at the construction layer (the four-way matrix
+// itself is tested in classify_test.go).
+func TestBuildClassifier_GateOff_NeutralizesSourceWritable(t *testing.T) {
+	r := New(nil, &config.Canonical{})
+	r.PropagateTargetEdits = false
+	pd := makeTestPDir("p1", "src-A", "tgt-A", true) // writable per accessRole
+	c, _ := r.buildClassifier(pd, NewInventory("tgt-A"), &Counts{})
+	if c.SourceWritable {
+		t.Error("Classifier.SourceWritable must be false when gate is off, even with a writable source")
+	}
+	if c.Recurring.SourceWritable {
+		t.Error("recurring.Handler.SourceWritable must be false when gate is off")
+	}
+}
+
+func TestBuildClassifier_GateOn_PassesThroughSourceWritable(t *testing.T) {
+	r := New(nil, &config.Canonical{})
+	r.PropagateTargetEdits = true
+	pd := makeTestPDir("p1", "src-A", "tgt-A", true)
+	c, _ := r.buildClassifier(pd, NewInventory("tgt-A"), &Counts{})
+	if !c.SourceWritable {
+		t.Error("Classifier.SourceWritable must be true when gate is on AND source is writable")
+	}
+	if !c.Recurring.SourceWritable {
+		t.Error("recurring.Handler.SourceWritable must be true when gate is on AND source is writable")
+	}
+}
+
+func TestBuildClassifier_GateOn_ReadOnlySourceStaysReadOnly(t *testing.T) {
+	// Even with the gate flipped on, a source whose accessRole is below
+	// writer can never be written to. The gate is a SUBSET, not an
+	// override.
+	r := New(nil, &config.Canonical{})
+	r.PropagateTargetEdits = true
+	pd := makeTestPDir("p1", "src-A", "tgt-A", false)
+	c, _ := r.buildClassifier(pd, NewInventory("tgt-A"), &Counts{})
+	if c.SourceWritable {
+		t.Error("read-only source must stay read-only regardless of the gate")
+	}
+}
+
+func TestWithPropagateTargetEdits_OptionApplies(t *testing.T) {
+	r := New(nil, &config.Canonical{}, WithPropagateTargetEdits(true))
+	if !r.PropagateTargetEdits {
+		t.Error("WithPropagateTargetEdits(true) did not apply")
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/tammersaleh/calendar-sync/internal/gws"
+	"github.com/tammersaleh/calendar-sync/internal/mirror"
 )
 
 // recordedCall captures one method invocation on stubAPI. Fields are unioned
@@ -37,6 +38,8 @@ type stubAPI struct {
 	mu              sync.Mutex
 	listResponses   []listResponse
 	listErrors      []error
+	listByLabel     map[string][]listResponse // optional per-label routing
+	listErrByLabel  map[string][]error
 	getResponses    map[[2]string][]*gws.Event
 	getErrors       map[[2]string][]error
 	instancesResp   [][]gws.Event
@@ -58,15 +61,57 @@ type listResponse struct {
 
 func newStubAPI() *stubAPI {
 	return &stubAPI{
-		getResponses: make(map[[2]string][]*gws.Event),
-		getErrors:    make(map[[2]string][]error),
+		getResponses:   make(map[[2]string][]*gws.Event),
+		getErrors:      make(map[[2]string][]error),
+		listByLabel:    make(map[string][]listResponse),
+		listErrByLabel: make(map[string][]error),
 	}
+}
+
+// listLabel computes a routing label for an EventsListParams. Tests that
+// need to enqueue per-(source, shape) responses use queueListLabeled with
+// the matching label; tests that don't care use the FIFO queueList.
+//
+// Labels:
+//
+//   - "list:<calendarID>:full"        - full source-list (no syncToken,
+//                                       no PrivateExtendedProperty filter)
+//   - "list:<calendarID>:incr"        - incremental tick (syncToken set)
+//   - "list:<calendarID>:inv:<v>"     - inventory rebuild (per version)
+func listLabel(p gws.EventsListParams) string {
+	if p.SyncToken != "" {
+		return "list:" + p.CalendarID + ":incr"
+	}
+	if len(p.PrivateExtendedProperty) > 0 {
+		// inventory rebuild uses calendar-sync:version=<n>; the label
+		// captures the version so v2 and v1 queues stay separate.
+		return "list:" + p.CalendarID + ":inv:" + p.PrivateExtendedProperty[0]
+	}
+	return "list:" + p.CalendarID + ":full"
 }
 
 func (s *stubAPI) EventsList(_ context.Context, params gws.EventsListParams) ([]gws.Event, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, recordedCall{Op: "EventsList", CalendarID: params.CalendarID, ListParams: params})
+
+	// Per-label routing wins when configured. Errors for the label are
+	// dequeued first; on a non-nil error the response queue isn't consumed.
+	label := listLabel(params)
+	if errs := s.listErrByLabel[label]; len(errs) > 0 {
+		head := errs[0]
+		s.listErrByLabel[label] = errs[1:]
+		if head != nil {
+			return nil, "", head
+		}
+	}
+	if resps := s.listByLabel[label]; len(resps) > 0 {
+		head := resps[0]
+		s.listByLabel[label] = resps[1:]
+		return head.events, head.token, nil
+	}
+
+	// Fall back to FIFO queues (used by older tests).
 	if len(s.listErrors) > 0 {
 		head := s.listErrors[0]
 		s.listErrors = s.listErrors[1:]
@@ -75,7 +120,7 @@ func (s *stubAPI) EventsList(_ context.Context, params gws.EventsListParams) ([]
 		}
 	}
 	if len(s.listResponses) == 0 {
-		return nil, "", errors.New("stubAPI: no EventsList response queued")
+		return nil, "", errors.New("stubAPI: no EventsList response queued for " + label)
 	}
 	head := s.listResponses[0]
 	s.listResponses = s.listResponses[1:]
@@ -197,6 +242,52 @@ func (s *stubAPI) queueList(events []gws.Event, token string) {
 // alongside an error (doing so would pollute later successful calls).
 func (s *stubAPI) queueListErr(err error) {
 	s.listErrors = append(s.listErrors, err)
+}
+
+// queueListFull enqueues a response for the full source-list call against
+// the given calendar (no syncToken, no PrivateExtendedProperty filter).
+// Used by FullSync tests; pairs with the matching helpers below for tick /
+// inventory shapes so a single test can feed every shape distinctly.
+func (s *stubAPI) queueListFull(calendarID string, events []gws.Event, token string) {
+	s.listByLabel["list:"+calendarID+":full"] = append(
+		s.listByLabel["list:"+calendarID+":full"],
+		listResponse{events: events, token: token})
+}
+
+// queueListFullErr enqueues an error for the next full source-list call
+// against the given calendar.
+func (s *stubAPI) queueListFullErr(calendarID string, err error) {
+	s.listErrByLabel["list:"+calendarID+":full"] = append(
+		s.listErrByLabel["list:"+calendarID+":full"], err)
+}
+
+// queueListIncr enqueues a response for the per-tick incremental list
+// (with syncToken).
+func (s *stubAPI) queueListIncr(calendarID string, events []gws.Event, token string) {
+	s.listByLabel["list:"+calendarID+":incr"] = append(
+		s.listByLabel["list:"+calendarID+":incr"],
+		listResponse{events: events, token: token})
+}
+
+// queueListIncrErr enqueues an error for the next incremental list call.
+func (s *stubAPI) queueListIncrErr(calendarID string, err error) {
+	s.listErrByLabel["list:"+calendarID+":incr"] = append(
+		s.listErrByLabel["list:"+calendarID+":incr"], err)
+}
+
+// queueListInventory enqueues a response for one of the inventory rebuild
+// list calls. version is "1" or "2" (mirror.SchemaVersion).
+func (s *stubAPI) queueListInventory(calendarID, version string, events []gws.Event) {
+	label := "list:" + calendarID + ":inv:" + mirror.ExtKeyVersion + "=" + version
+	s.listByLabel[label] = append(s.listByLabel[label],
+		listResponse{events: events, token: ""})
+}
+
+// queueListInventoryErr enqueues an error for the next inventory rebuild
+// list call against the given calendar+version.
+func (s *stubAPI) queueListInventoryErr(calendarID, version string, err error) {
+	label := "list:" + calendarID + ":inv:" + mirror.ExtKeyVersion + "=" + version
+	s.listErrByLabel[label] = append(s.listErrByLabel[label], err)
 }
 
 func (s *stubAPI) queueGet(calendarID, eventID string, e *gws.Event) {

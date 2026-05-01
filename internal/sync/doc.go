@@ -20,9 +20,13 @@
 //   - orphan.go: SPEC §"Daemon lifecycle: periodic full re-sync" step 5,
 //     the post-classify cleanup walk that prunes mirrors whose source is
 //     gone, outside horizon, or now-ineligible.
+//   - reconciler.go: the public FullSync / Tick entrypoint per SPEC
+//     §"Daemon lifecycle: startup" / "per-tick reconciliation" /
+//     "periodic full re-sync". Owns the in-memory per-source syncTokens
+//     and per-target inventories that survive across ticks.
 //
 // Layer 6.A covers the parent / non-recurring path; recurring instances
 // delegate to internal/recurring's Handler via the Classifier's Recurring
-// field. Layer 6.B adds the orphan walk; the Reconciler entrypoint
-// (FullSync, Tick) is added in 6.C.
+// field. Layer 6.B adds the orphan walk; layer 6.C provides the
+// Reconciler the daemon (layer 7) drives.
 package sync

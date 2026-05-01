@@ -467,9 +467,10 @@ A given `reason` is paired with one of six `action` values: `insert`, `patch`, `
 | `cancelled`                | `skip`                      | Source `status=cancelled` and no mirror exists to delete.                                                                                |
 | `source_cancelled`         | `delete`                    | Source `status=cancelled` and a mirror exists.                                                                                           |
 | `declined`                 | `skip` or `delete`          | Source calendar owner's `responseStatus=declined`. `delete` if a mirror exists, `skip` if not.                                           |
+| `tentative`                | `skip` or `delete`          | Source calendar owner's `responseStatus=tentative` (the "maybe" state). Treated like `declined` because a tentative event isn't a confirmed busy block. `delete` if a mirror exists, `skip` if not. |
 | `transparency_transparent` | `skip` or `delete`          | Source `transparency=transparent`. `delete` if a mirror exists, `skip` if not.                                                           |
 | `outside_horizon`          | `skip` or `delete`          | Non-recurring source `start > now + horizon`, or recurring source has no instance in `[now, now + horizon]`. `delete` if mirror exists.  |
-| `parent_not_eligible`      | `skip`                      | A recurring instance arrived but its source parent is itself filtered out (cancelled, transparent, declined, outside_horizon).           |
+| `parent_not_eligible`      | `skip`                      | A recurring instance arrived but its source parent is itself filtered out (cancelled, transparent, declined, tentative, outside_horizon). |
 | `unchanged`                | `skip`                      | Both drift signals false: mirror up-to-date and unmodified relative to source.                                                            |
 | `pair_disabled`            | `skip`                      | The pdir is `enabled=false`. Emitted only when the user explicitly named the pair via `--pair`.                                          |
 | `instance_unmaterializable`| `skip`                      | Recurring-instance lookup returned zero results even after re-patching the mirror parent (rare; see "Zero-result instance lookup").       |
@@ -848,7 +849,7 @@ A source event is mirrored only if **all** of these are true:
 
 - `eventType` is in `{default, outOfOffice, focusTime}`. Excludes `birthday`, `fromGmail`, `workingLocation`. Set as the `eventTypes` parameter on `events.list` so Google does the filtering server-side.
 - `transparency != "transparent"`. Free events are skipped regardless of all-day-ness.
-- `responseStatus != "declined"` for the source calendar's owner attendee entry. (No attendees array means the source owner is implicitly accepted - mirror.)
+- The source calendar owner's attendee `responseStatus` is one of `accepted` or `needsAction` (or there's no attendees array, in which case the owner is implicitly accepted). `declined` and `tentative` are both excluded - the owner has indicated this isn't a confirmed busy block, and mirroring would create a busy block on the destination calendar that doesn't reflect the owner's actual commitment.
 - Does not already carry `extendedProperties.private["calendar-sync:source"]` (loop prevention).
 - `start.dateTime <= now + horizon` (or `start.date <= today + horizon` for all-day).
 
@@ -950,7 +951,7 @@ What full re-sync does refresh:
    - **Source returns 404 or has `status=cancelled`**: delete the mirror. Action `delete`, reason `orphaned`.
    - **Source is non-recurring and `start > now + horizon`**: delete the mirror. Action `delete`, reason `outside_horizon`.
    - **Source is a recurring parent (has `recurrence`)**: don't trust `start` (which is the series start). Call `events.instances?calendarId=<S>&eventId=<source_id>&timeMin=<now>&timeMax=<now + horizon>&maxResults=1&showDeleted=false`. Zero instances: delete the mirror, reason `outside_horizon`.
-   - **Source is alive and in horizon but was filtered** (eventType excluded by Google's server-side filter, transparency=transparent, declined, etc.): delete the mirror, reason `source_filtered`. The fact that the source exists but doesn't match our query means it's no longer eligible for mirroring.
+   - **Source is alive and in horizon but was filtered** (eventType excluded by Google's server-side filter, transparency=transparent, declined, tentative, etc.): delete the mirror, reason `source_filtered`. The fact that the source exists but doesn't match our query means it's no longer eligible for mirroring.
 
 Step 5 closes the gap that the per-tick path can't: incremental deltas via `syncToken` carry `status=cancelled` for source deletions only when the daemon was up to receive them. If the daemon was down (laptop closed, system rebooted) when a source was deleted, the cancellation event is consumed and lost - the next incremental delta never sees it. Periodic full re-sync's orphan walk catches what the per-tick path missed.
 
@@ -958,7 +959,7 @@ What this catches:
 
 - **Horizon ingress.** Events that crossed into `[now, now + horizon]` simply by passage of time, without changing. Incremental sync wouldn't return them; full sync does.
 - **Mirror drift on currently-eligible source events.** A user edited a mirror but its source hasn't changed since the last delta. The incremental delta wouldn't include the source event, so the classification logic never had a chance to detect drift. Full sync visits every source event, checks every mirror, catches the drift.
-- **Orphans.** Mirrors whose source was deleted, moved beyond horizon, or made ineligible (transparency, declined) while the daemon was down. The orphan walk in step 5 handles these.
+- **Orphans.** Mirrors whose source was deleted, moved beyond horizon, or made ineligible (transparency, declined, tentative) while the daemon was down. The orphan walk in step 5 handles these.
 - **`accessRole` changes on calendars.** Step 1 re-fetches access roles. A target that lost writer access stops accepting writes; a source that gained writer access starts having its mirror drift propagated.
 
 What this does NOT catch (still documented limitations):
@@ -985,21 +986,23 @@ This runs once per source event `E` per pdir `(P, D)`. Called from both startup 
 
 1. **Already a mirror.** If `E.extendedProperties.private["calendar-sync:source"]` is set, `skip(reason=is_mirror)`. This is the bidirectional loop guard.
 
-2. **Recurring instance.** If `E.recurringEventId` is set, route to the recurring-instance handler (see "Recurring Events"). The handler internally deals with cancelled, transparent, declined, and updated instances. Generic skip rules in steps 3-6 do NOT apply to recurring instances - the handler subsumes them.
+2. **Recurring instance.** If `E.recurringEventId` is set, route to the recurring-instance handler (see "Recurring Events"). The handler internally deals with cancelled, transparent, declined, tentative, and updated instances. Generic skip rules in steps 3-7 do NOT apply to recurring instances - the handler subsumes them.
 
 3. **Cancelled (non-recurring).** If `E.status == "cancelled"` (and step 2 didn't fire), look up the mirror in the inventory by `(canonical_source_calendar_id, E.id)`. If found, delete it (action `delete`, reason `source_cancelled`). If not, `skip(reason=cancelled)`.
 
 4. **Declined.** If the source calendar owner's attendee entry has `responseStatus=declined`, `skip(reason=declined)`. (Plus delete the mirror if one exists.)
 
-5. **Transparent.** If `E.transparency == "transparent"`, `skip(reason=transparency_transparent)`. (Plus delete the mirror if one exists.)
+5. **Tentative.** If the source calendar owner's attendee entry has `responseStatus=tentative`, `skip(reason=tentative)`. (Plus delete the mirror if one exists.) The owner hasn't committed; mirroring it would advertise busy time the owner isn't sure about.
 
-6. **Outside horizon.** Compute the horizon-eligibility for this event:
+6. **Transparent.** If `E.transparency == "transparent"`, `skip(reason=transparency_transparent)`. (Plus delete the mirror if one exists.)
+
+7. **Outside horizon.** Compute the horizon-eligibility for this event:
    - For non-recurring: the event is in horizon if `start <= now + horizon` (where `start = E.start.dateTime || E.start.date`).
    - For recurring parents (`E.recurrence` is set): the event is in horizon if **any instance falls in `[now, now + horizon]`**. To check, call `events.instances?eventId=<E.id>&calendarId=<S>&timeMin=<now>&timeMax=<now + horizon>&maxResults=1&showDeleted=false`. If the response has at least one instance, the parent is in horizon. If empty, treat as outside_horizon.
 
    If outside horizon: `skip(reason=outside_horizon)` and delete the mirror if one exists.
 
-7. **Normal reconciliation.** Look up the mirror in the inventory by `(canonical_source_calendar_id, E.id)`:
+8. **Normal reconciliation.** Look up the mirror in the inventory by `(canonical_source_calendar_id, E.id)`:
    - **No mirror in inventory**: compute the deterministic mirror ID from `(canonical_source_calendar_id, E.id)` and `events.insert` on `T` with the full mirror payload (including the deterministic `id`). Action `insert`, reason `source_updated`. Add the post-write resource to the inventory.
      - **On HTTP 409 `duplicate`**: another process inserted the same mirror between our inventory build and our insert (e.g. concurrent `calendar-sync run` racing through the socket exclusion, or a deleted mirror that Google still has the ID reserved for). `events.get?eventId=<deterministic_id>` to fetch the existing mirror. If `status=cancelled`, `events.patch?eventId=<deterministic_id>` with `status=confirmed` plus the full mirror payload to revive it (action `insert`, reason `source_updated`). If alive, treat as "mirror exists" and re-run normal reconciliation against the fetched resource (drift detection etc.). Either way add to inventory.
    - **Mirror exists**: compute the two drift-detection signals from "Drift detection model":
@@ -1122,7 +1125,7 @@ A recurring source event with no overrides comes back from `events.list?singleEv
 
 ### The recurring-instance handler
 
-When the classification logic's recurring-instance branch routes here, this is the full reconciliation algorithm. It internally handles cancelled, transparent, declined, and modified cases - all the skip rules that the early-branch bypassed for the generic path.
+When the classification logic's recurring-instance branch routes here, this is the full reconciliation algorithm. It internally handles cancelled, transparent, declined, tentative, and modified cases - all the skip rules that the early-branch bypassed for the generic path.
 
 #### Step 1: find or repair the mirror parent
 
@@ -1130,7 +1133,7 @@ Look up the mirror parent by `calendar-sync:source = "<S>:<E.recurringEventId>"`
 
 If absent (incremental sync can return only the exception when only the exception changed), fetch the source parent via `events.get?calendarId=<S>&eventId=<E.recurringEventId>` and reconcile it through the classification logic's normal-reconciliation step. After that succeeds, the mirror parent exists and we proceed.
 
-If the source parent is now ineligible (status=cancelled, transparency=transparent, declined, or outside_horizon when checked via `events.instances`), record `skip(reason=parent_not_eligible)` and stop. The mirror parent isn't created, and any prior mirror instance for this exception will be cleaned up by the orphan-prune pass.
+If the source parent is now ineligible (status=cancelled, transparency=transparent, declined, tentative, or outside_horizon when checked via `events.instances`), record `skip(reason=parent_not_eligible)` and stop. The mirror parent isn't created, and any prior mirror instance for this exception will be cleaned up by the orphan-prune pass.
 
 #### Step 2: locate the mirror instance
 
@@ -1156,8 +1159,9 @@ Apply these rules in order to the source exception `E`. The "user-facing action"
 
 1. **Cancelled** - If `E.status == "cancelled"`: if the mirror instance is already cancelled, `skip(reason=unchanged)`. Otherwise call `events.patch` on the mirror instance with `{"status": "cancelled"}`. Action `delete`, reason `source_cancelled`. The API primitive is `patch`, but the effect on the mirror is removal of the busy block, so we report `delete`.
 2. **Declined** - If the source calendar owner's attendee entry on `E` has `responseStatus=declined`: if the mirror instance is already cancelled, `skip(reason=unchanged)`. Otherwise patch the mirror instance to `status=cancelled`. Action `delete`, reason `declined`.
-3. **Transparent** - If `E.transparency == "transparent"`: if the mirror instance is already cancelled, `skip(reason=unchanged)`. Otherwise patch the mirror instance to `status=cancelled`. Action `delete`, reason `transparency_transparent`.
-4. **Drift detection on the instance.** Compute the same two signals as for non-recurring events, but on the instance:
+3. **Tentative** - If the source calendar owner's attendee entry on `E` has `responseStatus=tentative`: if the mirror instance is already cancelled, `skip(reason=unchanged)`. Otherwise patch the mirror instance to `status=cancelled`. Action `delete`, reason `tentative`.
+4. **Transparent** - If `E.transparency == "transparent"`: if the mirror instance is already cancelled, `skip(reason=unchanged)`. Otherwise patch the mirror instance to `status=cancelled`. Action `delete`, reason `transparency_transparent`.
+5. **Drift detection on the instance.** Compute the same two signals as for non-recurring events, but on the instance:
    - `source_changed = E.updated > mirror_instance.calendar-sync:source_updated`
    - `mirror_drifted = sha256(canonical(mirror_instance.<managed fields>)) != mirror_instance.calendar-sync:checksum`. If `version < 2` on the mirror instance, derive `mirror_drifted` per the "Schema version migration" rules instead (compare live managed fields to desired-from-source).
 

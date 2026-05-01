@@ -28,14 +28,15 @@ import (
 // the wrapper sends whatever the caller passed verbatim to surface caller
 // bugs immediately rather than silently sending the API default.
 type EventsListParams struct {
-	CalendarID   string   `json:"calendarId"`
-	TimeMin      string   `json:"timeMin,omitempty"`
-	TimeMax      string   `json:"timeMax,omitempty"`
-	SyncToken    string   `json:"syncToken,omitempty"`
-	SingleEvents bool     `json:"singleEvents,omitempty"`
-	ShowDeleted  bool     `json:"showDeleted"`
-	EventTypes   []string `json:"eventTypes,omitempty"`
-	MaxResults   int      `json:"maxResults,omitempty"`
+	CalendarID              string   `json:"calendarId"`
+	TimeMin                 string   `json:"timeMin,omitempty"`
+	TimeMax                 string   `json:"timeMax,omitempty"`
+	SyncToken               string   `json:"syncToken,omitempty"`
+	SingleEvents            bool     `json:"singleEvents,omitempty"`
+	ShowDeleted             bool     `json:"showDeleted"`
+	EventTypes              []string `json:"eventTypes,omitempty"`
+	MaxResults              int      `json:"maxResults,omitempty"`
+	PrivateExtendedProperty []string `json:"privateExtendedProperty,omitempty"`
 }
 
 // eventsPage is one page of events.list/instances output. gws --page-all

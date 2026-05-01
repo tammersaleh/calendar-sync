@@ -299,7 +299,7 @@ func (h *Handler) reconcileInstance(ctx context.Context, source, mirrorInstance 
 	if source.Status == gws.EventStatusCancelled {
 		return h.cancelMirrorInstance(ctx, mirrorInstance, ReasonSourceCancelled)
 	}
-	switch sourceOwnerResponseStatus(source) {
+	switch mirror.SourceOwnerResponseStatus(source) {
 	case gws.ResponseStatusDeclined:
 		return h.cancelMirrorInstance(ctx, mirrorInstance, ReasonDeclined)
 	case gws.ResponseStatusTentative:
@@ -415,8 +415,8 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 		}, nil
 
 	case mirror.ActionPropagate:
-		fields := driftedFieldNames(mirrorInstance, desired)
-		propagateBody := buildPropagateBody(mirrorInstance, fields)
+		fields := mirror.DriftedFieldNames(mirrorInstance, desired)
+		propagateBody := mirror.BuildPropagatePatchBody(mirrorInstance, fields)
 		patchedSource, err := h.API.EventsPatch(ctx, h.SourceCalendarID, source.ID, propagateBody)
 		if err != nil {
 			return Result{}, err
@@ -437,7 +437,7 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 		}, nil
 
 	case mirror.ActionRevert:
-		fields := driftedFieldNames(mirrorInstance, desired)
+		fields := mirror.DriftedFieldNames(mirrorInstance, desired)
 		desired.ID = ""
 		post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, desired)
 		if err != nil {

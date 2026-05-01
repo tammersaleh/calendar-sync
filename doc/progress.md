@@ -16,6 +16,7 @@ Session-handoff state. Read this on session start (after `SPEC.md` and `CLAUDE.m
 | 4 | `internal/mirror` payload + drift signal + Classify four-way matrix | `214726b` |
 | 5 | `internal/recurring` handler (steps 1-3) + v1 migration cells (migration_upgrade, migration_source_won) | `4185541` |
 | 6.A | `internal/sync` inventory + classification (parent path with recurring delegation) + drift + v1 parent migration + 409 handling | `a2280e8` |
+| 6.B | `internal/sync` orphan walk + concurrent events.get fan-out (semaphore of 5) + per-entry error accumulation | `d3e00bf` |
 
 Plus: `2ce11b6` (gitignore tweak), `523fa76` (docs: filter tentative responseStatus alongside declined), `8e5013d` (docs: subagent-per-layer + push policies).
 
@@ -25,7 +26,6 @@ Layer 6.A also extracted three helpers from recurring → mirror (since both lay
 
 | Layer | Package | Notes |
 |---|---|---|
-| 6.B | `internal/sync` (orphan walk) | SPEC §"Daemon lifecycle: periodic full re-sync" step 5: walk inventory entries whose source wasn't visited in the full source-list, look up the source via events.get, classify into 4 outcomes (cancelled/404 → orphaned, non-recurring past horizon → outside_horizon, recurring with no instance in window → outside_horizon, alive but filtered → source_filtered). Fan-out semaphore of 5 per SPEC §Concurrency. |
 | 6.C | `internal/sync` (Reconciler entrypoint) | FullSync + Tick methods: orchestrate the source-list / inventory-rebuild / classify-all / orphan-walk / token-management dance. Per-source events.list calls, conditional syncToken advancement, 410 GONE recovery signaling to the daemon. |
 | 7 | `internal/daemon` | Lifecycle, scheduler (per-tick + periodic full re-sync), IPC socket, signal handling. |
 | 8 | `internal/launchd` | Plist generation, launchctl wrappers. |
@@ -50,30 +50,26 @@ All captured in `CLAUDE.md` "Architecture decisions and gotchas". Highlights:
 - sync.Outcome carries SourceUpdated / MirrorUpdated for the layer-7 conflict warn log (empty on migration_source_won per SPEC).
 - sync.Classifier.Horizon=0 disables the horizon check entirely; layer 7 wiring MUST set a non-zero value.
 - sync layer mutates the per-target Inventory in place after every write; the same map survives across pdirs that share a target.
+- Orphan walk's eventType filter is an allowlist ({default, outOfOffice, focusTime}); future Google types prune rather than silently retain.
+- Orphan walk fan-out is concurrent (semaphore of 5); inventory + Output mutations happen serially after the fan-out drains. stubAPI gained a sync.Mutex to support this.
 
 ## Push status at session end
 
-The user's SSH agent disconnected during session 1, so 14 commits are now stacked locally but not pushed. The user pushes manually when they return - per CLAUDE.md "Push policy", future sessions don't block on push.
+The user's SSH agent disconnected during session 1, so 15 commits are now stacked locally but not pushed. The user pushes manually when they return - per CLAUDE.md "Push policy", future sessions don't block on push.
 
 ## Pointers for the next session
 
-When picking up layer 6.B (orphan walk):
+When picking up layer 6.C (Reconciler entrypoint):
 
 1. Read `SPEC.md` end-to-end (still mandatory).
 2. Read this file + the relevant `Architecture decisions and gotchas` entries in `CLAUDE.md`.
 3. Per `CLAUDE.md` "Implementation strategy", spawn a `general-purpose` subagent.
-4. 6.B's scope: SPEC §"Daemon lifecycle: periodic full re-sync" step 5. Walks `*Inventory.All()` for entries whose source-tuple was NOT visited during a full classify pass. For each, `events.get` on the source; classify the response into one of four outcomes: cancelled/404 → orphaned, non-recurring past horizon → outside_horizon, recurring with no instance in window → outside_horizon, alive but filtered → source_filtered. SPEC §"Concurrency" calls for a fan-out semaphore of 5.
-5. The orphan walk produces `Outcome` values via the same `Output func(Outcome)` sink. Action `delete` for the first three; `delete` with reason `source_filtered` for the fourth.
-6. The walk needs to know which source-tuples were "visited" in the full classify pass. The simplest interface: 6.A's classify already mutates inventory; 6.B accepts a `visited map[mirror.SourceTuple]bool` parameter that the caller (eventually 6.C's FullSync) populates by iterating the source list and noting (canonical_source, source_id) for each.
+4. 6.C's scope: SPEC §"Daemon lifecycle: startup" + §"per-tick reconciliation" + §"periodic full re-sync". Provides `Reconciler` struct holding per-source syncTokens + per-target inventories, with `FullSync(ctx)` and `Tick(ctx)` methods. FullSync rebuilds inventories, full source-list per source, classify all, orphan walk, conditional token advancement. Tick does incremental events.list with syncToken, classify the delta, conditional advancement. Both produce per-pdir results so layer 7 can decide which tokens to commit.
+5. 410 GONE on Tick → set a flag in the result so the daemon schedules an immediate full re-sync for the affected source. Don't try to recover inside Tick (the daemon owns the timer).
+6. The Classifier (6.A) mutates Inventory in place during classify; the orphan walk (6.B) needs a `visited map[mirror.SourceTuple]bool` populated during classify. The simplest hookup: FullSync iterates the source list, tracks visited tuples as it calls Classify, then runs OrphanWalker.Walk with the populated set.
 7. Per `CLAUDE.md` "Workflow" step 6, spawn `feature-dev:code-reviewer` after the layer; address findings; re-review for the clean second pass.
 8. Commit per-layer; don't worry about push.
 9. Update this file after the layer ships.
-
-When picking up layer 6.C (Reconciler entrypoint):
-
-1. Same flow.
-2. 6.C's scope: SPEC §"Daemon lifecycle: startup" + §"per-tick reconciliation" + §"periodic full re-sync". Provides `Reconciler` struct holding per-source syncTokens + per-target inventories, with `FullSync(ctx)` and `Tick(ctx)` methods. FullSync rebuilds inventories, full source-list per source, classify all, orphan walk, conditional token advancement. Tick does incremental events.list with syncToken, classify the delta, conditional advancement. Both produce per-pdir results so layer 7 can decide which tokens to commit.
-3. 410 GONE on Tick → set a flag in the result so the daemon schedules an immediate full re-sync for the affected source. Don't try to recover inside Tick (the daemon owns the timer).
 
 ### Conventions established this session
 

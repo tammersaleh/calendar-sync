@@ -42,9 +42,10 @@ const (
 type Conflict string
 
 const (
-	ConflictNone       Conflict = ""
-	ConflictSourceWon  Conflict = "conflict_source_won"
-	ConflictTargetWon  Conflict = "conflict_target_won"
+	ConflictNone               Conflict = ""
+	ConflictSourceWon          Conflict = "conflict_source_won"
+	ConflictTargetWon          Conflict = "conflict_target_won"
+	ConflictMigrationSourceWon Conflict = "migration_source_won"
 )
 
 // Outcome is what the drift-handling matrix decides for one (source, mirror)

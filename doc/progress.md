@@ -18,6 +18,7 @@ Session-handoff state. Read this on session start (after `SPEC.md` and `CLAUDE.m
 | 6.A | `internal/sync` inventory + classification (parent path with recurring delegation) + drift + v1 parent migration + 409 handling | `a2280e8` |
 | 6.B | `internal/sync` orphan walk + concurrent events.get fan-out (semaphore of 5) + per-entry error accumulation | `d3e00bf` |
 | 6.C | `internal/sync` Reconciler entrypoint (FullSync + Tick), conditional syncToken advancement, lastFullSync stamping, 410 GONE → NeedsFullResync signaling | `8a0e6ec` |
+| 7 | `internal/daemon` (wall-clock scheduler + IPC socket + signal handling + auth probe + outcome JSONL printer) | `b86d888` |
 
 Plus: `2ce11b6` (gitignore tweak), `523fa76` (docs: filter tentative responseStatus alongside declined), `8e5013d` (docs: subagent-per-layer + push policies).
 
@@ -27,7 +28,6 @@ Layer 6.A also extracted three helpers from recurring → mirror (since both lay
 
 | Layer | Package | Notes |
 |---|---|---|
-| 7 | `internal/daemon` | Lifecycle, scheduler (per-tick + periodic full re-sync), IPC socket, signal handling. |
 | 8 | `internal/launchd` | Plist generation, launchctl wrappers. |
 | 9 | `cmd/` | kong CLI struct + each subcommand. Lift `slack-cli`'s `internal/output` for the JSONL printer (see `next.md`'s now-deleted "Reuse" section). |
 
@@ -55,26 +55,34 @@ All captured in `CLAUDE.md` "Architecture decisions and gotchas". Highlights:
 - Reconciler.FullSync stamps lastFullSync per source on full-source-list success regardless of whether Google returned a syncToken; gating on token advancement would loop FullSync indefinitely on a no-token source.
 - Reconciler.Tick passes nil to runClassifyLoop's visited param; FullSync passes a non-nil map. The orphan walk only runs in FullSync.
 - Tick's first call (empty in-memory token) signals NeedsFullResync without marking pdirs as failed - "no work to do" isn't a failure.
+- daemon scheduler is wall-clock-driven (now.Truncate(p).Add(p)) so a sleep crossing tick boundaries fires a single catch-up on wake; SPEC §"Sleep and wake".
+- daemon's IPC status response uses a compact duration form (60s, 24h - not Go's 1m0s, 24h0m0s) per SPEC line 725. compactDuration helper in internal/daemon/socket.go.
+- daemon owns the auth probe (configurable AuthChecker callback) which short-circuits BEFORE socket bind, so a bad-auth daemon never holds the socket.
+- daemon's fast-track FullSync flag handles Tick's NeedsFullResync signal in the next loop iteration (immediate, not on the timer).
 
 ## Push status at session end
 
-The user's SSH agent disconnected during session 1, so 17 commits are now stacked locally but not pushed. The user pushes manually when they return - per CLAUDE.md "Push policy", future sessions don't block on push.
+The user's SSH agent disconnected during session 1, so 19 commits are now stacked locally but not pushed. The user pushes manually when they return - per CLAUDE.md "Push policy", future sessions don't block on push.
 
 ## Pointers for the next session
 
-When picking up layer 7 (`internal/daemon`):
+When picking up layer 8 (`internal/launchd`):
 
 1. Read `SPEC.md` end-to-end (still mandatory).
 2. Read this file + the relevant `Architecture decisions and gotchas` entries in `CLAUDE.md`.
 3. Per `CLAUDE.md` "Implementation strategy", spawn a `general-purpose` subagent.
-4. 7's scope: SPEC §"Daemon lifecycle" timer-driven loop, IPC socket (`$TMPDIR/calendar-sync.sock`) for `calendar-sync status`, SIGTERM/SIGINT signal handling, `gws auth status` startup probe.
-5. The daemon constructs ONE `sync.Reconciler` at startup, calls `FullSync` once at launch, then schedules `Tick` every `poll_interval` and `FullSync` every `full_sync_interval`. On a `Tick` result with `NeedsFullResync=true` for any source, schedule an immediate FullSync (don't wait for the timer).
-6. Per SPEC §"Sleep and wake" (lines 1090-1101), the wall-clock-driven scheduler computes next-tick as `now.Truncate(poll_interval).Add(poll_interval)`, so a sleep that crosses tick boundaries fires a single catch-up tick on wake.
-7. The IPC socket emits a JSON snapshot of per-pdir state on connect (per SPEC §"calendar-sync status" stdout shape). The daemon owns the bind/cleanup lifecycle (SPEC §"IPC socket" - daemon-side lifecycle).
-8. Output: the daemon wires `r.Output = func(o sync.Outcome) { jsonl.Emit(o) }` to a JSONL printer (probably the `internal/output` package per CLAUDE.md project structure).
-9. Per `CLAUDE.md` "Workflow" step 6, spawn `feature-dev:code-reviewer` after the layer; address findings; re-review for the clean second pass.
-10. Commit per-layer; don't worry about push.
-11. Update this file after the layer ships.
+4. 8's scope: SPEC §"calendar-sync install" (lines 746-799) and §"calendar-sync uninstall" (lines 801-822). Generate the launchd plist (XML) per SPEC's exact template, write it to `~/Library/LaunchAgents/<label>.plist`, run `launchctl load -w` (or `unload`). Resolve calendar-sync's own binary path via `os.Executable`. Detect non-Darwin and surface `not_macos`.
+5. The plist template is fixed in SPEC lines 766-787; copy it verbatim and parameterize Label / ProgramArguments / log paths. Don't add a `StartInterval` - the daemon's internal scheduler handles polling.
+6. Per `CLAUDE.md` "Workflow" step 6, spawn `feature-dev:code-reviewer` after the layer; address findings; re-review for the clean second pass.
+7. Commit per-layer; don't worry about push.
+8. Update this file after the layer ships.
+
+When picking up layer 9 (`cmd/`):
+
+1. Same flow.
+2. 9's scope: kong CLI struct + each subcommand (`watch`, `run`, `init`, `config show/validate`, `pair list/test`, `mirror list/prune`, `status`, `install`, `uninstall`, `skill`, `version`). Wires gws.Client + config loader + sync.Reconciler + daemon.Daemon. Lift slack-cli's internal/output for the JSONL printer.
+3. Layer 7's daemon.Daemon takes an AuthChecker callback - layer 9 wires this to invoke `gws auth status` (either by adding a method to gws.Client or via os/exec).
+4. The `daemon.ErrDaemonAlreadyRunning` sentinel (raised when watch detects another daemon on the socket) and `daemon.ErrAuthFailed` (raised on bad auth) need mapping to SPEC's exit codes (1 / 2 respectively, plus the "auth-failed under run/watch routes to exit 2" rule).
 
 ### Conventions established this session
 

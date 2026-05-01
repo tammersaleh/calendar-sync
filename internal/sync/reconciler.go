@@ -191,6 +191,20 @@ type TickResult struct {
 	Aggregated Counts
 }
 
+// InventorySize returns the current number of mirrors in the in-memory
+// inventory for the given target calendar. Used by the layer-7 daemon's
+// IPC status surface (per SPEC §"calendar-sync status" line 726, the
+// `mirrors` field). Returns 0 when no inventory exists yet for the target
+// (e.g. before the first FullSync, or for a target whose rebuild
+// errored).
+func (r *Reconciler) InventorySize(target string) int {
+	inv, ok := r.inventories[target]
+	if !ok {
+		return 0
+	}
+	return len(inv.Tuples())
+}
+
 // uniqueSources returns the canonical source IDs from r.Canonical.PDirs in
 // alphabetical order. Sorted so tests can pin the wire order without
 // depending on map iteration.

@@ -1122,3 +1122,31 @@ func TestNew_OptionsApply(t *testing.T) {
 		t.Errorf("New must initialize internal maps")
 	}
 }
+
+// ---------- InventorySize accessor (used by layer 7's IPC status surface) ----------
+
+func TestInventorySize_UnknownTargetReturnsZero(t *testing.T) {
+	r := New(nil, &config.Canonical{})
+	if got := r.InventorySize("nonexistent-target"); got != 0 {
+		t.Errorf("InventorySize on missing target = %d, want 0", got)
+	}
+}
+
+func TestInventorySize_ReflectsInventoryEntries(t *testing.T) {
+	r := New(nil, &config.Canonical{})
+	inv := NewInventory("tgt-A")
+	inv.Set(mirror.SourceTuple{CalendarID: "src-A", EventID: "e1"},
+		&gws.Event{ID: "m1"})
+	inv.Set(mirror.SourceTuple{CalendarID: "src-A", EventID: "e2"},
+		&gws.Event{ID: "m2"})
+	r.inventories["tgt-A"] = inv
+
+	if got := r.InventorySize("tgt-A"); got != 2 {
+		t.Errorf("InventorySize = %d, want 2", got)
+	}
+
+	inv.Delete(mirror.SourceTuple{CalendarID: "src-A", EventID: "e1"})
+	if got := r.InventorySize("tgt-A"); got != 1 {
+		t.Errorf("InventorySize after delete = %d, want 1", got)
+	}
+}

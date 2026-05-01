@@ -33,6 +33,36 @@ func TestDuration_UnmarshalText(t *testing.T) {
 	}
 }
 
+func TestDuration_Compact(t *testing.T) {
+	tests := []struct {
+		name string
+		in   time.Duration
+		want string
+	}{
+		{"60 seconds", 60 * time.Second, "60s"},
+		{"15 seconds (min poll)", 15 * time.Second, "15s"},
+		{"five minutes", 5 * time.Minute, "300s"},
+		{"24 hours", 24 * time.Hour, "24h"},
+		{"one hour", time.Hour, "1h"},
+		{"two hours", 2 * time.Hour, "2h"},
+		{"365 days", 365 * 24 * time.Hour, "8760h"},
+		{"zero", 0, "0s"},
+		{"negative falls to zero", -time.Second, "0s"},
+		{"sub-second falls back to Go form", 500 * time.Millisecond, "500ms"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d := Duration(tc.in)
+			if got := d.Compact(); got != tc.want {
+				t.Errorf("Duration(%v).Compact() = %q, want %q", tc.in, got, tc.want)
+			}
+			if got := CompactDuration(tc.in); got != tc.want {
+				t.Errorf("CompactDuration(%v) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDuration_UnmarshalTextErrors(t *testing.T) {
 	tests := []struct {
 		name string

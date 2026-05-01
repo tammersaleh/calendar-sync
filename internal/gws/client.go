@@ -80,7 +80,16 @@ func (c *Client) execute(ctx context.Context, args []string) (stdout, stderr []b
 	}
 
 	if errors.Is(runErr, fs.ErrNotExist) || isExecNotFound(runErr) {
-		return stdout, stderr, -1, fmt.Errorf("gws binary not found at %q: %w", c.binPath, runErr)
+		// Wrap with the typed sentinel so the cmd layer's MapError routes
+		// this to gws_not_found (SPEC line 518) instead of falling through
+		// to api_invalid_request. The underlying os/exec error stays
+		// reachable via errors.Unwrap for log enrichment.
+		return stdout, stderr, -1, &Error{
+			Code:     CodeGWSNotFound,
+			ExitCode: 1,
+			Op:       "gws subprocess launch",
+			Cause:    fmt.Sprintf("gws binary not found at %q: %s", c.binPath, runErr),
+		}
 	}
 
 	return stdout, stderr, -1, fmt.Errorf("gws subprocess failed: %w", runErr)

@@ -19,6 +19,7 @@ import (
 // expose it as a typed error so the recovery path keys off a sentinel
 // instead of pattern-matching error strings.
 const (
+	CodeGWSNotFound       = "gws_not_found"
 	CodeGWSAuthFailed     = "gws_auth_failed"
 	CodeNetworkError      = "network_error"
 	CodeRateLimited       = "rate_limited"
@@ -35,6 +36,7 @@ const (
 // classifier returns NEW *Error values with full context); equality is by
 // the Code field via the (e *Error).Is method.
 var (
+	ErrGWSNotFound       = &Error{Code: CodeGWSNotFound, ExitCode: 1}
 	ErrGWSAuthFailed     = &Error{Code: CodeGWSAuthFailed}
 	ErrNetworkError      = &Error{Code: CodeNetworkError}
 	ErrRateLimited       = &Error{Code: CodeRateLimited}

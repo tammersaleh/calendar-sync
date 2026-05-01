@@ -7,6 +7,36 @@ import (
 	"time"
 )
 
+// CompactDuration formats d in the compact form SPEC.md uses across both
+// the IPC status response (line 725: "60s", "24h") and `config show` (line
+// 588: same). The rule is:
+//
+//   - whole hours (value % 1h == 0 && value > 0): emit as "<N>h"
+//   - everything else: emit as "<N>s" (seconds)
+//
+// Deliberately doesn't auto-promote 60 seconds to "1m" or 5 minutes to
+// "5m" - the SPEC examples show "60s" for the default poll_interval, and
+// promoting whole minutes would round-trip the user's "60s" config to
+// "1m" on the wire. Promoting whole hours IS done because SPEC shows
+// "24h" (not "86400s" or "1440m") for the default full_sync_interval.
+//
+// Sub-second precision falls back to time.Duration.String. The settings
+// validator clamps poll_interval >= 15s and full_sync_interval >= 1h so
+// the fallback is unreachable in production for those two; horizon (and
+// the bare config.Duration values) can in principle be sub-second.
+func CompactDuration(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	if d%time.Hour == 0 {
+		return strconv.FormatInt(int64(d/time.Hour), 10) + "h"
+	}
+	if d%time.Second == 0 {
+		return strconv.FormatInt(int64(d/time.Second), 10) + "s"
+	}
+	return d.String()
+}
+
 // Duration wraps time.Duration with TOML text-unmarshaling that supports a
 // "d" (days) suffix on top of Go's standard duration syntax (60s, 5m, 24h).
 // SPEC.md "Settings" calls this out explicitly: "Duration strings follow
@@ -48,4 +78,11 @@ func (d *Duration) UnmarshalText(text []byte) error {
 // parse-emit cycle.
 func (d Duration) String() string {
 	return time.Duration(d).String()
+}
+
+// Compact returns the SPEC's compact wire format ("60s", "24h"). See
+// CompactDuration for the precise rule. Used by `config show` and the
+// daemon's IPC status response.
+func (d Duration) Compact() string {
+	return CompactDuration(time.Duration(d))
 }

@@ -7,9 +7,10 @@ import (
 	"io/fs"
 	"net"
 	"os"
-	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/tammersaleh/calendar-sync/internal/config"
 )
 
 // ErrDaemonAlreadyRunning is returned by Daemon.Run when the IPC socket
@@ -224,31 +225,10 @@ func writeJSONLine(w net.Conn, v any) {
 	_, _ = w.Write([]byte("\n"))
 }
 
-// compactDuration formats d in the compact form SPEC.md uses for the IPC
-// status response (line 725: "60s", "24h" - not Go's verbose "1m0s" or
-// "24h0m0s"). The rule is:
-//
-//   - whole hours (value % 1h == 0 && value > 0): emit as "<N>h"
-//   - everything else: emit as "<N>s" (seconds)
-//
-// Deliberately doesn't auto-promote 60 seconds to "1m" or 5 minutes to
-// "5m" - the SPEC example shows "60s" for the default poll_interval, and
-// promoting whole minutes would round-trip the user's "60s" config to
-// "1m" on the wire. Promoting whole hours IS done because SPEC shows
-// "24h" (not "86400s" or "1440m") for the default full_sync_interval.
-//
-// Sub-second precision falls back to time.Duration.String. The daemon's
-// settings validate to >=15s (poll_interval) and >=1h (full_sync_interval)
-// so the fallback is never reached in production.
+// compactDuration delegates to config.CompactDuration so the IPC status
+// response and `config show` agree on the wire format. SPEC line 725 ("60s",
+// "24h") and SPEC line 588 use the same rule; the canonical implementation
+// lives in the config package because Duration originates there.
 func compactDuration(d time.Duration) string {
-	if d <= 0 {
-		return "0s"
-	}
-	if d%time.Hour == 0 {
-		return strconv.FormatInt(int64(d/time.Hour), 10) + "h"
-	}
-	if d%time.Second == 0 {
-		return strconv.FormatInt(int64(d/time.Second), 10) + "s"
-	}
-	return d.String()
+	return config.CompactDuration(d)
 }

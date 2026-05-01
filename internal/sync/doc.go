@@ -17,9 +17,12 @@
 //     "v1 migration cells live in callers".
 //   - helpers.go: patchMirrorWithChecksum (the SPEC §"Computing the checksum
 //     from the post-write event" two-step write).
+//   - orphan.go: SPEC §"Daemon lifecycle: periodic full re-sync" step 5,
+//     the post-classify cleanup walk that prunes mirrors whose source is
+//     gone, outside horizon, or now-ineligible.
 //
 // Layer 6.A covers the parent / non-recurring path; recurring instances
 // delegate to internal/recurring's Handler via the Classifier's Recurring
-// field. Orphan walk and the Reconciler entrypoint (FullSync, Tick) are
-// added in 6.B and 6.C respectively.
+// field. Layer 6.B adds the orphan walk; the Reconciler entrypoint
+// (FullSync, Tick) is added in 6.C.
 package sync

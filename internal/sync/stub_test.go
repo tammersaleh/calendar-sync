@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/tammersaleh/calendar-sync/internal/gws"
 )
@@ -26,7 +27,14 @@ type recordedCall struct {
 // Each Op's response is a queue: tests enqueue the expected response(s) in
 // FIFO order. errors are interleaved via per-op error queues; when an error
 // is non-nil the response queue is not consumed.
+//
+// stubAPI is safe for concurrent use. Layer 6.B's orphan walk fans out
+// events.get calls; protecting the queues + recorded-call log with a
+// mutex lets the same stub serve both serial and concurrent tests
+// without a parallel thread-safe variant. The lock is not held across
+// queue dequeues' channel sends or anything else that could deadlock.
 type stubAPI struct {
+	mu              sync.Mutex
 	listResponses   []listResponse
 	listErrors      []error
 	getResponses    map[[2]string][]*gws.Event
@@ -56,6 +64,8 @@ func newStubAPI() *stubAPI {
 }
 
 func (s *stubAPI) EventsList(_ context.Context, params gws.EventsListParams) ([]gws.Event, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.calls = append(s.calls, recordedCall{Op: "EventsList", CalendarID: params.CalendarID, ListParams: params})
 	if len(s.listErrors) > 0 {
 		head := s.listErrors[0]
@@ -73,6 +83,8 @@ func (s *stubAPI) EventsList(_ context.Context, params gws.EventsListParams) ([]
 }
 
 func (s *stubAPI) EventsGet(_ context.Context, calendarID, eventID string) (*gws.Event, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.calls = append(s.calls, recordedCall{Op: "EventsGet", CalendarID: calendarID, EventID: eventID})
 	key := [2]string{calendarID, eventID}
 	if errs := s.getErrors[key]; len(errs) > 0 {
@@ -92,6 +104,8 @@ func (s *stubAPI) EventsGet(_ context.Context, calendarID, eventID string) (*gws
 }
 
 func (s *stubAPI) EventsInstances(_ context.Context, params gws.EventsInstancesParams) ([]gws.Event, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.calls = append(s.calls, recordedCall{
 		Op:             "EventsInstances",
 		CalendarID:     params.CalendarID,
@@ -114,6 +128,8 @@ func (s *stubAPI) EventsInstances(_ context.Context, params gws.EventsInstancesP
 }
 
 func (s *stubAPI) EventsInsert(_ context.Context, calendarID string, body *gws.Event) (*gws.Event, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.calls = append(s.calls, recordedCall{Op: "EventsInsert", CalendarID: calendarID, Body: body})
 	if len(s.insertErrors) > 0 {
 		head := s.insertErrors[0]
@@ -131,6 +147,8 @@ func (s *stubAPI) EventsInsert(_ context.Context, calendarID string, body *gws.E
 }
 
 func (s *stubAPI) EventsPatch(_ context.Context, calendarID, eventID string, body *gws.Event) (*gws.Event, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.calls = append(s.calls, recordedCall{
 		Op:         "EventsPatch",
 		CalendarID: calendarID,
@@ -153,6 +171,8 @@ func (s *stubAPI) EventsPatch(_ context.Context, calendarID, eventID string, bod
 }
 
 func (s *stubAPI) EventsDelete(_ context.Context, calendarID, eventID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.calls = append(s.calls, recordedCall{Op: "EventsDelete", CalendarID: calendarID, EventID: eventID})
 	if len(s.deleteErrors) > 0 {
 		head := s.deleteErrors[0]
@@ -212,6 +232,8 @@ func (s *stubAPI) queuePatch(e *gws.Event) {
 }
 
 func (s *stubAPI) callsByOp(op string) []recordedCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var out []recordedCall
 	for _, c := range s.calls {
 		if c.Op == op {

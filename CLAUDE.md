@@ -180,6 +180,18 @@ Each error code (`gws.CodeAPIConflict` etc.) has a paired sentinel value (`gws.E
 
 The wrapper exposes `nextSyncToken` from the LAST NDJSON page (or empty string if Google omitted it). Per SPEC, the in-memory syncToken must advance only when every dependent pdir successfully processed every event in the delta - that conditional-advancement invariant is the sync layer's responsibility, not the wrapper's.
 
+### v1 migration cells live in callers, not in `mirror.Classify`
+
+`mirror.Classify` does not consume `signal.NeedsMigration`. The two migration-specific cells (`migration_upgrade` for no-actual-drift, `migration_source_won` for both-changed) live in the caller. The recurring handler branches on `signal.NeedsMigration` BEFORE delegating to `Classify`; the sync layer (layer 6) will need the same branch when reconciling non-recurring/parent events. The other two cells (source-only, mirror-only) are identical between v1 and v2 mirrors so they fall through to `Classify` unchanged. This keeps `Classify` tidy at the cost of a small per-caller branch.
+
+### `recurring.Handler` accepts callbacks, doesn't import sync
+
+`Handler.LookupMirrorParent` (over the per-target inventory) and `Handler.ReconcileParent` (the classification path for source parents) are function-typed fields rather than interface methods on a sync-layer type. Layer 5 cannot import layer 6 without a cycle; the inversion lets the sync layer inject closures over its inventory map and classification logic. Tests pass plain closures over hand-rolled fixtures instead of mocking an interface.
+
+### Cancellation patches skip the checksum follow-up
+
+Source-cancelled / declined / tentative / transparent all patch the mirror instance with `{status: cancelled}` and stop. No follow-up `calendar-sync:checksum` write happens because no managed field changed; the existing checksum on the mirror is still accurate. This is one of two write paths in the recurring handler that bypass `patchMirrorWithChecksum` (the other is the source-side patch in `propagate`, which writes to the source, not a mirror).
+
 ## Sandbox
 
 `mise run` commands work fine in sandboxed processes. Network access required during `go mod tidy` (first run) and during `go test` for any test that pulls a module.

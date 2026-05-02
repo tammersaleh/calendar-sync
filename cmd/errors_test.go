@@ -257,3 +257,40 @@ func TestMapError_DetailIncludesUnderlyingMessage(t *testing.T) {
 		t.Errorf("detail = %q, want it to include the call context", detail)
 	}
 }
+
+// TestUnwrapCause covers the helper that populates ErrorEnvelope.Cause from
+// the wrapped error chain. The partial_failure path (cmd/run.go) wraps the
+// first PDir error as the cmdError's cause; without unwrapCause the
+// underlying gws/sync error never reaches stderr.
+func TestUnwrapCause(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "no cause returns empty",
+			err:  errors.New("no cause"),
+			want: "",
+		},
+		{
+			name: "cmdError with cause returns cause text",
+			err: newCmdError("partial_failure", "1 pdir(s) failed",
+				"", fmt.Errorf("classify src/evt: %w", gws.ErrAPIConflict)),
+			want: "classify src/evt: " + gws.ErrAPIConflict.Error(),
+		},
+		{
+			name: "fmt.Errorf wrapped error returns the wrapped message",
+			err:  fmt.Errorf("outer: %w", errors.New("inner")),
+			want: "inner",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := unwrapCause(tc.err)
+			if got != tc.want {
+				t.Errorf("unwrapCause = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

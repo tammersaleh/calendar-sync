@@ -154,6 +154,64 @@ func TestRunCmd_PartialFailureCollectsAllAndEmitsFailuresList(t *testing.T) {
 	}
 }
 
+// TestRunCmd_PartialFailureSurfacesUnderlyingErrorViaHandleErr:
+// Anomaly #2 fix. A partial_failure exit must include the underlying gws
+// error in the stderr ErrorEnvelope.Cause field; otherwise an operator
+// sees only "1 pdir(s) failed: foo:a_to_b" with no clue what failed.
+//
+// The Run-method test path (TestRunCmd_PartialFailure...) only asserts on
+// the cmdError MapError surface. This test drives the full handleErr path
+// to verify the JSON envelope on stderr carries the cause.
+func TestRunCmd_PartialFailureSurfacesUnderlyingErrorViaHandleErr(t *testing.T) {
+	tmp := shortTempDir(t)
+	t.Setenv("TMPDIR", tmp)
+	path := writeConfigFixture(t, validConfigTOML)
+
+	stub := &failingInventoryGws{
+		stubGws: stubGws{},
+		failInventoryFor: map[string]error{
+			"personal@example.com": errStubEventsList,
+		},
+	}
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	rt := &Runtime{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		Globals: Globals{Config: path},
+		Ctx:     context.Background(),
+		Gws:     stub,
+	}
+	err := (&RunCmd{}).Run(rt)
+	if err == nil {
+		t.Fatalf("expected partial_failure error")
+	}
+	// Drive handleErr to populate stderr.
+	exitCode := handleErr(stderr, err)
+	if exitCode == 0 {
+		t.Fatalf("handleErr returned 0; expected non-zero")
+	}
+
+	var envelope struct {
+		Error  string `json:"error"`
+		Detail string `json:"detail"`
+		Cause  string `json:"cause"`
+	}
+	last := strings.TrimSpace(stderr.String())
+	if err := json.Unmarshal([]byte(last), &envelope); err != nil {
+		t.Fatalf("unmarshal stderr %q: %v", last, err)
+	}
+	if envelope.Error != "partial_failure" {
+		t.Errorf("error = %q, want partial_failure", envelope.Error)
+	}
+	if envelope.Cause == "" {
+		t.Errorf("cause must be populated so operators can see WHY a pdir failed; got empty. envelope=%+v", envelope)
+	}
+	if !strings.Contains(envelope.Cause, "EventsList") {
+		t.Errorf("cause = %q, want it to mention the underlying gws operation", envelope.Cause)
+	}
+}
+
 // TestRunCmd_AllPDirsFailEmitsAllFailures: when every pdir fails, the
 // failures list mirrors the full pdir list. Ensures the loop never
 // short-circuits on the first failure.

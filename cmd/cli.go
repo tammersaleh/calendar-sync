@@ -132,6 +132,13 @@ func signalContext() context.Context {
 // handleErr maps a subcommand's returned error to SPEC's stderr envelope
 // and returns the exit code to bubble up to the OS. The returned int is
 // always non-zero on a non-nil err.
+//
+// SPEC line 384's ErrorEnvelope has a `cause` field for the underlying
+// error message; we populate it from errors.Unwrap so a partial_failure
+// (where detail is just the pdir-name list) still surfaces the gws/Calendar
+// error that triggered the failure. Without the cause, an operator seeing
+// `{"error":"partial_failure","detail":"1 pdir(s) failed: foo:a_to_b"}` has
+// no idea WHY foo:a_to_b failed.
 func handleErr(stderr io.Writer, err error) int {
 	// kong-injected usage errors carry their own code; surface as 64.
 	var parseErr *kong.ParseError
@@ -140,12 +147,32 @@ func handleErr(stderr io.Writer, err error) int {
 		return 64
 	}
 	code, detail, hint := MapError(err)
+	cause := unwrapCause(err)
 	output.EmitError(stderr, output.ErrorEnvelope{
 		Error:  code,
 		Detail: detail,
 		Hint:   hint,
+		Cause:  cause,
 	})
 	return output.ExitCodeFor(code)
+}
+
+// unwrapCause walks errors.Unwrap to find the first wrapped cause and
+// returns its Error() text, or "" if the error is unwrappable to nothing.
+// Used by handleErr to populate ErrorEnvelope.Cause without duplicating
+// the top-level detail (which is err.Error() for non-cmdError types).
+//
+// For *cmdError specifically, Unwrap returns the cause field directly,
+// which is exactly the underlying gws/sync error - that's the value
+// operators want surfaced. For other error types Unwrap may produce noise
+// (an entire error chain joined by ": "); the cause field is omitempty
+// so an empty return drops cleanly out of the JSON envelope.
+func unwrapCause(err error) string {
+	cause := errors.Unwrap(err)
+	if cause == nil {
+		return ""
+	}
+	return cause.Error()
 }
 
 // printer constructs the per-command JSONL Printer using the runtime's

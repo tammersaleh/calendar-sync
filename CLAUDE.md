@@ -214,6 +214,18 @@ When `gws` is not on PATH, `internal/gws/client.go` returns `&Error{Code: CodeGW
 
 The gate lives in the Reconciler rather than in mirror.Classify so Classify stays a pure function of `(signal, sourceWritable, ...)`. Tests that exercise the matrix directly (classify_test.go) bypass the gate by constructing a Classifier with explicit SourceWritable; tests that want to pin the gate (reconciler_test.go's TestBuildClassifier_Gate*) drive `Reconciler.buildClassifier` directly.
 
+### Logger threading uses re-declared interfaces, not output package imports
+
+`internal/sync` and `internal/recurring` each re-declare a 4-method `Logger` interface (Debug/Info/Warn/Error) rather than importing `internal/output`. This keeps the dependency direction one-way: output is a top-of-tree package, the lower layers don't depend on it. Production code passes `*output.Logger` through `WithLogger(...)` options on Reconciler / gws.Client; the same pointer satisfies all three interfaces structurally. Tests leave the field nil; every per-method log call does an `if r.Log != nil` short-circuit so silence has no formatting cost.
+
+The same pattern (`internal/gws.Logger`) exists in the gws layer for the same reason. When extending, add new logger calls inside nil-safe wrappers (`r.debug`, `c.debug`, `h.debug`) on the receiver - direct `r.Log.Debug(...)` without the nil check breaks tests that don't set Log.
+
+### `cmdError.Unwrap` carries cause; `handleErr` populates `ErrorEnvelope.Cause`
+
+The partial_failure path wraps the first PDir error as the cmdError's cause field via `newCmdError(code, detail, hint, cause)`. cmdError.Unwrap returns that field, so `errors.Unwrap(err)` from handleErr gives the underlying gws/sync error. SPEC line 384's `cause` field is now populated from that single-step unwrap (see `cmd/cli.go:unwrapCause`).
+
+Don't try to make the cause "smarter" - a single-step unwrap is exactly right for cmdError chains. The omitempty rule on the field handles non-cmdError fall-throughs cleanly.
+
 ## Sandbox
 
 `mise run` commands work fine in sandboxed processes. Network access required during `go mod tidy` (first run) and during `go test` for any test that pulls a module.

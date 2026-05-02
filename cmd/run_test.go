@@ -521,24 +521,29 @@ func TestDryRunAPI_EventsDeleteSuppressesWrite(t *testing.T) {
 	}
 }
 
-// TestRunCmd_DryRun_DuplicateSourceEventTriggersBogusMigrationSourceWon is
-// scaffolding for the eventual regression test of
-// doc/dry-run-anomaly-analysis.md anomaly #1. The user's dry-run produced
-// 14 patches with conflict=migration_source_won despite zero v1/v2 mirrors
-// on the target. The setup below feeds two copies of the same source event
-// (a stand-in for whatever caused the production duplication - phantom
-// recurring exception, paginated overlap, etc.) and is what the regression
-// test will exercise once the bug is fixed.
+// TestRunCmd_DryRun_DuplicateSourceEventNoLongerEmitsBogusMigration is the
+// end-to-end regression test for doc/dry-run-anomaly-analysis.md anomaly #1.
+// The user's dry-run produced 14 patches with conflict=migration_source_won
+// despite zero v1/v2 mirrors on the target. Two cooperating causes:
 //
-// Currently t.Skip - asserting the buggy outcome as a pass condition would
-// give false confidence that an incidental fix had been caught. When the
-// fix lands (either reject duplicate source-tuples in runClassifyLoop, or
-// have dryRunAPI.EventsPatch echo a full snapshot rather than only the
-// patch body), drop the t.Skip and assert that migration_source_won is
-// NOT in the output.
-func TestRunCmd_DryRun_DuplicateSourceEventTriggersBogusMigrationSourceWon(t *testing.T) {
-	t.Skip("known bug; see doc/dry-run-anomaly-analysis.md anomaly #1")
-
+//   - Cause A: dryRunAPI.EventsPatch echoed only the request body, dropping
+//     the prior Insert's extended properties (calendar-sync:version, source).
+//   - Cause B: source-list duplication - _R<timestamp> recurring parents
+//     appear both as a top-level event and as a recurring_event_id on their
+//     instances, so runClassifyLoop processed the same source-tuple twice.
+//
+// Both fixes landed (the dedupe in runClassifyLoop and the cache-and-merge
+// in dryRunAPI). Either alone makes the bogus outcome go away in the
+// duplicate-source case; with both, the wire shape is also correct on
+// other dry-run paths that consume the post-Patch event.
+//
+// This test feeds two copies of the same source event - the production
+// shape - and asserts:
+//  1. NO migration_source_won outcome appears in the output.
+//  2. Exactly ONE outcome is emitted (the insert from the first occurrence).
+//     The dedupe at runClassifyLoop short-circuits the second pass before
+//     it reaches Classify.
+func TestRunCmd_DryRun_DuplicateSourceEventNoLongerEmitsBogusMigration(t *testing.T) {
 	tmp := shortTempDir(t)
 	t.Setenv("TMPDIR", tmp)
 	path := writeConfigFixture(t, validConfigTOML)
@@ -562,7 +567,56 @@ func TestRunCmd_DryRun_DuplicateSourceEventTriggersBogusMigrationSourceWon(t *te
 		Ctx:     context.Background(),
 		Gws:     stub,
 	}
-	_ = (&RunCmd{DryRun: true}).Run(rt)
+	if err := (&RunCmd{DryRun: true}).Run(rt); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	out := stdout.String()
+	if strings.Contains(out, "migration_source_won") {
+		t.Errorf("dry-run output contains migration_source_won; B2 fix regressed.\noutput:\n%s", out)
+	}
+
+	// Parse outcome lines (skip the _meta trailer). validConfigTOML uses
+	// direction=bidirectional which expands to two pdirs (a_to_b and
+	// b_to_a). dupSourceListGws returns the same events on every
+	// source-list call, so both pdirs see the duplicate. Per-pdir dedupe
+	// at runClassifyLoop kills the second occurrence in each, leaving
+	// exactly ONE outcome per pdir = TWO outcomes total. The key
+	// post-fix invariant is that NEITHER outcome is migration_source_won
+	// AND each pdir's count is 1 (not 2).
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	var outcomes []map[string]interface{}
+	for _, ln := range lines {
+		if ln == "" {
+			continue
+		}
+		var row map[string]interface{}
+		if err := json.Unmarshal([]byte(ln), &row); err != nil {
+			t.Fatalf("unmarshal %q: %v", ln, err)
+		}
+		if _, isMeta := row["_meta"]; isMeta {
+			continue
+		}
+		outcomes = append(outcomes, row)
+	}
+	// 2 outcomes (one per pdir, dedupe killed the duplicates). 4 outcomes
+	// would mean dedupe regressed. 0 means a different regression.
+	if len(outcomes) != 2 {
+		t.Fatalf("expected 2 outcomes (one insert per pdir, dedupe within pdir); got %d:\n%s",
+			len(outcomes), out)
+	}
+	for _, row := range outcomes {
+		if action, _ := row["action"].(string); action != "insert" {
+			t.Errorf("outcome action = %q, want insert; row=%+v", action, row)
+		}
+		if src, _ := row["source_event"].(string); src != "evt-1" {
+			t.Errorf("outcome source_event = %q, want evt-1; row=%+v", src, row)
+		}
+		if conflict, _ := row["conflict"].(string); conflict != "" {
+			t.Errorf("outcome conflict = %q, want empty (no conflict on insert); row=%+v",
+				conflict, row)
+		}
+	}
 }
 
 // TestRunCmd_SettingsDryRunGatesWrites pins SPEC line 253: the

@@ -4,17 +4,6 @@ Running list of bugs surfaced during the v1.0.0 install + test session. Add a ne
 
 ## Open
 
-### B2 - Bogus `migration_source_won` outcomes in dry-run
-
-15 patches reported with `conflict: migration_source_won` despite zero v1/v2 mirrors on the target. Two cooperating causes per `doc/dry-run-anomaly-analysis.md`:
-
-- Cause A: `dryRunAPI.EventsPatch` echoes only the request body, dropping any extended properties the prior insert wrote.
-- Cause B: source-list duplication - `_R<timestamp>` recurring parents appear both as a top-level event and as a `recurring_event_id` on their instances, so `runClassifyLoop` processes the same source tuple twice.
-
-Dry-run cosmetic only - production semantics are unaffected (real Calendar API merges patches correctly).
-
-Fix sketch: dedupe `runClassifyLoop` by source-tuple and tighten `dryRunAPI.EventsPatch` to merge into a cached resource.
-
 ### B3 - gws subprocess timeouts cascade to `partial_failure`
 
 A 365-day-horizon dry-run produced ~200 `gws subprocess: context deadline exceeded` errors. The outer `--timeout` default is 5m; per-event `events.instances` lookups serialize and queue past it.
@@ -74,3 +63,23 @@ Resolved path comes from `config.FindPath(rt.Globals.Config)` so `--config` / `$
 Verified by `TestRenderPlist_WatchPathsContainsConfig` and `TestRenderPlist_HappyPath` (rendered plist asserts `<key>WatchPaths</key>` plus the config-path `<string>` entry inside the array) and `TestInstall_HappyPath` (end-to-end through `Install`).
 
 Macos-only by virtue of `launchd.Install` already returning `ErrNotMacOS` on non-Darwin platforms; the WatchPaths feature inherits that gate.
+
+### B2 - Bogus `migration_source_won` outcomes in dry-run
+
+15 patches reported with `conflict: migration_source_won` despite zero v1/v2 mirrors on the target. Two cooperating causes per `doc/dry-run-anomaly-analysis.md`:
+
+- Cause A: `dryRunAPI.EventsPatch` echoes only the request body, dropping any extended properties the prior insert wrote. The follow-up checksum patch sends `body={Private:{checksum}}` ONLY, so the cached event lost `calendar-sync:version` and `calendar-sync:source` from the prior Insert. On a second pass `ComputeDriftSignal` saw a missing version and routed through the migration matrix.
+- Cause B: source-list duplication - `_R<timestamp>` recurring parents appear both as a top-level event and as a `recurring_event_id` on their instances, so `runClassifyLoop` processed the same source-tuple twice.
+
+Dry-run cosmetic only - production semantics weren't affected (real Calendar API merges patches correctly), but the wrong outcomes obscured the actual mirror plan.
+
+Both causes fixed:
+
+- Cause B dedupe in `e1e1f4d fix: dedupe source-tuples in runClassifyLoop (B2 cause B)`. A per-call `seen[SourceTuple]bool` short-circuits subsequent occurrences with no outcome emitted (SPEC's outcomes table doesn't define a "duplicate" reason). The `visited` set still records every occurrence so the orphan walk's "saw this on the wire" semantics are preserved.
+- Cause A cache-and-merge in `f6d9f1c fix: dryRunAPI EventsPatch merges into cached Insert resource (B2 cause A)`. `dryRunAPI` now keeps a per-(calendarID, eventID) cache populated by `EventsInsert`. `EventsPatch` merges body into the cached snapshot per Calendar API JSON Merge Patch semantics: top-level fields replace, ExtendedProperties.Private/Shared merge at the key level, pointer/slice fields replace as a whole when non-nil. A patch on an event that was never Inserted falls back to body-echo, preserving the prior contract for tests that don't drive `doInsert`.
+
+Verified by:
+
+- `TestRunClassifyLoop_DedupesSourceTuple` (`internal/sync/reconciler_test.go`) feeds two copies of the same source event and asserts exactly one outcome plus `Counts.Inserts/EventsProcessed = 1`.
+- `TestDryRunAPI_PatchMergesIntoCachedInsertResource` etc. (`cmd/run_test.go`) drive Insert(version=2 + source) → Patch({checksum}) and assert the merged result carries all three keys.
+- `TestRunCmd_DryRun_DuplicateSourceEventNoLongerEmitsBogusMigration` (the un-skipped end-to-end regression) feeds duplicate events through `RunCmd.Run` and asserts no `migration_source_won` in the output and exactly one outcome per pdir.

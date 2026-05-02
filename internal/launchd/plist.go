@@ -28,12 +28,19 @@ const (
 // plistInputs is the data the plist XML template substitutes into
 // SPEC.md's template (lines 766-787). All fields are required; renderPlist
 // returns an error if any are empty.
+//
+// ConfigPath is added for B7 (config.toml auto-reload). The field
+// declaration lands ahead of the template + validator wiring so the
+// regression test for the WatchPaths directive can compile against the
+// final shape; the green-pass commit lights up the rendering and the
+// require-non-empty check.
 type plistInputs struct {
 	Label      string
 	BinaryPath string
 	StdoutPath string
 	StderrPath string
 	PATH       string
+	ConfigPath string
 }
 
 // plistTemplate is SPEC's plist XML verbatim, with `{{.Field}}` placeholders

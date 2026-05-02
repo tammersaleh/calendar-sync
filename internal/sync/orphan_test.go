@@ -474,6 +474,36 @@ func TestOrphanWalk_DeleteReturns404_TreatedAsSuccess(t *testing.T) {
 	}
 }
 
+// TestOrphanWalk_DeleteReturns410_TreatedAsSuccess pins B14: Calendar API
+// returns HTTP 410 ("Resource has been deleted") on events.delete for
+// mirrors whose underlying event was already cleaned up - typically a
+// cancelled exception instance of a recurring event whose parent was
+// deleted in the same pass, triggering a server-side cascade. The
+// walker must treat that the same as 404: the cleanup happened (just
+// not by us), so the inventory and outcome should reflect success.
+func TestOrphanWalk_DeleteReturns410_TreatedAsSuccess(t *testing.T) {
+	api := newStubAPI()
+	inv := NewInventory("tgt-cal")
+	sink, captured := captureOutputs()
+
+	tuple := mirror.SourceTuple{CalendarID: "src-cal", EventID: "ghost"}
+	inv.Set(tuple, makeOrphanMirror("m-ghost", tuple.String()))
+	api.queueGetErr("src-cal", "ghost", &gws.Error{Code: gws.CodeAPINotFound, ExitCode: 1})
+	api.deleteErrors = append(api.deleteErrors, &gws.Error{Code: gws.CodeAPIGone, ExitCode: 1})
+
+	w := newOrphanWalker(t, api, inv, sink, orphanOptions{horizon: 30 * 24 * time.Hour})
+	if err := w.Walk(context.Background(), nil); err != nil {
+		t.Fatalf("delete-410 must be swallowed; got %v", err)
+	}
+	got := firstOutcome(t, *captured)
+	if got.Action != mirror.ActionDelete || got.Reason != ReasonOrphaned {
+		t.Errorf("got %s/%s, want delete/orphaned", got.Action, got.Reason)
+	}
+	if _, ok := inv.Lookup(tuple); ok {
+		t.Errorf("inventory must still be pruned even when delete returns 410")
+	}
+}
+
 // ---------- non-404 errors propagate but don't abort the walk ----------
 
 func TestOrphanWalk_GetErrorOnOneEntry_OthersStillProgress(t *testing.T) {

@@ -40,6 +40,14 @@ Fix sketch: switch to `html/template` (handles XML-class escaping for content), 
 
 ## Fixed
 
+### B14 - orphan walker errors on HTTP 410 from events.delete
+
+After B13 the orphan walker started seeing legitimate 410 responses on `events.delete` ("Resource has been deleted") - typically a cancelled exception instance of a recurring event whose parent was just deleted in the same pass, triggering a server-side cascade. The walker only handled `ErrAPINotFound` (404), so the 410 bubbled up as `partial_failure`.
+
+Surfaced on the rollout's drop-and-restart pivot: dropping horizon from 14d to 1d made the orphan walker classify ~63 mirrors as outside_horizon. Many of those were recurring instances; deleting their parents cascaded the children, and the deletes-of-already-cascaded-children returned 410.
+
+Fixed by adding `gws.ErrAPIGone` to the carry-on branch alongside `gws.ErrAPINotFound`. Test pin: `TestOrphanWalk_DeleteReturns410_TreatedAsSuccess` (`internal/sync/orphan_test.go`).
+
 ### B13 - gws error JSON parsed from wrong stream; masks 409/410/404 (CRITICAL)
 
 `gws` emits the Calendar API error envelope on **stdout** (the JSON: `{"error":{"code":409,...}}`). stderr gets only the human-readable summary plus keyring noise. `internal/gws/errors.go:classifyError` parsed **stderr** for the JSON, found nothing parseable, and fell through to `api_invalid_request` for every API error. This masked every meaningful HTTP-status sentinel - including 409 (which broke SPEC's cancelled-and-revived flow that triggers on `errors.Is(err, ErrAPIConflict)`).

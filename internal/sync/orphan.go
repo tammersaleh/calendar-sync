@@ -346,13 +346,16 @@ func (w *OrphanWalker) sourceFilteredOut(source *gws.Event) bool {
 }
 
 // deleteMirror issues events.delete on the target, removes the entry
-// from the in-memory inventory, and emits an outcome. A 404 on
-// events.delete is treated as success: the mirror was already gone
-// (concurrent prune, manual deletion, etc.), so the inventory and
-// downstream consumers should still see the cleanup.
+// from the in-memory inventory, and emits an outcome. A 404 (NotFound)
+// or 410 (Gone, "Resource has been deleted" - typical for cancelled
+// exception instances of recurring events whose parent was just
+// deleted) on events.delete is treated as success: the mirror was
+// already gone (concurrent prune, recurring-parent cascade, manual
+// deletion, etc.), so the inventory and downstream consumers should
+// still see the cleanup.
 func (w *OrphanWalker) deleteMirror(ctx context.Context, r orphanResult, reason mirror.Reason) error {
 	err := w.API.EventsDelete(ctx, w.TargetCalendarID, r.mirror.ID)
-	if err != nil && !errors.Is(err, gws.ErrAPINotFound) {
+	if err != nil && !errors.Is(err, gws.ErrAPINotFound) && !errors.Is(err, gws.ErrAPIGone) {
 		return fmt.Errorf("orphan walk events.delete %s/%s: %w",
 			w.TargetCalendarID, r.mirror.ID, err)
 	}

@@ -449,6 +449,51 @@ func TestDryRunAPI_PatchWithoutPriorInsertReturnsBody(t *testing.T) {
 	}
 }
 
+// TestDryRunAPI_DeleteClearsCache pins the cache-clearing semantics
+// of EventsDelete. Without this, an Insert -> Delete -> Patch
+// sequence would surface the deleted event's old payload via the
+// post-merge return value, which doesn't match production semantics
+// (a deleted event isn't there anymore; subsequent Patch on it would
+// be a 404). Tests that exercise mirror.prune through dry-run rely
+// on Delete clearing the cache so a subsequent Insert with the same
+// ID re-hydrates fresh.
+func TestDryRunAPI_DeleteClearsCache(t *testing.T) {
+	api := newDryRunAPI(&stubGws{})
+	ctx := context.Background()
+
+	insertBody := &gws.Event{
+		ID:      "evt",
+		Summary: "v1",
+		ExtendedProperties: &gws.ExtendedProperties{
+			Private: map[string]string{"calendar-sync:version": "2"},
+		},
+	}
+	if _, err := api.EventsInsert(ctx, "cal", insertBody); err != nil {
+		t.Fatalf("EventsInsert: %v", err)
+	}
+	if err := api.EventsDelete(ctx, "cal", "evt"); err != nil {
+		t.Fatalf("EventsDelete: %v", err)
+	}
+
+	// After Delete, a Patch with no body of its own should hit the
+	// no-prior-insert fallback (body-echo). The Insert's Summary=v1
+	// must NOT bleed through.
+	patchBody := &gws.Event{Summary: "v2"}
+	got, err := api.EventsPatch(ctx, "cal", "evt", patchBody)
+	if err != nil {
+		t.Fatalf("EventsPatch: %v", err)
+	}
+	if got.Summary != "v2" {
+		t.Errorf("Summary = %q, want v2 (cache should have been cleared)", got.Summary)
+	}
+	// The Insert's calendar-sync:version must NOT be present - it was
+	// in the cleared cache, not in the patch body.
+	if got.ExtendedProperties != nil && got.ExtendedProperties.Private["calendar-sync:version"] != "" {
+		t.Errorf("Private[version] = %q, want empty (cache should have been cleared); ext=%+v",
+			got.ExtendedProperties.Private["calendar-sync:version"], got.ExtendedProperties)
+	}
+}
+
 // countingGws extends stubGws with per-method counters so dryRunAPI tests
 // can assert no underlying write occurred. Each Counter is a *int so the
 // test owns the storage and can assert directly without exposing extra

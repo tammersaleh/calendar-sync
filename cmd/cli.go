@@ -78,15 +78,33 @@ type Runtime struct {
 //
 // Returns the SPEC's exit code. kong-side parse errors emit a usage line on
 // stderr and surface as exit 64 (SPEC line 398).
+//
+// SAFETY: kong's helpFlag.BeforeReset (and VersionFlag's BeforeReset)
+// terminates by calling ctx.Kong.Exit(code) and returning nil. We can't
+// let those calls hit os.Exit because tests need to drive Run() in-process.
+// The previous implementation passed `kong.Exit(func(int) {})` which made
+// Exit a no-op - so Parse returned successfully after --help and the
+// subcommand's Run method got dispatched anyway, performing live writes
+// (B1). The fix below captures the kong-Exit signal into a local sentinel
+// and short-circuits before kctx.Run is called, so any kong-builtin flag
+// that terminates via Exit (currently --help and --version) bypasses the
+// subcommand entirely.
 func Run(args []string, stdout, stderr io.Writer) int {
 	cli := &CLI{}
+
+	// kongExitCode captures any code passed to ctx.Kong.Exit during
+	// Parse. -1 means "Exit was never called". Anything >= 0 means a
+	// kong-builtin flag asked the program to terminate with that code
+	// (--help → 0; --version → 0; kong.Fatalf → 1). We honor it by
+	// returning before subcommand dispatch.
+	kongExitCode := -1
 
 	parser, err := kong.New(cli,
 		kong.Name("calendar-sync"),
 		kong.Description("Google Calendar event mirroring tool."),
 		kong.Writers(stdout, stderr),
 		kong.UsageOnError(),
-		kong.Exit(func(int) {}),
+		kong.Exit(func(code int) { kongExitCode = code }),
 	)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -98,6 +116,14 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		// kong's parse errors are always usage failures.
 		return 64
+	}
+
+	// If a kong-builtin flag (--help, --version, ...) called Exit during
+	// Parse, return that code now. Crucially: do NOT dispatch the
+	// subcommand. helpFlag's BeforeReset prints the usage to stdout and
+	// then calls Exit(0); the user wanted help, not the subcommand.
+	if kongExitCode >= 0 {
+		return kongExitCode
 	}
 
 	rt := &Runtime{

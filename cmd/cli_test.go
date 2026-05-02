@@ -64,11 +64,20 @@ func TestRun_NoArgsShowsUsage(t *testing.T) {
 // calendar". Post-fix the test passes via the kong help short-circuit
 // before loadConfig is ever called.
 //
-// The post-fix expectation: exit code 0, stdout contains the help text,
-// stderr empty (no error envelope). That triple proves help short-circuited.
+// The cases split into two columns:
 //
-// Pre-fix this test fails because exit code is non-zero (config_not_found
-// from loadConfig) and stderr carries an ErrorEnvelope.
+//   - wantHelp: subcommand has no required positionals, so kong runs hooks
+//     (including helpFlag.BeforeReset) before validation. Expectation:
+//     exit 0, "Usage:" on stdout.
+//   - wantParseError: subcommand has a required positional. kong's Trace
+//     fails with "expected <name>" BEFORE BeforeReset can fire. Expectation:
+//     exit 64 with the parse error on stderr. The subcommand's Run method
+//     is still NOT dispatched, which is the load-bearing safety invariant.
+//
+// Both columns share the "no error envelope" and "no subcommand-side error
+// code" check: at HEAD pre-fix, every case writes a CodeXxx envelope to
+// stderr because RunCmd / WatchCmd / InstallCmd / UninstallCmd actually
+// executed.
 func TestRun_HelpFlagDoesNotDispatchSubcommand(t *testing.T) {
 	// Belt-and-suspenders against accidental writes: even if B1 is unfixed,
 	// the subcommand will error out at loadConfig long before reaching gws.
@@ -82,21 +91,27 @@ func TestRun_HelpFlagDoesNotDispatchSubcommand(t *testing.T) {
 	t.Setenv("HOME", "/no/such/home")
 	t.Setenv("XDG_CONFIG_HOME", "/no/such/xdg")
 
+	type expectation int
+	const (
+		wantHelp       expectation = iota // exit 0, "Usage:" on stdout
+		wantParseError                    // exit 64, kong-style "expected <X>" on stderr
+	)
 	cases := []struct {
-		name string
-		args []string
+		name   string
+		args   []string
+		expect expectation
 	}{
-		{"run --help", []string{"run", "--help"}},
-		{"run -h", []string{"run", "-h"}},
-		{"watch --help", []string{"watch", "--help"}},
-		{"install --help", []string{"install", "--help"}},
-		{"uninstall --help", []string{"uninstall", "--help"}},
-		{"mirror prune --help", []string{"mirror", "prune", "--help"}},
-		{"mirror list --help", []string{"mirror", "list", "--help"}},
-		{"pair test --help", []string{"pair", "test", "--help"}},
-		{"config show --help", []string{"config", "show", "--help"}},
-		{"init --help", []string{"init", "--help"}},
-		{"top-level --help", []string{"--help"}},
+		{"run --help", []string{"run", "--help"}, wantHelp},
+		{"run -h", []string{"run", "-h"}, wantHelp},
+		{"watch --help", []string{"watch", "--help"}, wantHelp},
+		{"install --help", []string{"install", "--help"}, wantHelp},
+		{"uninstall --help", []string{"uninstall", "--help"}, wantHelp},
+		{"mirror prune --help", []string{"mirror", "prune", "--help"}, wantParseError},
+		{"mirror list --help", []string{"mirror", "list", "--help"}, wantParseError},
+		{"pair test --help", []string{"pair", "test", "--help"}, wantParseError},
+		{"config show --help", []string{"config", "show", "--help"}, wantHelp},
+		{"init --help", []string{"init", "--help"}, wantHelp},
+		{"top-level --help", []string{"--help"}, wantParseError},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -105,16 +120,31 @@ func TestRun_HelpFlagDoesNotDispatchSubcommand(t *testing.T) {
 
 			code := Run(tc.args, stdout, stderr)
 
-			if code != 0 {
-				t.Errorf("exit code = %d, want 0; stderr=%q", code, stderr.String())
-			}
-			// Help text always contains "Usage:".
-			if !strings.Contains(stdout.String(), "Usage:") {
-				t.Errorf("stdout missing 'Usage:'; got %q", stdout.String())
-			}
-			// No error envelope on stderr.
+			// Subcommand-side error envelope must NEVER appear: that's the
+			// load-bearing safety check. Kong parse errors print plain text
+			// (e.g. "expected <calendar>") on stderr; subcommand-side
+			// errors emit a JSON `{"error":...}` envelope. The latter is
+			// what we're guarding against - it would prove the subcommand's
+			// Run method executed.
 			if strings.Contains(stderr.String(), `"error"`) {
 				t.Errorf("stderr carries an error envelope - subcommand executed; stderr=%q", stderr.String())
+			}
+
+			switch tc.expect {
+			case wantHelp:
+				if code != 0 {
+					t.Errorf("exit code = %d, want 0; stderr=%q", code, stderr.String())
+				}
+				if !strings.Contains(stdout.String(), "Usage:") {
+					t.Errorf("stdout missing 'Usage:'; got %q", stdout.String())
+				}
+			case wantParseError:
+				if code != 64 {
+					t.Errorf("exit code = %d, want 64 (kong parse error); stderr=%q", code, stderr.String())
+				}
+				if stderr.Len() == 0 {
+					t.Errorf("expected kong parse error on stderr; got empty")
+				}
 			}
 		})
 	}

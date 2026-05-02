@@ -157,16 +157,16 @@ func handleErr(stderr io.Writer, err error) int {
 	return output.ExitCodeFor(code)
 }
 
-// unwrapCause walks errors.Unwrap to find the first wrapped cause and
-// returns its Error() text, or "" if the error is unwrappable to nothing.
-// Used by handleErr to populate ErrorEnvelope.Cause without duplicating
-// the top-level detail (which is err.Error() for non-cmdError types).
+// unwrapCause does a single-step errors.Unwrap on err and returns the
+// wrapped error's Error() text, or "" if err doesn't wrap anything. Used
+// by handleErr to populate ErrorEnvelope.Cause without duplicating the
+// top-level detail (which is err.Error() for non-cmdError types).
 //
-// For *cmdError specifically, Unwrap returns the cause field directly,
-// which is exactly the underlying gws/sync error - that's the value
-// operators want surfaced. For other error types Unwrap may produce noise
-// (an entire error chain joined by ": "); the cause field is omitempty
-// so an empty return drops cleanly out of the JSON envelope.
+// For *cmdError, Unwrap returns the cause field directly - the underlying
+// gws/sync error operators want surfaced. For other error types, the
+// behavior depends on whether they implement Unwrap; non-wrapping errors
+// return "" and the omitempty rule on Cause drops it cleanly from the
+// JSON envelope.
 func unwrapCause(err error) string {
 	cause := errors.Unwrap(err)
 	if cause == nil {

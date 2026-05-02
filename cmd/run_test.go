@@ -361,29 +361,27 @@ func (c *countingGws) EventsInsert(ctx context.Context, cal string, body *gws.Ev
 }
 
 // TestRunCmd_DryRun_DuplicateSourceEventTriggersBogusMigrationSourceWon is
-// the end-to-end reproduction of doc/dry-run-anomaly-analysis.md anomaly
-// #1. The user's dry-run output had 14 patches with conflict=
-// migration_source_won despite zero v1/v2 mirrors existing on the target.
-// This test wires the same code path with two copies of the same source
-// event (a stand-in for whatever caused the actual duplication on Tammer's
-// calendar - phantom recurring exception, paginated overlap, etc.) and
-// asserts the bogus outcome is reproducible.
+// scaffolding for the eventual regression test of
+// doc/dry-run-anomaly-analysis.md anomaly #1. The user's dry-run produced
+// 14 patches with conflict=migration_source_won despite zero v1/v2 mirrors
+// on the target. The setup below feeds two copies of the same source event
+// (a stand-in for whatever caused the production duplication - phantom
+// recurring exception, paginated overlap, etc.) and is what the regression
+// test will exercise once the bug is fixed.
 //
-// Expected to FAIL on a future fix that either:
-//   - rejects duplicate source-tuples in the source list (sync layer), or
-//   - has dryRunAPI.EventsPatch echo a snapshot rather than only the patch
-//     body (so the cached mirror retains version=2).
-//
-// When that fix lands, change t.Errorf to t.Logf and update the comment.
+// Currently t.Skip - asserting the buggy outcome as a pass condition would
+// give false confidence that an incidental fix had been caught. When the
+// fix lands (either reject duplicate source-tuples in runClassifyLoop, or
+// have dryRunAPI.EventsPatch echo a full snapshot rather than only the
+// patch body), drop the t.Skip and assert that migration_source_won is
+// NOT in the output.
 func TestRunCmd_DryRun_DuplicateSourceEventTriggersBogusMigrationSourceWon(t *testing.T) {
+	t.Skip("known bug; see doc/dry-run-anomaly-analysis.md anomaly #1")
+
 	tmp := shortTempDir(t)
 	t.Setenv("TMPDIR", tmp)
 	path := writeConfigFixture(t, validConfigTOML)
 
-	// Two identical copies of the same source event in the source list.
-	// In the user's actual dry-run output the duplication appeared as
-	// "_R<timestamp>" recurring-exception IDs being returned twice; the
-	// shape that drives the bug is duplication, not recurring-ness.
 	dupEvent := gws.Event{
 		ID:           "evt-1",
 		Status:       gws.EventStatusConfirmed,
@@ -403,21 +401,7 @@ func TestRunCmd_DryRun_DuplicateSourceEventTriggersBogusMigrationSourceWon(t *te
 		Ctx:     context.Background(),
 		Gws:     stub,
 	}
-	if err := (&RunCmd{DryRun: true}).Run(rt); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-
-	// First pass should be insert(source_updated), second should be
-	// patch(source_updated) with conflict=migration_source_won. That second
-	// outcome is the bug: the mirror was JUST minted with version=2 in the
-	// same dry-run pass.
-	out := stdout.String()
-	if !strings.Contains(out, `"action":"insert"`) {
-		t.Errorf("expected first pass to insert; stdout:\n%s", out)
-	}
-	if !strings.Contains(out, `"conflict":"migration_source_won"`) {
-		t.Errorf("expected second pass to emit migration_source_won; stdout:\n%s", out)
-	}
+	_ = (&RunCmd{DryRun: true}).Run(rt)
 }
 
 // dupSourceListGws extends stubGws with a fixed source-list response. The

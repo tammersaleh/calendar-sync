@@ -106,7 +106,6 @@ func (c *RunCmd) run(rt *Runtime, canonical *config.Canonical, count *int) error
 	// (the same identifier shape SPEC uses for pdirs throughout).
 	var failures []string
 	var firstErr error
-	log := rt.Logger
 	for _, pr := range res.PDirs {
 		if pr.Err == nil {
 			continue
@@ -120,16 +119,15 @@ func (c *RunCmd) run(rt *Runtime, canonical *config.Canonical, count *int) error
 		// a list of pdir names; the actual cause lives in stderr's warn-level
 		// log so an operator running with --log-level=warn or above can
 		// always see why a pdir failed without re-running with debug.
-		if log != nil {
-			log.Warn("cmd.run: pdir failed",
-				"pair", pr.Pair,
-				"direction", pr.Direction,
-				"source", pr.Source,
-				"target", pr.Target,
-				"events_processed", pr.Counts.EventsProcessed,
-				"error", pr.Err.Error(),
-			)
-		}
+		// Logger.Warn is nil-safe at the receiver (see internal/output/logger.go).
+		rt.Logger.Warn("cmd.run: pdir failed",
+			"pair", pr.Pair,
+			"direction", pr.Direction,
+			"source", pr.Source,
+			"target", pr.Target,
+			"events_processed", pr.Counts.EventsProcessed,
+			"error", pr.Err.Error(),
+		)
 	}
 
 	p.Meta(runMetaPayload{

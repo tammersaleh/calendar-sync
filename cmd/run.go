@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tammersaleh/calendar-sync/internal/config"
@@ -257,16 +258,43 @@ type runMetaPayload struct {
 // reconciler still emits Outcomes for would-be writes via its Output
 // callback; the wire effect is suppressed.
 //
-// The wrapper returns minimal-but-valid Event values for write paths so
-// downstream code that consults the response (e.g. mirror.BuildPayload's
-// follow-up checksum patch) doesn't trip on nil. In particular:
+// The wrapper holds a per-(calendarID, eventID) cache of "what was
+// last echoed back" so repeated writes against the same event behave
+// like Calendar API's JSON Merge Patch:
 //
-//   - Insert returns a copy of the body with ID populated if missing.
-//   - Patch returns body unchanged.
-//   - Delete returns nil (success).
-type dryRunAPI struct{ inner GwsClient }
+//   - Insert caches a clone of the body (with ID populated if missing).
+//   - Patch merges the patch body into the cached snapshot - top-level
+//     fields replace; ExtendedProperties.Private/Shared merges at the
+//     key level - and returns the merged event. Without a prior Insert,
+//     Patch falls back to body-echo with ID populated.
+//   - Delete clears the cache entry and returns nil.
+//
+// The cache + merge are what make B2 cause A go away. Before, Patch
+// echoed body verbatim, so a checksum-only follow-up Patch dropped the
+// version + source the Insert had populated. The next Classify pass
+// for the same source-tuple read the broken cached event and fired
+// NeedsMigration - bogus migration_source_won outcomes.
+//
+// The wrapper IS thread-safe (Reconciler's orphan walk fans events.get
+// out across goroutines, and fake test stubs that wrap dryRunAPI may
+// also fan out); the inner mutex serializes cache reads and writes.
+type dryRunAPI struct {
+	inner GwsClient
+	mu    sync.Mutex
+	cache map[dryRunCacheKey]*gws.Event
+}
 
-func newDryRunAPI(inner GwsClient) GwsClient { return &dryRunAPI{inner: inner} }
+type dryRunCacheKey struct {
+	calendarID string
+	eventID    string
+}
+
+func newDryRunAPI(inner GwsClient) GwsClient {
+	return &dryRunAPI{
+		inner: inner,
+		cache: make(map[dryRunCacheKey]*gws.Event),
+	}
+}
 
 func (d *dryRunAPI) CalendarListGet(ctx context.Context, id string) (*gws.CalendarListEntry, error) {
 	return d.inner.CalendarListGet(ctx, id)
@@ -284,28 +312,208 @@ func (d *dryRunAPI) EventsInstances(ctx context.Context, params gws.EventsInstan
 	return d.inner.EventsInstances(ctx, params)
 }
 
-func (d *dryRunAPI) EventsInsert(_ context.Context, _ string, body *gws.Event) (*gws.Event, error) {
+func (d *dryRunAPI) EventsInsert(_ context.Context, calendarID string, body *gws.Event) (*gws.Event, error) {
 	if body == nil {
 		return &gws.Event{}, nil
 	}
-	out := *body
+	out := dryRunCloneEvent(body)
 	if out.ID == "" {
 		out.ID = "dry-run"
 	}
-	return &out, nil
+	d.mu.Lock()
+	d.cache[dryRunCacheKey{calendarID: calendarID, eventID: out.ID}] = out
+	d.mu.Unlock()
+	// Return an independent copy so callers mutating the response
+	// don't scribble over the cache.
+	return dryRunCloneEvent(out), nil
 }
 
-func (d *dryRunAPI) EventsPatch(_ context.Context, _ string, eventID string, body *gws.Event) (*gws.Event, error) {
+func (d *dryRunAPI) EventsPatch(_ context.Context, calendarID string, eventID string, body *gws.Event) (*gws.Event, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	key := dryRunCacheKey{calendarID: calendarID, eventID: eventID}
+	cached := d.cache[key]
+
 	if body == nil {
+		// Body-less patch: return what's cached if any, else a minimal
+		// stub matching the prior body-echo contract.
+		if cached != nil {
+			return dryRunCloneEvent(cached), nil
+		}
 		return &gws.Event{ID: eventID}, nil
 	}
-	out := *body
-	if out.ID == "" {
-		out.ID = eventID
+
+	if cached == nil {
+		// No prior insert seen by the wrapper. Body-echo with ID
+		// populated. Tests that don't drive doInsert (e.g. patch-only
+		// stubs) rely on this contract.
+		out := dryRunCloneEvent(body)
+		if out.ID == "" {
+			out.ID = eventID
+		}
+		d.cache[key] = out
+		return dryRunCloneEvent(out), nil
 	}
-	return &out, nil
+
+	merged := dryRunMergeEvent(cached, body)
+	d.cache[key] = merged
+	return dryRunCloneEvent(merged), nil
 }
 
-func (d *dryRunAPI) EventsDelete(_ context.Context, _, _ string) error {
+func (d *dryRunAPI) EventsDelete(_ context.Context, calendarID, eventID string) error {
+	d.mu.Lock()
+	delete(d.cache, dryRunCacheKey{calendarID: calendarID, eventID: eventID})
+	d.mu.Unlock()
 	return nil
+}
+
+// dryRunCloneEvent returns a fresh *gws.Event with deep copies of the
+// pointer + slice + map fields the dry-run cache could otherwise leak
+// callers' mutations into (or vice versa).
+func dryRunCloneEvent(e *gws.Event) *gws.Event {
+	if e == nil {
+		return nil
+	}
+	out := *e
+	if e.Start != nil {
+		s := *e.Start
+		out.Start = &s
+	}
+	if e.End != nil {
+		s := *e.End
+		out.End = &s
+	}
+	if e.OriginalStartTime != nil {
+		s := *e.OriginalStartTime
+		out.OriginalStartTime = &s
+	}
+	if e.Reminders != nil {
+		r := *e.Reminders
+		out.Reminders = &r
+	}
+	if e.ExtendedProperties != nil {
+		ep := *e.ExtendedProperties
+		if e.ExtendedProperties.Private != nil {
+			priv := make(map[string]string, len(e.ExtendedProperties.Private))
+			for k, v := range e.ExtendedProperties.Private {
+				priv[k] = v
+			}
+			ep.Private = priv
+		}
+		if e.ExtendedProperties.Shared != nil {
+			sh := make(map[string]string, len(e.ExtendedProperties.Shared))
+			for k, v := range e.ExtendedProperties.Shared {
+				sh[k] = v
+			}
+			ep.Shared = sh
+		}
+		out.ExtendedProperties = &ep
+	}
+	if e.Recurrence != nil {
+		r := make([]string, len(e.Recurrence))
+		copy(r, e.Recurrence)
+		out.Recurrence = r
+	}
+	if e.Attendees != nil {
+		a := make([]gws.Attendee, len(e.Attendees))
+		copy(a, e.Attendees)
+		out.Attendees = a
+	}
+	return &out
+}
+
+// dryRunMergeEvent applies Calendar API JSON Merge Patch semantics:
+// non-zero top-level fields in patch REPLACE base; ExtendedProperties
+// (both Private and Shared) merge at the key level so a checksum-only
+// follow-up patch doesn't drop the version + source the Insert wrote.
+//
+// Pointer + slice fields in patch (Start, Recurrence, Attendees, ...)
+// replace as a whole when non-nil. Wholesale-replacement matches
+// Calendar API's wire behavior for these fields - a patch with a new
+// `start` replaces the prior start, it doesn't merge sub-fields.
+//
+// Empty-string scalars in patch are NOT applied; calendar-sync's
+// patches never explicitly clear a field, and the wire test suite
+// already exercises the "drop empty in body" pattern via omitempty.
+func dryRunMergeEvent(base, patch *gws.Event) *gws.Event {
+	out := dryRunCloneEvent(base)
+	if patch.ID != "" {
+		out.ID = patch.ID
+	}
+	if patch.Status != "" {
+		out.Status = patch.Status
+	}
+	if patch.Summary != "" {
+		out.Summary = patch.Summary
+	}
+	if patch.Description != "" {
+		out.Description = patch.Description
+	}
+	if patch.Updated != "" {
+		out.Updated = patch.Updated
+	}
+	if patch.Transparency != "" {
+		out.Transparency = patch.Transparency
+	}
+	if patch.Visibility != "" {
+		out.Visibility = patch.Visibility
+	}
+	if patch.HTMLLink != "" {
+		out.HTMLLink = patch.HTMLLink
+	}
+	if patch.RecurringEventID != "" {
+		out.RecurringEventID = patch.RecurringEventID
+	}
+	if patch.EventType != "" {
+		out.EventType = patch.EventType
+	}
+	if patch.Start != nil {
+		s := *patch.Start
+		out.Start = &s
+	}
+	if patch.End != nil {
+		s := *patch.End
+		out.End = &s
+	}
+	if patch.OriginalStartTime != nil {
+		s := *patch.OriginalStartTime
+		out.OriginalStartTime = &s
+	}
+	if patch.Reminders != nil {
+		r := *patch.Reminders
+		out.Reminders = &r
+	}
+	if patch.Recurrence != nil {
+		r := make([]string, len(patch.Recurrence))
+		copy(r, patch.Recurrence)
+		out.Recurrence = r
+	}
+	if patch.Attendees != nil {
+		a := make([]gws.Attendee, len(patch.Attendees))
+		copy(a, patch.Attendees)
+		out.Attendees = a
+	}
+	if patch.ExtendedProperties != nil {
+		if out.ExtendedProperties == nil {
+			out.ExtendedProperties = &gws.ExtendedProperties{}
+		}
+		if patch.ExtendedProperties.Private != nil {
+			if out.ExtendedProperties.Private == nil {
+				out.ExtendedProperties.Private = make(map[string]string, len(patch.ExtendedProperties.Private))
+			}
+			for k, v := range patch.ExtendedProperties.Private {
+				out.ExtendedProperties.Private[k] = v
+			}
+		}
+		if patch.ExtendedProperties.Shared != nil {
+			if out.ExtendedProperties.Shared == nil {
+				out.ExtendedProperties.Shared = make(map[string]string, len(patch.ExtendedProperties.Shared))
+			}
+			for k, v := range patch.ExtendedProperties.Shared {
+				out.ExtendedProperties.Shared[k] = v
+			}
+		}
+	}
+	return out
 }

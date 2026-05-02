@@ -995,6 +995,115 @@ target    = "personal@example.com"
 	}
 }
 
+// TestRunCmd_ConfigPropagateWiredToPDir pins the per-pair propagate scoping
+// rollout: `[settings].propagate_target_edits` is the per-pdir fallback.
+// Post-rollout, the gate value lives on each canonical PDir (resolved at
+// canonicalization to either the per-pair override or the settings
+// default). A regression that drops the wire-through would leave PDirs
+// with PropagateTargetEdits=false even when the operator opted in via
+// settings - silently neutralizing every two-way pdir.
+//
+// We replicate the exact wire pattern run.go uses (Load → Canonicalize)
+// and assert on the canonical PDir's resolved value - the reconciler no
+// longer carries a PropagateTargetEdits field; the gate reads pd.PropagateTargetEdits.
+func TestRunCmd_ConfigPropagateWiredToPDir(t *testing.T) {
+	body := `
+[settings]
+poll_interval         = "60s"
+horizon               = "365d"
+full_sync_interval    = "24h"
+log_level             = "info"
+log_format            = "json"
+propagate_target_edits = true
+
+[[pairs]]
+name      = "work-personal"
+source    = "work@example.com"
+target    = "personal@example.com"
+`
+	path := writeConfigFixture(t, body)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	canonical, err := cfg.Canonicalize(context.Background(), &stubGws{})
+	if err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	if len(canonical.PDirs) != 1 {
+		t.Fatalf("len(PDirs) = %d, want 1", len(canonical.PDirs))
+	}
+	if got, want := canonical.PDirs[0].PropagateTargetEdits, true; got != want {
+		t.Errorf("PDir.PropagateTargetEdits = %v, want %v (settings opt-in)", got, want)
+	}
+}
+
+// TestRunCmd_PerPairPropagateOverridesSettings: when a [[pairs]] block
+// sets its own propagate_target_edits, that override flows through
+// canonicalization to the PDir's resolved value. The settings field is
+// the fallback for pairs without an explicit override; per-pair scoping
+// is what enables ramping two-way sync one direction at a time.
+//
+// Three pairs cover the three resolution paths:
+//   - settings=false, no override → false (fallback).
+//   - settings=false, override=true → true (per-pair opt-in).
+//   - settings=false, override=false → false (explicit-false override; pins
+//     the *bool wire so omitempty / nil-vs-pointer-to-false confusion can't
+//     silently downgrade to fallback).
+func TestRunCmd_PerPairPropagateOverridesSettings(t *testing.T) {
+	body := `
+[settings]
+poll_interval         = "60s"
+horizon               = "365d"
+full_sync_interval    = "24h"
+log_level             = "info"
+log_format            = "json"
+propagate_target_edits = false
+
+[[pairs]]
+name    = "fallback"
+source  = "a@example.com"
+target  = "b@example.com"
+
+[[pairs]]
+name                   = "override-true"
+source                 = "c@example.com"
+target                 = "d@example.com"
+propagate_target_edits = true
+
+[[pairs]]
+name                   = "override-false"
+source                 = "e@example.com"
+target                 = "f@example.com"
+propagate_target_edits = false
+`
+	path := writeConfigFixture(t, body)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	canonical, err := cfg.Canonicalize(context.Background(), &stubGws{})
+	if err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	pdirByName := map[string]config.PDir{}
+	for _, pd := range canonical.PDirs {
+		pdirByName[pd.PairName] = pd
+	}
+	if got, want := pdirByName["fallback"].PropagateTargetEdits, false; got != want {
+		t.Errorf("fallback PDir.PropagateTargetEdits = %v, want %v (settings default)", got, want)
+	}
+	if got, want := pdirByName["override-true"].PropagateTargetEdits, true; got != want {
+		t.Errorf("override-true PDir.PropagateTargetEdits = %v, want %v (per-pair override)", got, want)
+	}
+	if got, want := pdirByName["override-false"].PropagateTargetEdits, false; got != want {
+		t.Errorf("override-false PDir.PropagateTargetEdits = %v, want %v (explicit-false per-pair override)", got, want)
+	}
+}
+
 // TestRunCmd_PerPairHorizonOverridesSettings: when a [[pairs]] block sets
 // its own horizon, that override flows through canonicalization to the
 // PDir.Horizon. Settings.Horizon is the fallback for pairs without an

@@ -48,10 +48,11 @@ func (c *ConfigShowCmd) Run(rt *Runtime) error {
 	} else {
 		for _, p := range cfg.Pairs {
 			row := pairPayload{
-				Name:    p.Name,
-				Source:  p.Source,
-				Target:  p.Target,
-				Enabled: p.IsEnabled(),
+				Name:                 p.Name,
+				Source:               p.Source,
+				Target:               p.Target,
+				Enabled:              p.IsEnabled(),
+				PropagateTargetEdits: p.PropagateTargetEdits,
 			}
 			if p.Horizon != nil {
 				row.Horizon = p.Horizon.Compact()
@@ -82,10 +83,11 @@ func pairPayloadFromCanonical(p config.Pair, canonical *config.Canonical) pairPa
 		break
 	}
 	row := pairPayload{
-		Name:    p.Name,
-		Source:  source,
-		Target:  target,
-		Enabled: p.IsEnabled(),
+		Name:                 p.Name,
+		Source:               source,
+		Target:               target,
+		Enabled:              p.IsEnabled(),
+		PropagateTargetEdits: p.PropagateTargetEdits,
 	}
 	if p.Horizon != nil {
 		row.Horizon = p.Horizon.Compact()
@@ -161,12 +163,19 @@ type settingsPayload struct {
 // Horizon surfaces only when the pair set its own override; absence (the
 // settings-fallback case) drops the field via omitempty so the wire shape
 // matches the user's config exactly.
+//
+// PropagateTargetEdits is *bool (not bool) so omitempty distinguishes
+// "absent" (nil → settings fallback) from "explicit false" (&false → the
+// operator turned the gate off for this pair specifically). A plain bool
+// with omitempty would also drop `false`, silently demoting a deliberate
+// per-pair override back to the fallback.
 type pairPayload struct {
-	Name    string `json:"name"`
-	Source  string `json:"source"`
-	Target  string `json:"target"`
-	Enabled bool   `json:"enabled"`
-	Horizon string `json:"horizon,omitempty"`
+	Name                 string `json:"name"`
+	Source               string `json:"source"`
+	Target               string `json:"target"`
+	Enabled              bool   `json:"enabled"`
+	Horizon              string `json:"horizon,omitempty"`
+	PropagateTargetEdits *bool  `json:"propagate_target_edits,omitempty"`
 }
 
 // configValidatePayload is SPEC line 609's wire shape:

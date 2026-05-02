@@ -424,6 +424,90 @@ func TestCanonicalize_NilHorizonFallsBackToSettings(t *testing.T) {
 	}
 }
 
+// TestCanonicalize_PerPairPropagateTargetEditsOverride: settings has
+// propagate_target_edits=false but the pair sets &true; the resolved PDir
+// flips to true. Pins the per-pair scoping fallthrough for the safety gate.
+func TestCanonicalize_PerPairPropagateTargetEditsOverride(t *testing.T) {
+	c := baseConfig()
+	c.Settings.PropagateTargetEdits = false
+	override := true
+	c.Pairs = []config.Pair{{
+		Name:                 "p",
+		Source:               "a@example.com",
+		Target:               "b@example.com",
+		PropagateTargetEdits: &override,
+	}}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"a@example.com": {ID: "a@example.com", AccessRole: "owner"},
+			"b@example.com": {ID: "b@example.com", AccessRole: "owner"},
+		},
+	}
+	can, err := c.Canonicalize(context.Background(), lister)
+	if err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	if got, want := can.PDirs[0].PropagateTargetEdits, true; got != want {
+		t.Errorf("PDir.PropagateTargetEdits = %v, want %v (per-pair override)", got, want)
+	}
+}
+
+// TestCanonicalize_PerPairPropagateTargetEditsExplicitFalse: settings has
+// propagate_target_edits=true but the pair sets &false; the resolved PDir
+// is false. Pins the explicit-false case so a future bug that conflates
+// nil-vs-&false (e.g. reading "absent" from "explicit false") gets caught.
+func TestCanonicalize_PerPairPropagateTargetEditsExplicitFalse(t *testing.T) {
+	c := baseConfig()
+	c.Settings.PropagateTargetEdits = true
+	override := false
+	c.Pairs = []config.Pair{{
+		Name:                 "p",
+		Source:               "a@example.com",
+		Target:               "b@example.com",
+		PropagateTargetEdits: &override,
+	}}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"a@example.com": {ID: "a@example.com", AccessRole: "owner"},
+			"b@example.com": {ID: "b@example.com", AccessRole: "owner"},
+		},
+	}
+	can, err := c.Canonicalize(context.Background(), lister)
+	if err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	if got, want := can.PDirs[0].PropagateTargetEdits, false; got != want {
+		t.Errorf("PDir.PropagateTargetEdits = %v, want %v (explicit false override)", got, want)
+	}
+}
+
+// TestCanonicalize_NilPropagateFallsBackToSettings: a pair with no
+// propagate_target_edits resolves to a PDir whose value equals the
+// settings default. Pins the fallback path for configs that omit the
+// per-pair field.
+func TestCanonicalize_NilPropagateFallsBackToSettings(t *testing.T) {
+	c := baseConfig()
+	c.Settings.PropagateTargetEdits = true
+	c.Pairs = []config.Pair{{
+		Name:   "p",
+		Source: "a@example.com",
+		Target: "b@example.com",
+	}}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"a@example.com": {ID: "a@example.com", AccessRole: "owner"},
+			"b@example.com": {ID: "b@example.com", AccessRole: "owner"},
+		},
+	}
+	can, err := c.Canonicalize(context.Background(), lister)
+	if err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	if got, want := can.PDirs[0].PropagateTargetEdits, true; got != want {
+		t.Errorf("PDir.PropagateTargetEdits = %v, want %v (settings fallback)", got, want)
+	}
+}
+
 func TestCanonicalize_PreservesTimeZoneOnPDir(t *testing.T) {
 	c := baseConfig()
 	c.Pairs = []config.Pair{{

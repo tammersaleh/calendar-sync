@@ -37,10 +37,11 @@ func (c *PairListCmd) Run(rt *Runtime) error {
 			continue
 		}
 		row := pairPayload{
-			Name:    pair.Name,
-			Source:  pair.Source,
-			Target:  pair.Target,
-			Enabled: pair.IsEnabled(),
+			Name:                 pair.Name,
+			Source:               pair.Source,
+			Target:               pair.Target,
+			Enabled:              pair.IsEnabled(),
+			PropagateTargetEdits: pair.PropagateTargetEdits,
 		}
 		if pair.Horizon != nil {
 			row.Horizon = pair.Horizon.Compact()

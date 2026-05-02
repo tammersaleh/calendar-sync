@@ -219,6 +219,79 @@ horizon = "1d"
 	}
 }
 
+// TestConfigShowCmd_PerPairPropagateWireShape pins the per-pair-propagate
+// scoping rollout's wire format, with a critical "explicit false" case:
+//
+//   - "fallback" pair has no override → omitempty drops the field entirely.
+//   - "override-true" → key present, value true.
+//   - "override-false" → key present, value false. This is the load-bearing
+//     case: with a plain `bool` field + omitempty, Go's encoder would also
+//     drop `false` and silently demote an explicit override to fallback.
+//     The pairPayload's *bool pointer makes "absent" and "explicit false"
+//     distinguishable; this test pins it.
+func TestConfigShowCmd_PerPairPropagateWireShape(t *testing.T) {
+	body := `
+[settings]
+poll_interval = "60s"
+horizon = "365d"
+full_sync_interval = "24h"
+log_level = "info"
+log_format = "json"
+propagate_target_edits = false
+
+[[pairs]]
+name = "fallback"
+source = "a@example.com"
+target = "b@example.com"
+
+[[pairs]]
+name = "override-true"
+source = "c@example.com"
+target = "d@example.com"
+propagate_target_edits = true
+
+[[pairs]]
+name = "override-false"
+source = "e@example.com"
+target = "f@example.com"
+propagate_target_edits = false
+`
+	path := writeConfigFixture(t, body)
+	stdout := &bytes.Buffer{}
+	rt := &Runtime{
+		Stdout:  stdout,
+		Stderr:  &bytes.Buffer{},
+		Globals: Globals{Config: path},
+		Ctx:     context.Background(),
+		Gws:     &stubGws{},
+	}
+	if err := (&ConfigShowCmd{}).Run(rt); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	first := strings.SplitN(stdout.String(), "\n", 2)[0]
+
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(first), &raw); err != nil {
+		t.Fatalf("unmarshal: %v\nstdout=%s", err, stdout.String())
+	}
+	pairs, _ := raw["pairs"].([]any)
+	byName := map[string]map[string]any{}
+	for _, p := range pairs {
+		entry := p.(map[string]any)
+		byName[entry["name"].(string)] = entry
+	}
+	if v, present := byName["fallback"]["propagate_target_edits"]; present {
+		t.Errorf("fallback pair must drop propagate_target_edits via omitempty; got %v", v)
+	}
+	if v, present := byName["override-true"]["propagate_target_edits"]; !present || v != true {
+		t.Errorf("override-true propagate_target_edits = %v (present=%v), want true", v, present)
+	}
+	if v, present := byName["override-false"]["propagate_target_edits"]; !present || v != false {
+		t.Errorf("override-false propagate_target_edits = %v (present=%v), want false (explicit false must NOT be dropped)",
+			v, present)
+	}
+}
+
 func TestConfigShowCmd_CanonicalizeResolvesSource(t *testing.T) {
 	path := writeConfigFixture(t, validConfigTOML)
 	stdout := &bytes.Buffer{}

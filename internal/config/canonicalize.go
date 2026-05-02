@@ -30,6 +30,15 @@ type PDir struct {
 	// Settings.Horizon. Resolved at canonicalization so downstream
 	// consumers (sync/classify/orphan) read a single, non-nil value.
 	Horizon time.Duration
+
+	// PropagateTargetEdits is the resolved effective two-way-sync gate for
+	// this pdir: the per-pair Pair.PropagateTargetEdits override if set,
+	// otherwise the fallback Settings.PropagateTargetEdits. Resolved at
+	// canonicalization so the sync layer's drift-handling gate reads a
+	// single, plain-bool value rather than chasing the *bool fallback at
+	// each call site. ANDed with SourceWritable in the sync layer; a
+	// read-only source can never propagate regardless.
+	PropagateTargetEdits bool
 }
 
 // Direction value for PDir. Pre-v2.0.0 there was also PDirBtoA for the
@@ -219,7 +228,14 @@ func expandPDirs(c Config, calendars map[string]Calendar, refToCanonical map[str
 		if p.Horizon != nil {
 			horizon = p.Horizon.Duration()
 		}
-		out = append(out, makePDir(p, sourceCal, targetCal, horizon))
+		// Resolve effective propagate-target-edits gate: per-pair override
+		// wins (including an explicit `false`), settings default is the
+		// fallback when the pair leaves it unset.
+		propagate := c.Settings.PropagateTargetEdits
+		if p.PropagateTargetEdits != nil {
+			propagate = *p.PropagateTargetEdits
+		}
+		out = append(out, makePDir(p, sourceCal, targetCal, horizon, propagate))
 	}
 	return out, nil
 }
@@ -240,15 +256,16 @@ func requireTarget(cal Calendar, pairName string) error {
 	return nil
 }
 
-func makePDir(p Pair, source, target Calendar, horizon time.Duration) PDir {
+func makePDir(p Pair, source, target Calendar, horizon time.Duration, propagate bool) PDir {
 	return PDir{
-		PairName:       p.Name,
-		Direction:      PDirAtoB,
-		SourceCalendar: source.CanonicalID,
-		TargetCalendar: target.CanonicalID,
-		SourceWritable: AccessRoleAtLeast(source.AccessRole, AccessRoleWriter),
-		TimeZone:       p.TimeZone,
-		Horizon:        horizon,
+		PairName:             p.Name,
+		Direction:            PDirAtoB,
+		SourceCalendar:       source.CanonicalID,
+		TargetCalendar:       target.CanonicalID,
+		SourceWritable:       AccessRoleAtLeast(source.AccessRole, AccessRoleWriter),
+		TimeZone:             p.TimeZone,
+		Horizon:              horizon,
+		PropagateTargetEdits: propagate,
 	}
 }
 

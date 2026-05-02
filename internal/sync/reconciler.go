@@ -62,14 +62,6 @@ type Reconciler struct {
 	// "semaphore of 5" (line 1107) is the default when this is <= 0.
 	OrphanConcurrency int
 
-	// PropagateTargetEdits gates the SPEC §"Drift detection model" propagate
-	// path. When false, drift on a writable-source pdir routes to revert
-	// instead of propagate; the source is never modified. When true,
-	// SPEC's two-way behavior is in effect. Defaults to false so a fresh
-	// install runs one-way until the operator opts in via
-	// `[settings].propagate_target_edits = true`.
-	PropagateTargetEdits bool
-
 	// In-memory state. SPEC §"In-memory state" lists these as the only
 	// pieces that survive across ticks. A cold start (daemon restart, system
 	// reboot) starts with all three empty and re-derives them via FullSync.
@@ -117,12 +109,6 @@ func WithOrphanConcurrency(n int) Option {
 // WithOutput sets the Outcome sink.
 func WithOutput(out Output) Option {
 	return func(r *Reconciler) { r.Output = out }
-}
-
-// WithPropagateTargetEdits flips the safety gate. See
-// Reconciler.PropagateTargetEdits for semantics.
-func WithPropagateTargetEdits(enabled bool) Option {
-	return func(r *Reconciler) { r.PropagateTargetEdits = enabled }
 }
 
 // WithLogger wires a structured logger that propagates into every Classifier
@@ -694,12 +680,15 @@ func (r *Reconciler) buildClassifier(
 
 	// Effective writability gates SPEC's drift-handling propagate path.
 	// pd.SourceWritable reflects the calendar's accessRole (the API
-	// permission); r.PropagateTargetEdits is the operator's safety toggle.
-	// Both must be true for drift to flow back to source. When the gate is
-	// off, drift routes to revert even on a writable source - matching the
-	// SPEC's read-only-source behavior so the operator can verify the
-	// one-way path before opting into bidirectional sync.
-	effectiveSourceWritable := pd.SourceWritable && r.PropagateTargetEdits
+	// permission); pd.PropagateTargetEdits is the operator's safety toggle
+	// (resolved at canonicalization from the per-pair override or the
+	// [settings] default). Both must be true for drift to flow back to
+	// source. When the gate is off, drift routes to revert even on a
+	// writable source - matching the SPEC's read-only-source behavior so
+	// the operator can verify the one-way path before opting into
+	// bidirectional sync. Per-pair scoping makes this independent across
+	// pdirs so a fresh install can ramp two-way one direction at a time.
+	effectiveSourceWritable := pd.SourceWritable && pd.PropagateTargetEdits
 
 	c := &Classifier{
 		API:              r.API,

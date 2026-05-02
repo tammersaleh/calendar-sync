@@ -51,6 +51,14 @@ type Pair struct {
 	// time. Pointer-typed so absence is distinguishable from an explicit
 	// zero. Same 1d..730d bounds as the settings field.
 	Horizon *Duration `toml:"horizon"`
+
+	// PropagateTargetEdits optionally overrides
+	// [settings].propagate_target_edits for this pair. nil (the unset case)
+	// means fall back to Settings.PropagateTargetEdits at canonicalization
+	// time. Pointer-typed so absence is distinguishable from an explicit
+	// `false` - the per-pair scoping rollout uses this distinction to ramp
+	// two-way sync one direction at a time without disturbing the other.
+	PropagateTargetEdits *bool `toml:"propagate_target_edits"`
 }
 
 // IsEnabled returns whether the pair should be processed. Enabled defaults

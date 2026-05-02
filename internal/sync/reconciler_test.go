@@ -1155,14 +1155,18 @@ func TestInventorySize_ReflectsInventoryEntries(t *testing.T) {
 
 // ---------- PropagateTargetEdits safety gate ----------
 
-// buildClassifier ANDs PropagateTargetEdits with pd.SourceWritable so a
+// buildClassifier ANDs pd.PropagateTargetEdits with pd.SourceWritable so a
 // freshly installed daemon never propagates mirror edits back to source.
 // These tests pin the gate at the construction layer (the four-way matrix
 // itself is tested in classify_test.go).
+//
+// Post per-pair-scoping: the gate lives on the PDir (resolved at
+// canonicalization from either the per-pair override or [settings]) rather
+// than on the Reconciler, so each pdir's gate is independent.
 func TestBuildClassifier_GateOff_NeutralizesSourceWritable(t *testing.T) {
 	r := New(nil, &config.Canonical{})
-	r.PropagateTargetEdits = false
 	pd := makeTestPDir("p1", "src-A", "tgt-A", true) // writable per accessRole
+	pd.PropagateTargetEdits = false
 	c, _ := r.buildClassifier(pd, NewInventory("tgt-A"), &Counts{})
 	if c.SourceWritable {
 		t.Error("Classifier.SourceWritable must be false when gate is off, even with a writable source")
@@ -1174,8 +1178,8 @@ func TestBuildClassifier_GateOff_NeutralizesSourceWritable(t *testing.T) {
 
 func TestBuildClassifier_GateOn_PassesThroughSourceWritable(t *testing.T) {
 	r := New(nil, &config.Canonical{})
-	r.PropagateTargetEdits = true
 	pd := makeTestPDir("p1", "src-A", "tgt-A", true)
+	pd.PropagateTargetEdits = true
 	c, _ := r.buildClassifier(pd, NewInventory("tgt-A"), &Counts{})
 	if !c.SourceWritable {
 		t.Error("Classifier.SourceWritable must be true when gate is on AND source is writable")
@@ -1190,18 +1194,40 @@ func TestBuildClassifier_GateOn_ReadOnlySourceStaysReadOnly(t *testing.T) {
 	// writer can never be written to. The gate is a SUBSET, not an
 	// override.
 	r := New(nil, &config.Canonical{})
-	r.PropagateTargetEdits = true
 	pd := makeTestPDir("p1", "src-A", "tgt-A", false)
+	pd.PropagateTargetEdits = true
 	c, _ := r.buildClassifier(pd, NewInventory("tgt-A"), &Counts{})
 	if c.SourceWritable {
 		t.Error("read-only source must stay read-only regardless of the gate")
 	}
 }
 
-func TestWithPropagateTargetEdits_OptionApplies(t *testing.T) {
-	r := New(nil, &config.Canonical{}, WithPropagateTargetEdits(true))
-	if !r.PropagateTargetEdits {
-		t.Error("WithPropagateTargetEdits(true) did not apply")
+// TestBuildClassifier_PerPDirGate pins per-pdir gate independence: with two
+// PDirs sharing a Reconciler but carrying different PropagateTargetEdits
+// values, each gets its own effective writability. This is the load-bearing
+// invariant that makes the "ramp two-way one direction at a time" workflow
+// work.
+func TestBuildClassifier_PerPDirGate(t *testing.T) {
+	r := New(nil, &config.Canonical{})
+	pdOn := makeTestPDir("p-on", "src-A", "tgt-A", true)
+	pdOn.PropagateTargetEdits = true
+	pdOff := makeTestPDir("p-off", "src-B", "tgt-B", true)
+	pdOff.PropagateTargetEdits = false
+
+	cOn, _ := r.buildClassifier(pdOn, NewInventory("tgt-A"), &Counts{})
+	if !cOn.SourceWritable {
+		t.Error("p-on Classifier.SourceWritable must be true (gate=on, accessRole=writable)")
+	}
+	if !cOn.Recurring.SourceWritable {
+		t.Error("p-on recurring.Handler.SourceWritable must be true")
+	}
+
+	cOff, _ := r.buildClassifier(pdOff, NewInventory("tgt-B"), &Counts{})
+	if cOff.SourceWritable {
+		t.Error("p-off Classifier.SourceWritable must be false (gate=off neutralizes writable source)")
+	}
+	if cOff.Recurring.SourceWritable {
+		t.Error("p-off recurring.Handler.SourceWritable must be false")
 	}
 }
 

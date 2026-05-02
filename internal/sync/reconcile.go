@@ -17,17 +17,44 @@ func (c *Classifier) reconcileNormal(ctx context.Context, source *gws.Event) err
 	tuple := mirror.SourceTuple{CalendarID: c.SourceCalendarID, EventID: source.ID}
 	mirrorEvent, ok := c.Inventory.Lookup(tuple)
 	if !ok {
+		c.debug("sync.reconcileNormal: inventory miss -> insert",
+			"source_calendar", c.SourceCalendarID,
+			"source_event", source.ID,
+			"summary", source.Summary,
+		)
 		return c.doInsert(ctx, source)
 	}
 
 	signal := mirror.ComputeDriftSignal(source, mirrorEvent)
 	desired := mirror.BuildPayload(c.SourceCalendarID, source)
 
+	c.debug("sync.reconcileNormal: inventory hit",
+		"source_calendar", c.SourceCalendarID,
+		"source_event", source.ID,
+		"mirror_event", mirrorEvent.ID,
+		"source_changed", signal.SourceChanged,
+		"mirror_drifted", signal.MirrorDrifted,
+		"needs_migration", signal.NeedsMigration,
+		"summary", source.Summary,
+	)
+
 	if signal.NeedsMigration {
+		c.debug("sync.reconcileNormal: routing to reconcileMigration",
+			"source_event", source.ID,
+			"mirror_event", mirrorEvent.ID,
+			"source_changed", signal.SourceChanged,
+			"mirror_drifted", signal.MirrorDrifted,
+		)
 		return c.reconcileMigration(ctx, source, mirrorEvent, desired, signal)
 	}
 
 	outcome := mirror.Classify(signal, c.SourceWritable, source.Updated, mirrorEvent.Updated)
+	c.debug("sync.reconcileNormal: action chosen",
+		"source_event", source.ID,
+		"action", string(outcome.Action),
+		"reason", string(outcome.Reason),
+		"conflict", string(outcome.Conflict),
+	)
 	switch outcome.Action {
 	case mirror.ActionSkip:
 		c.emit(Outcome{

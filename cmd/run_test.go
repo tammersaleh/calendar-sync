@@ -243,6 +243,53 @@ func TestDryRunAPI_EventsInsertSuppressesWrite(t *testing.T) {
 	}
 }
 
+// TestDryRunAPI_PatchReturnsBodyWithoutOriginalExtProps documents the
+// dry-run wrapper's body-echo behavior that drives Anomaly #1 in
+// doc/dry-run-anomaly-analysis.md.
+//
+// The follow-up checksum patch sends body={extendedProperties.private:
+// {checksum: ...}} only. The dry-run wrapper returns this body as the
+// post-write resource, so the caller (sync.completeInsert) caches an
+// "inserted" mirror in inventory whose extended properties contain ONLY
+// the checksum - no calendar-sync:version, no calendar-sync:source. On the
+// NEXT Classify pass for the same source event, ComputeDriftSignal sees
+// a missing version and reports NeedsMigration=true even though the mirror
+// was just minted with version=2 in the same dry-run pass.
+//
+// This test pins the wire shape so a future fix to dryRunAPI.EventsPatch
+// (e.g. merging body into a remembered prior snapshot) breaks an explicit
+// assertion rather than silently changing behavior.
+func TestDryRunAPI_PatchReturnsBodyOnlyAndDropsOriginalExtProps(t *testing.T) {
+	api := newDryRunAPI(&stubGws{})
+	body := &gws.Event{
+		ExtendedProperties: &gws.ExtendedProperties{
+			Private: map[string]string{"calendar-sync:checksum": "abc123"},
+		},
+	}
+	got, err := api.EventsPatch(context.Background(), "cal", "evt", body)
+	if err != nil {
+		t.Fatalf("EventsPatch: %v", err)
+	}
+	if got.ID != "evt" {
+		t.Errorf("ID = %q, want evt", got.ID)
+	}
+	// The returned body has ONLY {checksum}. There is no calendar-sync:source
+	// or calendar-sync:version - because the wrapper has no memory of the
+	// prior insert. Downstream `mirror.ComputeDriftSignal` will read these
+	// missing keys and return NeedsMigration=true.
+	if got.ExtendedProperties == nil || got.ExtendedProperties.Private == nil {
+		t.Fatalf("ExtendedProperties/Private nil; got %+v", got)
+	}
+	if _, has := got.ExtendedProperties.Private["calendar-sync:version"]; has {
+		t.Errorf("post-checksum-patch body must NOT carry calendar-sync:version - "+
+			"the wrapper echoes body verbatim. got=%+v", got.ExtendedProperties.Private)
+	}
+	if _, has := got.ExtendedProperties.Private["calendar-sync:source"]; has {
+		t.Errorf("post-checksum-patch body must NOT carry calendar-sync:source. "+
+			"got=%+v", got.ExtendedProperties.Private)
+	}
+}
+
 // countingGws extends stubGws with insert counter so the dryRunAPI test
 // can assert no underlying write occurred.
 type countingGws struct {
@@ -253,4 +300,81 @@ type countingGws struct {
 func (c *countingGws) EventsInsert(ctx context.Context, cal string, body *gws.Event) (*gws.Event, error) {
 	*c.insertCount++
 	return c.stubGws.EventsInsert(ctx, cal, body)
+}
+
+// TestRunCmd_DryRun_DuplicateSourceEventTriggersBogusMigrationSourceWon is
+// the end-to-end reproduction of doc/dry-run-anomaly-analysis.md anomaly
+// #1. The user's dry-run output had 14 patches with conflict=
+// migration_source_won despite zero v1/v2 mirrors existing on the target.
+// This test wires the same code path with two copies of the same source
+// event (a stand-in for whatever caused the actual duplication on Tammer's
+// calendar - phantom recurring exception, paginated overlap, etc.) and
+// asserts the bogus outcome is reproducible.
+//
+// Expected to FAIL on a future fix that either:
+//   - rejects duplicate source-tuples in the source list (sync layer), or
+//   - has dryRunAPI.EventsPatch echo a snapshot rather than only the patch
+//     body (so the cached mirror retains version=2).
+//
+// When that fix lands, change t.Errorf to t.Logf and update the comment.
+func TestRunCmd_DryRun_DuplicateSourceEventTriggersBogusMigrationSourceWon(t *testing.T) {
+	tmp := shortTempDir(t)
+	t.Setenv("TMPDIR", tmp)
+	path := writeConfigFixture(t, validConfigTOML)
+
+	// Two identical copies of the same source event in the source list.
+	// In the user's actual dry-run output the duplication appeared as
+	// "_R<timestamp>" recurring-exception IDs being returned twice; the
+	// shape that drives the bug is duplication, not recurring-ness.
+	dupEvent := gws.Event{
+		ID:           "evt-1",
+		Status:       gws.EventStatusConfirmed,
+		Summary:      "SA Office Hours",
+		Updated:      "2026-04-29T20:00:00Z",
+		Transparency: gws.TransparencyOpaque,
+		Start:        &gws.EventDateTime{DateTime: "2026-05-01T16:00:00Z"},
+		End:          &gws.EventDateTime{DateTime: "2026-05-01T17:00:00Z"},
+	}
+	stub := &dupSourceListGws{events: []gws.Event{dupEvent, dupEvent}}
+
+	stdout := &bytes.Buffer{}
+	rt := &Runtime{
+		Stdout:  stdout,
+		Stderr:  &bytes.Buffer{},
+		Globals: Globals{Config: path},
+		Ctx:     context.Background(),
+		Gws:     stub,
+	}
+	if err := (&RunCmd{DryRun: true}).Run(rt); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// First pass should be insert(source_updated), second should be
+	// patch(source_updated) with conflict=migration_source_won. That second
+	// outcome is the bug: the mirror was JUST minted with version=2 in the
+	// same dry-run pass.
+	out := stdout.String()
+	if !strings.Contains(out, `"action":"insert"`) {
+		t.Errorf("expected first pass to insert; stdout:\n%s", out)
+	}
+	if !strings.Contains(out, `"conflict":"migration_source_won"`) {
+		t.Errorf("expected second pass to emit migration_source_won; stdout:\n%s", out)
+	}
+}
+
+// dupSourceListGws extends stubGws with a fixed source-list response. The
+// inventory rebuild calls return empty (no mirrors exist on the target),
+// which mirrors the production scenario we observed.
+type dupSourceListGws struct {
+	stubGws
+	events []gws.Event
+}
+
+func (d *dupSourceListGws) EventsList(_ context.Context, params gws.EventsListParams) ([]gws.Event, string, error) {
+	if len(params.PrivateExtendedProperty) > 0 {
+		// Inventory rebuild: empty (no v1 or v2 mirrors).
+		return nil, "", nil
+	}
+	// Source-list call: return the duplicated events.
+	return d.events, "next-token", nil
 }

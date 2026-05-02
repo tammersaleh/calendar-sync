@@ -63,6 +63,12 @@ type Runtime struct {
 	// Production-mode gws.New(...) is constructed lazily inside the
 	// subcommand methods that need it; tests assign Gws to override.
 	Gws GwsClient
+
+	// Logger is the structured-log sink wired from --log-level / --log-format
+	// (or the matching settings.toml values). nil is valid: every log call
+	// short-circuits before formatting. Subcommand Run methods read this
+	// when they want to emit per-step diagnostics.
+	Logger *output.Logger
 }
 
 // Run is the package's main entry point. main.go calls Run with
@@ -99,6 +105,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		Stderr:  stderr,
 		Globals: cli.Globals,
 		Ctx:     signalContext(),
+		Logger:  output.NewLogger(stderr, cli.Globals.LogFormat, cli.Globals.LogLevel),
 	}
 	if cli.Globals.Quiet {
 		rt.Stdout = nil

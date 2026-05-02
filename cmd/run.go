@@ -82,14 +82,18 @@ func (c *RunCmd) run(rt *Runtime, canonical *config.Canonical, count *int) error
 	}
 
 	p := rt.printer()
-	rec := syncpkg.New(api, scopedCanonical,
+	opts := []syncpkg.Option{
 		syncpkg.WithHorizon(canonical.Settings.Horizon.Duration()),
 		syncpkg.WithPropagateTargetEdits(canonical.Settings.PropagateTargetEdits),
 		syncpkg.WithOutput(func(o syncpkg.Outcome) {
 			p.Emit(outcomeRow{Outcome: o})
 			*count++
 		}),
-	)
+	}
+	if rt.Logger != nil {
+		opts = append(opts, syncpkg.WithLogger(rt.Logger))
+	}
+	rec := syncpkg.New(api, scopedCanonical, opts...)
 
 	res, err := rec.FullSync(ctx)
 	if err != nil {
@@ -102,6 +106,7 @@ func (c *RunCmd) run(rt *Runtime, canonical *config.Canonical, count *int) error
 	// (the same identifier shape SPEC uses for pdirs throughout).
 	var failures []string
 	var firstErr error
+	log := rt.Logger
 	for _, pr := range res.PDirs {
 		if pr.Err == nil {
 			continue
@@ -109,6 +114,21 @@ func (c *RunCmd) run(rt *Runtime, canonical *config.Canonical, count *int) error
 		failures = append(failures, pr.Pair+":"+pr.Direction)
 		if firstErr == nil {
 			firstErr = pr.Err
+		}
+		// SPEC line 1295: a pdir failure must surface the underlying error
+		// somewhere visible. The stderr partial_failure envelope only carries
+		// a list of pdir names; the actual cause lives in stderr's warn-level
+		// log so an operator running with --log-level=warn or above can
+		// always see why a pdir failed without re-running with debug.
+		if log != nil {
+			log.Warn("cmd.run: pdir failed",
+				"pair", pr.Pair,
+				"direction", pr.Direction,
+				"source", pr.Source,
+				"target", pr.Target,
+				"events_processed", pr.Counts.EventsProcessed,
+				"error", pr.Err.Error(),
+			)
 		}
 	}
 

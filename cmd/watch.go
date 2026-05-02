@@ -31,10 +31,14 @@ func (c *WatchCmd) Run(rt *Runtime) error {
 	}
 
 	api := rt.gwsClient()
-	reconciler := syncpkg.New(api, canonical,
+	opts := []syncpkg.Option{
 		syncpkg.WithHorizon(canonical.Settings.Horizon.Duration()),
 		syncpkg.WithPropagateTargetEdits(canonical.Settings.PropagateTargetEdits),
-	)
+	}
+	if rt.Logger != nil {
+		opts = append(opts, syncpkg.WithLogger(rt.Logger))
+	}
+	reconciler := syncpkg.New(api, canonical, opts...)
 
 	d := &daemon.Daemon{
 		Reconciler:  reconciler,

@@ -33,7 +33,7 @@ func TestBuildInventory_V2Only(t *testing.T) {
 	api.queueList([]gws.Event{*m1, *m2}, "")
 	api.queueList(nil, "") // no v1 mirrors
 
-	inv, err := BuildInventory(context.Background(), api, "tgt-cal")
+	inv, err := BuildInventory(context.Background(), api, "tgt-cal", nil)
 	if err != nil {
 		t.Fatalf("BuildInventory error: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestBuildInventory_V1Only(t *testing.T) {
 	v1 := makeMirrorWithSource("v1mirror", "src-cal:src-evt-X", "1")
 	api.queueList([]gws.Event{*v1}, "")
 
-	inv, err := BuildInventory(context.Background(), api, "tgt-cal")
+	inv, err := BuildInventory(context.Background(), api, "tgt-cal", nil)
 	if err != nil {
 		t.Fatalf("BuildInventory error: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestBuildInventory_MixedV2andV1(t *testing.T) {
 	v1 := makeMirrorWithSource("m1", "src-cal:evtB", "1")
 	api.queueList([]gws.Event{*v1}, "")
 
-	inv, err := BuildInventory(context.Background(), api, "tgt-cal")
+	inv, err := BuildInventory(context.Background(), api, "tgt-cal", nil)
 	if err != nil {
 		t.Fatalf("BuildInventory error: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestBuildInventory_ListErrorPropagates(t *testing.T) {
 	api := newStubAPI()
 	api.queueListErr(errors.New("calendar API kaboom"))
 
-	_, err := BuildInventory(context.Background(), api, "tgt-cal")
+	_, err := BuildInventory(context.Background(), api, "tgt-cal", nil)
 	if err == nil {
 		t.Fatal("expected error from EventsList failure")
 	}
@@ -125,7 +125,7 @@ func TestBuildInventory_SkipsMirrorsMissingSourceTuple(t *testing.T) {
 	api.queueList([]gws.Event{*missing, *emptySource, *malformed, *good}, "")
 	api.queueList(nil, "")
 
-	inv, err := BuildInventory(context.Background(), api, "tgt-cal")
+	inv, err := BuildInventory(context.Background(), api, "tgt-cal", nil)
 	if err != nil {
 		t.Fatalf("BuildInventory error: %v", err)
 	}

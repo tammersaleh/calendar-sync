@@ -27,6 +27,20 @@ var sourceListEventTypes = []string{
 	gws.EventTypeFocusTime,
 }
 
+// Logger is the slog-style interface the sync layer consumes for structured
+// per-step diagnostics. Re-declared here (rather than imported from
+// internal/output) to keep the dependency direction one-way: output → sync,
+// not sync → output. Production code passes *output.Logger which satisfies
+// this interface naturally.
+//
+// A nil Logger is valid: every log call short-circuits before formatting.
+type Logger interface {
+	Debug(msg string, args ...any)
+	Info(msg string, args ...any)
+	Warn(msg string, args ...any)
+	Error(msg string, args ...any)
+}
+
 // Reconciler is the public-facing orchestrator for layer 6. It owns the
 // in-memory per-source syncTokens and per-target inventories that survive
 // across ticks per SPEC.md §"In-memory state". The daemon (layer 7)
@@ -43,6 +57,7 @@ type Reconciler struct {
 	Horizon   time.Duration
 	Canonical *config.Canonical
 	Output    Output
+	Log       Logger
 
 	// OrphanConcurrency caps the orphan walk's events.get fan-out. SPEC's
 	// "semaphore of 5" (line 1107) is the default when this is <= 0.
@@ -62,6 +77,25 @@ type Reconciler struct {
 	syncTokens   map[string]string     // canonical source -> latest token
 	inventories  map[string]*Inventory // canonical target -> live inventory
 	lastFullSync map[string]time.Time  // canonical source -> last full-sync ts
+}
+
+// debug is a nil-safe wrapper around r.Log.Debug. Centralizing the nil
+// check keeps the per-method log call sites uniform.
+func (r *Reconciler) debug(msg string, args ...any) {
+	if r.Log != nil {
+		r.Log.Debug(msg, args...)
+	}
+}
+
+// warn is a nil-safe wrapper around r.Log.Warn. Used by the per-pdir
+// classify loop to surface per-event errors without dropping them on the
+// floor (the SPEC's partial_failure path only carries pdir names; the
+// underlying error needs its own log line so an operator running with
+// --log-level=warn still gets the context).
+func (r *Reconciler) warn(msg string, args ...any) {
+	if r.Log != nil {
+		r.Log.Warn(msg, args...)
+	}
 }
 
 // Option mutates a Reconciler at construction time. Reserved for daemon-
@@ -95,6 +129,12 @@ func WithOutput(out Output) Option {
 // Reconciler.PropagateTargetEdits for semantics.
 func WithPropagateTargetEdits(enabled bool) Option {
 	return func(r *Reconciler) { r.PropagateTargetEdits = enabled }
+}
+
+// WithLogger wires a structured logger that propagates into every Classifier
+// and recurring.Handler the reconciler builds. Nil silences logging.
+func WithLogger(l Logger) Option {
+	return func(r *Reconciler) { r.Log = l }
 }
 
 // New constructs a Reconciler with empty in-memory state. Required fields
@@ -477,7 +517,7 @@ func (r *Reconciler) rebuildInventories(ctx context.Context) map[string]error {
 	fresh := map[string]*Inventory{}
 
 	for _, target := range r.uniqueTargets() {
-		inv, err := BuildInventory(ctx, r.API, target)
+		inv, err := BuildInventory(ctx, r.API, target, r.Log)
 		if err != nil {
 			errs[target] = err
 			continue
@@ -647,6 +687,7 @@ func (r *Reconciler) buildClassifier(
 		SourceWritable:   effectiveSourceWritable,
 		Inventory:        inv,
 		Output:           wrapped,
+		Log:              r.Log,
 	}
 
 	// Wire the recurring.Handler. The closures capture the Classifier so
@@ -659,6 +700,7 @@ func (r *Reconciler) buildClassifier(
 		SourceCalendarID: pd.SourceCalendar,
 		TargetCalendarID: pd.TargetCalendar,
 		SourceWritable:   effectiveSourceWritable,
+		Log:              r.Log,
 		LookupMirrorParent: func(s mirror.SourceTuple) (*gws.Event, bool) {
 			return inv.Lookup(s)
 		},
@@ -692,6 +734,13 @@ func (r *Reconciler) runClassifyLoop(
 	events []gws.Event,
 	visited map[mirror.SourceTuple]bool,
 ) error {
+	r.debug("sync.runClassifyLoop start",
+		"pair", c.Pair,
+		"direction", c.Direction,
+		"source_calendar", c.SourceCalendarID,
+		"target_calendar", c.TargetCalendarID,
+		"events", len(events),
+	)
 	var errs []error
 	for i := range events {
 		ev := events[i]
@@ -706,7 +755,25 @@ func (r *Reconciler) runClassifyLoop(
 			}] = true
 		}
 
+		r.debug("sync.runClassifyLoop event",
+			"pair", c.Pair,
+			"direction", c.Direction,
+			"source_event", ev.ID,
+			"recurring_event_id", ev.RecurringEventID,
+			"summary", ev.Summary,
+			"status", ev.Status,
+			"transparency", ev.Transparency,
+		)
+
 		if err := c.Classify(ctx, &ev); err != nil {
+			r.warn("sync.runClassifyLoop: classify error",
+				"pair", c.Pair,
+				"direction", c.Direction,
+				"source_event", ev.ID,
+				"recurring_event_id", ev.RecurringEventID,
+				"summary", ev.Summary,
+				"error", err.Error(),
+			)
 			errs = append(errs, fmt.Errorf("classify %s/%s: %w",
 				c.SourceCalendarID, ev.ID, err))
 		}

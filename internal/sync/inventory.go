@@ -109,7 +109,12 @@ func (i *Inventory) Tuples() []mirror.SourceTuple {
 // skipped with their tuple effectively dropped on the floor; SPEC.md
 // considers those mirrors unmanageable. The orphan walk catches them
 // indirectly when the user triggers `mirror prune`.
-func BuildInventory(ctx context.Context, api API, target string) (*Inventory, error) {
+//
+// log may be nil; when non-nil it receives one info-level entry per version
+// pass (after the events.list call returns) carrying target + count, so the
+// daemon log surfaces the pre-reconcile inventory baseline that the rest of
+// the pass operates against.
+func BuildInventory(ctx context.Context, api API, target string, log Logger) (*Inventory, error) {
 	inv := NewInventory(target)
 
 	// Two passes: v2 first, then v1. The order is for SPEC documentation
@@ -124,14 +129,32 @@ func BuildInventory(ctx context.Context, api API, target string) (*Inventory, er
 		if err != nil {
 			return nil, fmt.Errorf("inventory rebuild for %s (version=%s): %w", target, version, err)
 		}
+		var added, skipped int
 		for i := range events {
 			ev := events[i]
 			tuple, ok := parseSourceFromMirror(&ev)
 			if !ok {
+				skipped++
 				continue
 			}
 			inv.Set(tuple, &ev)
+			added++
 		}
+		if log != nil {
+			log.Info("sync.BuildInventory pass",
+				"target", target,
+				"schema_version", version,
+				"events_returned", len(events),
+				"added", added,
+				"unparseable_skipped", skipped,
+			)
+		}
+	}
+	if log != nil {
+		log.Info("sync.BuildInventory complete",
+			"target", target,
+			"total_mirrors", len(inv.Tuples()),
+		)
 	}
 	return inv, nil
 }

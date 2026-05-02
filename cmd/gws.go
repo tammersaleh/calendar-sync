@@ -23,9 +23,16 @@ type GwsClient interface {
 // gwsClient returns the runtime's injected GwsClient (tests) or a fresh
 // production *gws.Client. Lazy construction so tests that stub the runtime
 // never accidentally hit the real binary.
+//
+// Production callers get a Client with the runtime's logger pre-wired, so
+// every gws subprocess invocation emits a debug log line that callers can
+// see by running with --log-level=debug.
 func (rt *Runtime) gwsClient() GwsClient {
 	if rt.Gws != nil {
 		return rt.Gws
+	}
+	if rt.Logger != nil {
+		return gws.New(gws.WithLogger(rt.Logger))
 	}
 	return gws.New()
 }

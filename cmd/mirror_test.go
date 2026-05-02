@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/tammersaleh/calendar-sync/internal/gws"
 	"github.com/tammersaleh/calendar-sync/internal/mirror"
@@ -168,4 +170,81 @@ func TestMirrorPruneCmd_DryRunDoesNotCallDelete(t *testing.T) {
 	if !strings.Contains(stdout.String(), "would_delete") {
 		t.Errorf("expected would_delete action in output, got %q", stdout.String())
 	}
+}
+
+// TestMirrorPruneCmd_PruneHorizonFiltersByStart pins the --prune-horizon
+// behavior used for the user's phased mirror-cleanup workflow. With
+// --prune-horizon=24h, only mirrors whose start falls in [now, now+24h]
+// are deleted; past events, future-out-of-window events, and events
+// without a parseable start are skipped.
+//
+// Boundaries are inclusive on both ends so a phased rollout that bumps
+// the horizon by exactly the previous horizon's value (1d, 2d, 3d...)
+// always covers the seam.
+func TestMirrorPruneCmd_PruneHorizonFiltersByStart(t *testing.T) {
+	path := writeConfigFixture(t, validConfigTOML)
+
+	fixedNow, err := time.Parse(time.RFC3339, "2026-05-01T12:00:00Z")
+	if err != nil {
+		t.Fatalf("parse fixedNow: %v", err)
+	}
+
+	withStart := func(id, dt string) gws.Event {
+		ev := makeMirrorEvent(id, "work@example.com", "src-"+id, id)
+		ev.Start = &gws.EventDateTime{DateTime: dt}
+		return ev
+	}
+	noStart := makeMirrorEvent("nostart", "work@example.com", "src-nostart", "nostart")
+
+	gwsClient := &inventoryGws{
+		v2events: []gws.Event{
+			withStart("past", "2026-04-30T12:00:00Z"),       // -24h - excluded
+			withStart("at-now", "2026-05-01T12:00:00Z"),     // exactly now - included (lower edge)
+			withStart("in-window", "2026-05-01T18:00:00Z"),  // +6h - included
+			withStart("at-end", "2026-05-02T12:00:00Z"),     // exactly now+24h - included (upper edge)
+			withStart("just-past", "2026-05-02T12:00:01Z"),  // +24h+1s - excluded
+			withStart("future", "2026-05-03T12:00:00Z"),     // +48h - excluded
+			noStart,                                          // no start - excluded
+		},
+	}
+	stdout := &bytes.Buffer{}
+	rt := &Runtime{
+		Stdout:  stdout,
+		Stderr:  &bytes.Buffer{},
+		Globals: Globals{Config: path},
+		Ctx:     context.Background(),
+		Gws:     gwsClient,
+	}
+	cmd := &MirrorPruneCmd{
+		Calendar:     "personal@example.com",
+		All:          true,
+		PruneHorizon: 24 * time.Hour,
+		Yes:          true,
+		now:          func() time.Time { return fixedNow },
+	}
+	if err := cmd.Run(rt); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	got := make([]string, 0, len(gwsClient.deletes))
+	for _, d := range gwsClient.deletes {
+		got = append(got, d.eventID)
+	}
+	sort.Strings(got)
+	want := []string{"at-end", "at-now", "in-window"}
+	if !equalStringSlices(got, want) {
+		t.Errorf("deleted = %v, want %v", got, want)
+	}
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

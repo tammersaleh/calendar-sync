@@ -226,6 +226,12 @@ The partial_failure path wraps the first PDir error as the cmdError's cause fiel
 
 Reading the field directly is required, not stylistic. `Reconciler.runClassifyLoop` aggregates per-event classify errors via `errors.Join`, and `errors.Unwrap` returns nil on the resulting joinError (it implements `Unwrap() []error`, not `Unwrap() error`). A single-step `errors.Unwrap(cmdErr)` would therefore drop the cause whenever the pdir failed with multiple events - which is the production partial_failure shape.
 
+### `[settings].dry_run` is OR'd with `--dry-run`, not overridden by it
+
+`run` and `watch` compute effective dry-run as `c.DryRun || canonical.Settings.DryRun`. If config.toml has `dry_run = true`, the CLI cannot turn it off - `--dry-run=false` (kong's negative boolean form) goes from `false || true = true` and writes are still suppressed. This is intentional: a user who set the config flag did so deliberately, and a typo'd CLI invocation shouldn't override the safer setting. The escape hatch is editing config.toml.
+
+`mirror prune` is intentionally NOT gated by `[settings].dry_run`. It has its own `--dry-run` flag and SPEC scopes the settings field to the sync loop (run/watch). Pruning is a manual surgical operation; if you ran `mirror prune` without `--dry-run`, you meant it.
+
 ## Sandbox
 
 `mise run` commands work fine in sandboxed processes. Network access required during `go mod tidy` (first run) and during `go test` for any test that pulls a module.

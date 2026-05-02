@@ -57,7 +57,7 @@ func (c *PairListCmd) Run(rt *Runtime) error {
 // example: `calendar-sync pair test work-personal`.
 type PairTestCmd struct {
 	Name      string `arg:"" name:"name" help:"Pair name to test."`
-	Direction string `name:"direction" placeholder:"<dir>" help:"Limit to one direction. One of a_to_b, b_to_a."`
+	Direction string `name:"direction" placeholder:"<dir>" help:"Limit to one direction. Only a_to_b is currently meaningful."`
 }
 
 // Run validates the pair exists, canonicalizes it, then delegates to the

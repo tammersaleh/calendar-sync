@@ -8,6 +8,7 @@ import (
 	"net"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -281,6 +282,14 @@ target    = "work@example.com"
 	}
 	if len(meta.Meta.Failures) != 2 {
 		t.Fatalf("failures = %v, want exactly 2 entries (both pdirs failed)", meta.Meta.Failures)
+	}
+	// Pin the specific identifiers, not just the count: both pdirs must
+	// surface in the failures list, in the SPEC `<pair>:<direction>`
+	// shape. Order is unspecified; use slices.Contains.
+	for _, want := range []string{"work-personal:a_to_b", "personal-work:a_to_b"} {
+		if !slices.Contains(meta.Meta.Failures, want) {
+			t.Errorf("failures missing %q; got %v", want, meta.Meta.Failures)
+		}
 	}
 }
 

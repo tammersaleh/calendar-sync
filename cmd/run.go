@@ -24,7 +24,7 @@ const runDialTimeout = 200 * time.Millisecond
 // to start if the daemon is already running on the IPC socket.
 type RunCmd struct {
 	Pair      []string      `name:"pair" placeholder:"<name>" help:"Reconcile only the named pair. May be repeated. Default: all enabled pairs."`
-	Direction string        `name:"direction" placeholder:"<dir>" help:"Limit to one direction within each pair. One of a_to_b, b_to_a."`
+	Direction string        `name:"direction" placeholder:"<dir>" help:"Limit to one direction within each pair. Only a_to_b is currently meaningful."`
 	DryRun    bool          `name:"dry-run" help:"Plan and print actions but make no API writes. Reads still happen."`
 	Timeout   time.Duration `name:"timeout" placeholder:"<dur>" default:"5m" help:"Wall-clock cap for the entire command. Default: 5m."`
 }

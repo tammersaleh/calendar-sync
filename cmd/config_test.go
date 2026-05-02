@@ -117,6 +117,49 @@ func TestConfigShowCmd_EmitsResolvedSettings(t *testing.T) {
 	}
 }
 
+// TestConfigShowCmd_DoesNotEmitDirectionField pins the v2.0.0 wire-format
+// change: the `direction` field was removed from the per-pair JSON output.
+// Decoding into map[string]any (rather than the typed pairPayload) catches
+// regressions where someone re-adds the field to the struct - struct-typed
+// unmarshal would silently ignore an unexpected key.
+func TestConfigShowCmd_DoesNotEmitDirectionField(t *testing.T) {
+	path := writeConfigFixture(t, validConfigTOML)
+	stdout := &bytes.Buffer{}
+	rt := &Runtime{
+		Stdout:  stdout,
+		Stderr:  &bytes.Buffer{},
+		Globals: Globals{Config: path},
+		Ctx:     context.Background(),
+		Gws:     &stubGws{},
+	}
+	if err := (&ConfigShowCmd{}).Run(rt); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	first := strings.SplitN(stdout.String(), "\n", 2)[0]
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(first), &raw); err != nil {
+		t.Fatalf("unmarshal: %v\nstdout=%s", err, stdout.String())
+	}
+	pairs, ok := raw["pairs"].([]any)
+	if !ok {
+		t.Fatalf("pairs not a JSON array; raw=%+v", raw)
+	}
+	if len(pairs) == 0 {
+		t.Fatalf("pairs is empty; want at least one entry")
+	}
+	for i, p := range pairs {
+		entry, ok := p.(map[string]any)
+		if !ok {
+			t.Fatalf("pairs[%d] not a JSON object; got %T", i, p)
+		}
+		if _, present := entry["direction"]; present {
+			t.Errorf("pairs[%d] contains `direction` key; v2.0.0 removed the field. entry=%+v",
+				i, entry)
+		}
+	}
+}
+
 func TestConfigShowCmd_CanonicalizeResolvesSource(t *testing.T) {
 	path := writeConfigFixture(t, validConfigTOML)
 	stdout := &bytes.Buffer{}

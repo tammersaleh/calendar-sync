@@ -136,7 +136,14 @@ func classifyError(stdout, stderr []byte, exitCode int, op string) error {
 		}
 	}
 
-	apiErr, ok := parseAPIError(stderr)
+	// gws emits the Calendar API error envelope on STDOUT (not stderr).
+	// Stderr gets the human-readable summary plus keyring noise. Try
+	// stdout first, then stderr (the historical/test path), and fall
+	// back to api_invalid_request if neither parses.
+	apiErr, ok := parseAPIError(stdout)
+	if !ok {
+		apiErr, ok = parseAPIError(stderr)
+	}
 	if !ok {
 		return &Error{
 			Code:     CodeAPIInvalidRequest,

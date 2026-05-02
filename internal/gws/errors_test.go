@@ -189,6 +189,58 @@ func TestClassifyError_UnparseableStderrFallsBackToInvalidRequest(t *testing.T) 
 	}
 }
 
+// TestClassifyError_ParsesAPIErrorFromStdout pins B13: gws emits the
+// Calendar API error envelope on STDOUT (not stderr), with stderr getting
+// only the human-readable summary like "Using keyring backend: keyring\n
+// error[api]: <message>\n". Pre-fix, classifyError parsed stderr and
+// found no JSON, falling through to api_invalid_request - which masked
+// every 409/410/etc. The masked 409s broke SPEC's cancelled-and-revived
+// flow (it triggers on errors.Is(err, ErrAPIConflict)).
+//
+// Verify: feed both streams as gws would emit them, and check the
+// resulting error is the right HTTP-status-derived sentinel.
+func TestClassifyError_ParsesAPIErrorFromStdout(t *testing.T) {
+	tests := []struct {
+		name         string
+		stdout       string
+		stderr       string
+		wantSentinel *Error
+	}{
+		{
+			name:         "409 duplicate from events.insert (cancelled-and-revived trigger)",
+			stdout:       `{"error":{"code":409,"message":"The requested identifier already exists.","reason":"duplicate"}}`,
+			stderr:       "Using keyring backend: keyring\nerror[api]: The requested identifier already exists.\n",
+			wantSentinel: ErrAPIConflict,
+		},
+		{
+			name:         "400 Resource has been deleted from events.delete on tombstone",
+			stdout:       `{"error":{"code":400,"message":"Resource has been deleted","reason":"deleted"}}`,
+			stderr:       "Using keyring backend: keyring\nerror[api]: Resource has been deleted\n",
+			wantSentinel: ErrAPIInvalidRequest,
+		},
+		{
+			name:         "410 syncToken expiry",
+			stdout:       `{"error":{"code":410,"message":"Sync token is no longer valid","errors":[{"reason":"fullSyncRequired"}]}}`,
+			stderr:       "Using keyring backend: keyring\nerror[api]: Sync token is no longer valid\n",
+			wantSentinel: ErrAPIGone,
+		},
+		{
+			name:         "404 not found",
+			stdout:       `{"error":{"code":404,"message":"Not Found"}}`,
+			stderr:       "Using keyring backend: keyring\nerror[api]: Not Found\n",
+			wantSentinel: ErrAPINotFound,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := classifyError([]byte(tc.stdout), []byte(tc.stderr), 1, "events.insert")
+			if !errors.Is(err, tc.wantSentinel) {
+				t.Errorf("errors.Is(err, %s) = false; got err=%v", tc.wantSentinel.Code, err)
+			}
+		})
+	}
+}
+
 func TestClassifyError_PreservesHTTPStatusAndReason(t *testing.T) {
 	stderr := []byte(`{"error":{"code":403,"message":"daily limit","errors":[{"reason":"rateLimitExceeded"}]}}`)
 	err := classifyError(nil, stderr, 1, "events.list")

@@ -40,6 +40,16 @@ Fix sketch: switch to `html/template` (handles XML-class escaping for content), 
 
 ## Fixed
 
+### B13 - gws error JSON parsed from wrong stream; masks 409/410/404 (CRITICAL)
+
+`gws` emits the Calendar API error envelope on **stdout** (the JSON: `{"error":{"code":409,...}}`). stderr gets only the human-readable summary plus keyring noise. `internal/gws/errors.go:classifyError` parsed **stderr** for the JSON, found nothing parseable, and fell through to `api_invalid_request` for every API error. This masked every meaningful HTTP-status sentinel - including 409 (which broke SPEC's cancelled-and-revived flow that triggers on `errors.Is(err, ErrAPIConflict)`).
+
+The bug was the proximate root cause of B10, B11, AND B12. With B13 fixed, the 409 from inserting against a tombstone correctly routes through `doInsert`'s 409 handler → `reviveCancelledMirror` → mirror is revived in-place. Without B13, the same insert appeared as `api_invalid_request` and the revival path never ran.
+
+Surfaced during the day-by-day rollout's Day 2: with horizon=2d the 24-event source list included the "CoreWeave P&E Offsite" tombstone from yesterday's cleanup. Insert returned 409, classifyError mismapped to `api_invalid_request`, the run errored as `partial_failure` with cause "The requested identifier already exists." - clearly a 409 misrendered.
+
+Fixed by parsing stdout first, falling back to stderr if stdout doesn't contain a parseable envelope (preserves backwards compat for tests/edge cases that route the envelope to stderr). Test pin: `TestClassifyError_ParsesAPIErrorFromStdout` (`internal/gws/errors_test.go`) covers 404, 409, 410, and 400 with realistic stdout+stderr pairs.
+
 ### B11 - sync orphan walk errors on already-cancelled mirrors
 
 Same root cause as B10 but in a different code path. `BuildInventory` uses `ShowDeleted:true` to surface tombstones for the cancelled-and-revived flow, then indexes them into the inventory. The orphan walk iterates the inventory and (correctly, given the visited set) classifies tombstones as orphaned, then tries `events.delete` on them - which Calendar API rejects with `api_invalid_request: Resource has been deleted`. The walker only catches `ErrAPINotFound`, so the error bubbles up as `partial_failure` and the entire sync tick errors out.

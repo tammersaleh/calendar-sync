@@ -103,8 +103,11 @@ func TestRun_HelpFlagDoesNotDispatchSubcommand(t *testing.T) {
 	}{
 		{"run --help", []string{"run", "--help"}, wantHelp},
 		{"run -h", []string{"run", "-h"}, wantHelp},
+		{"run --pair=X --help", []string{"run", "--pair=X", "--help"}, wantHelp},
+		{"run --dry-run --help", []string{"run", "--dry-run", "--help"}, wantHelp},
 		{"watch --help", []string{"watch", "--help"}, wantHelp},
 		{"install --help", []string{"install", "--help"}, wantHelp},
+		{"install --force --help", []string{"install", "--force", "--help"}, wantHelp},
 		{"uninstall --help", []string{"uninstall", "--help"}, wantHelp},
 		{"mirror prune --help", []string{"mirror", "prune", "--help"}, wantParseError},
 		{"mirror list --help", []string{"mirror", "list", "--help"}, wantParseError},
@@ -112,6 +115,10 @@ func TestRun_HelpFlagDoesNotDispatchSubcommand(t *testing.T) {
 		{"config show --help", []string{"config", "show", "--help"}, wantHelp},
 		{"init --help", []string{"init", "--help"}, wantHelp},
 		{"top-level --help", []string{"--help"}, wantParseError},
+		// Quiet + help: --quiet redirects stdout to nil; --help writes via
+		// kong's writer (the original stdout we passed to kong.New).
+		// Verify kong's stdout still gets the help text.
+		{"run --quiet --help", []string{"run", "--quiet", "--help"}, wantHelp},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

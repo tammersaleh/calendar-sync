@@ -467,6 +467,68 @@ func TestRunCmd_DryRun_DuplicateSourceEventTriggersBogusMigrationSourceWon(t *te
 	_ = (&RunCmd{DryRun: true}).Run(rt)
 }
 
+// TestRunCmd_SettingsDryRunGatesWrites pins SPEC line 253: the
+// `[settings].dry_run` config field, when true, must suppress writes the
+// same way `--dry-run` does. Pre-fix this fails because the settings
+// field is parsed and emitted in `config show` output but never wired to
+// the dryRunAPI wrapper at the run/watch/pair-test sites.
+//
+// We use the panicWriteGws stub so any leaked write surfaces as a
+// descriptive panic; the test asserts the run completes without panic.
+func TestRunCmd_SettingsDryRunGatesWrites(t *testing.T) {
+	tmp := shortTempDir(t)
+	t.Setenv("TMPDIR", tmp)
+
+	// Same-shape config as validConfigTOML but with dry_run=true.
+	const dryRunConfigTOML = `
+[settings]
+poll_interval      = "60s"
+horizon            = "365d"
+full_sync_interval = "24h"
+log_level          = "info"
+log_format         = "json"
+dry_run            = true
+
+[[pairs]]
+name      = "work-personal"
+direction = "bidirectional"
+source    = "work@example.com"
+target    = "personal@example.com"
+`
+	path := writeConfigFixture(t, dryRunConfigTOML)
+
+	// One confirmed source event: enough to drive the doInsert path which
+	// is the most common write call site.
+	stub := &panicWriteGws{events: []gws.Event{{
+		ID:           "evt-1",
+		Status:       gws.EventStatusConfirmed,
+		Summary:      "Test event",
+		Updated:      "2026-04-29T20:00:00Z",
+		Transparency: gws.TransparencyOpaque,
+		Start:        &gws.EventDateTime{DateTime: "2026-05-01T16:00:00Z"},
+		End:          &gws.EventDateTime{DateTime: "2026-05-01T17:00:00Z"},
+	}}}
+
+	rt := &Runtime{
+		Stdout:  &bytes.Buffer{},
+		Stderr:  &bytes.Buffer{},
+		Globals: Globals{Config: path},
+		Ctx:     context.Background(),
+		Gws:     stub,
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("settings.dry_run did not gate writes: %v\nstack:\n%s", r, debug.Stack())
+		}
+	}()
+
+	// CRUCIAL: NO --dry-run flag. settings.dry_run must do the gating.
+	if err := (&RunCmd{}).Run(rt); err != nil {
+		t.Logf("RunCmd.Run returned %v (expected for synthetic stub; the panic-stub guarantee is what matters)", err)
+	}
+}
+
 // dupSourceListGws extends stubGws with a fixed source-list response. The
 // inventory rebuild calls return empty (no mirrors exist on the target),
 // which mirrors the production scenario we observed.

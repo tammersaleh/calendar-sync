@@ -67,6 +67,42 @@ func TestValidate_HorizonRange(t *testing.T) {
 	}
 }
 
+// TestValidate_PairHorizonBounds pins the per-pair horizon override:
+// when [[pairs]].horizon is set, it's validated against the same 1d..730d
+// bounds as [settings].horizon. nil (the unset case) is allowed and
+// canonicalizes to the settings default - validation must NOT reject nil
+// even though the bare zero-value Duration would be below the minimum.
+func TestValidate_PairHorizonBounds(t *testing.T) {
+	atDur := func(d time.Duration) *Duration {
+		v := Duration(d)
+		return &v
+	}
+	tests := []struct {
+		name string
+		dur  *Duration
+		ok   bool
+	}{
+		{"nil falls back to settings", nil, true},
+		{"at 1d", atDur(24 * time.Hour), true},
+		{"at 730d", atDur(730 * 24 * time.Hour), true},
+		{"below 1d", atDur(12 * time.Hour), false},
+		{"above 730d", atDur(731 * 24 * time.Hour), false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := validConfig()
+			c.Pairs[0].Horizon = tc.dur
+			err := c.Validate()
+			if tc.ok && err != nil {
+				t.Errorf("Validate returned error: %v", err)
+			}
+			if !tc.ok && !errors.Is(err, ErrInvalid) {
+				t.Errorf("Validate err = %v; want ErrInvalid", err)
+			}
+		})
+	}
+}
+
 func TestValidate_FullSyncIntervalRange(t *testing.T) {
 	tests := []struct {
 		name string

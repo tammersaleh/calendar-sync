@@ -15,7 +15,6 @@ import (
 
 	"github.com/tammersaleh/calendar-sync/internal/config"
 	"github.com/tammersaleh/calendar-sync/internal/gws"
-	syncpkg "github.com/tammersaleh/calendar-sync/internal/sync"
 )
 
 func TestRunCmd_EmptySourceListEmitsMetaOnly(t *testing.T) {
@@ -934,24 +933,22 @@ func TestDryRunAPI_ZeroWritesAcrossEventShapes(t *testing.T) {
 	_ = (&RunCmd{DryRun: true}).Run(rt)
 }
 
-// TestRunCmd_ConfigHorizonWiredToReconciler pins B4 from doc/bugs.md: the
-// `[settings].horizon` config field is the single configurable surface for
-// the sync horizon (SPEC line 249); there is no `--horizon` CLI flag, by
-// design. The wire-through is `cmd/run.go` and `cmd/watch.go` calling
-// `syncpkg.WithHorizon(canonical.Settings.Horizon.Duration())`. A
-// regression that drops the call here would be invisible at the cmd-layer
-// surface (`run` would still complete) but would leave the Reconciler
-// running with `Horizon=0` so EVERY event is treated as outside-horizon
-// and every mirror gets deleted.
+// TestRunCmd_ConfigHorizonWiredToPDir pins B4 from doc/bugs.md and the
+// per-pair horizon scoping rollout: `[settings].horizon` is the per-pdir
+// fallback. Post-rollout, horizon lives on each canonical PDir (resolved
+// during canonicalization to either the per-pair override or the settings
+// default). A regression that drops the wire-through would leave PDir
+// horizons at zero, classifying every event as outside_horizon and
+// deleting every mirror.
 //
 // Two cases pin both ends of the SPEC's allowed range (1d-730d):
 //   - "1d" → 24h: smallest horizon, the day-by-day rollout shape.
 //   - "365d" → 8760h: SPEC's default.
 //
-// We replicate the exact wire pattern run.go uses (Load → Canonicalize →
-// New + WithHorizon) so a refactor that introduces a new helper in
-// run.go which forgets the WithHorizon call gets caught here.
-func TestRunCmd_ConfigHorizonWiredToReconciler(t *testing.T) {
+// We replicate the exact wire pattern run.go uses (Load → Canonicalize)
+// and assert on the canonical PDir's resolved horizon - the reconciler no
+// longer carries a Horizon field; per-pdir consumers read it from the PDir.
+func TestRunCmd_ConfigHorizonWiredToPDir(t *testing.T) {
 	cases := []struct {
 		name        string
 		horizonTOML string
@@ -987,14 +984,59 @@ target    = "personal@example.com"
 			if err != nil {
 				t.Fatalf("Canonicalize: %v", err)
 			}
-			// Replicates cmd/run.go and cmd/watch.go's option construction.
-			rec := syncpkg.New(&stubGws{}, canonical,
-				syncpkg.WithHorizon(canonical.Settings.Horizon.Duration()),
-			)
-			if rec.Horizon != tc.want {
-				t.Errorf("Reconciler.Horizon = %v, want %v (config horizon=%q)",
-					rec.Horizon, tc.want, tc.horizonTOML)
+			if len(canonical.PDirs) != 1 {
+				t.Fatalf("len(PDirs) = %d, want 1", len(canonical.PDirs))
+			}
+			if got := canonical.PDirs[0].Horizon; got != tc.want {
+				t.Errorf("PDir.Horizon = %v, want %v (config horizon=%q)",
+					got, tc.want, tc.horizonTOML)
 			}
 		})
+	}
+}
+
+// TestRunCmd_PerPairHorizonOverridesSettings: when a [[pairs]] block sets
+// its own horizon, that override flows through canonicalization to the
+// PDir.Horizon. Settings.Horizon is the fallback for pairs without an
+// explicit override; per-pair scoping is what enables the gradual rollout
+// shape (one direction at horizon=1d while the other stays at 365d).
+func TestRunCmd_PerPairHorizonOverridesSettings(t *testing.T) {
+	body := `
+[settings]
+poll_interval      = "60s"
+horizon            = "365d"
+full_sync_interval = "24h"
+log_level          = "info"
+log_format         = "json"
+
+[[pairs]]
+name    = "fallback"
+source  = "a@example.com"
+target  = "b@example.com"
+
+[[pairs]]
+name    = "override"
+source  = "c@example.com"
+target  = "d@example.com"
+horizon = "1d"
+`
+	path := writeConfigFixture(t, body)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	canonical, err := cfg.Canonicalize(context.Background(), &stubGws{})
+	if err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	pdirByName := map[string]config.PDir{}
+	for _, pd := range canonical.PDirs {
+		pdirByName[pd.PairName] = pd
+	}
+	if got, want := pdirByName["fallback"].Horizon, 365*24*time.Hour; got != want {
+		t.Errorf("fallback PDir.Horizon = %v, want %v (settings default)", got, want)
+	}
+	if got, want := pdirByName["override"].Horizon, 24*time.Hour; got != want {
+		t.Errorf("override PDir.Horizon = %v, want %v (per-pair override)", got, want)
 	}
 }

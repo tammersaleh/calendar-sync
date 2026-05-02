@@ -3,6 +3,7 @@ package config
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/tammersaleh/calendar-sync/internal/gws"
 )
@@ -23,6 +24,12 @@ type PDir struct {
 	TargetCalendar string // canonical ID
 	SourceWritable bool   // derived from source.AccessRole
 	TimeZone       string
+
+	// Horizon is the resolved effective horizon for this pdir: the
+	// per-pair Pair.Horizon override if set, otherwise the fallback
+	// Settings.Horizon. Resolved at canonicalization so downstream
+	// consumers (sync/classify/orphan) read a single, non-nil value.
+	Horizon time.Duration
 }
 
 // Direction value for PDir. Pre-v2.0.0 there was also PDirBtoA for the
@@ -204,7 +211,15 @@ func expandPDirs(c Config, calendars map[string]Calendar, refToCanonical map[str
 		if err := requireTarget(targetCal, p.Name); err != nil {
 			return nil, err
 		}
-		out = append(out, makePDir(p, sourceCal, targetCal))
+
+		// Resolve effective horizon: per-pair override wins, settings
+		// default is the fallback. Validation has already bounded both
+		// against the 1d..730d range.
+		horizon := c.Settings.Horizon.Duration()
+		if p.Horizon != nil {
+			horizon = p.Horizon.Duration()
+		}
+		out = append(out, makePDir(p, sourceCal, targetCal, horizon))
 	}
 	return out, nil
 }
@@ -225,7 +240,7 @@ func requireTarget(cal Calendar, pairName string) error {
 	return nil
 }
 
-func makePDir(p Pair, source, target Calendar) PDir {
+func makePDir(p Pair, source, target Calendar, horizon time.Duration) PDir {
 	return PDir{
 		PairName:       p.Name,
 		Direction:      PDirAtoB,
@@ -233,6 +248,7 @@ func makePDir(p Pair, source, target Calendar) PDir {
 		TargetCalendar: target.CanonicalID,
 		SourceWritable: AccessRoleAtLeast(source.AccessRole, AccessRoleWriter),
 		TimeZone:       p.TimeZone,
+		Horizon:        horizon,
 	}
 }
 

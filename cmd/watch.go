@@ -38,7 +38,6 @@ func (c *WatchCmd) Run(rt *Runtime) error {
 		api = newDryRunAPI(api)
 	}
 	opts := []syncpkg.Option{
-		syncpkg.WithHorizon(canonical.Settings.Horizon.Duration()),
 		syncpkg.WithPropagateTargetEdits(canonical.Settings.PropagateTargetEdits),
 	}
 	if rt.Logger != nil {

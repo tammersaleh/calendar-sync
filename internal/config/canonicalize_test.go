@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/tammersaleh/calendar-sync/internal/config"
 	"github.com/tammersaleh/calendar-sync/internal/gws"
@@ -367,6 +368,59 @@ func TestCanonicalize_DedupesCalendarLookups(t *testing.T) {
 	if len(lister.calls) != 3 {
 		t.Errorf("len(calls) = %d, want 3 (one per distinct calendar ref); calls = %v",
 			len(lister.calls), lister.calls)
+	}
+}
+
+// TestCanonicalize_PerPairHorizonOverridesSettings: a pair with an
+// explicit horizon resolves to a PDir whose Horizon equals the override,
+// not the settings default. Pins the per-pair scoping fallthrough.
+func TestCanonicalize_PerPairHorizonOverridesSettings(t *testing.T) {
+	c := baseConfig()
+	override := config.Duration(24 * time.Hour)
+	c.Pairs = []config.Pair{{
+		Name:    "p",
+		Source:  "a@example.com",
+		Target:  "b@example.com",
+		Horizon: &override,
+	}}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"a@example.com": {ID: "a@example.com", AccessRole: "owner"},
+			"b@example.com": {ID: "b@example.com", AccessRole: "owner"},
+		},
+	}
+	can, err := c.Canonicalize(context.Background(), lister)
+	if err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	if got, want := can.PDirs[0].Horizon, 24*time.Hour; got != want {
+		t.Errorf("PDir.Horizon = %v, want %v (per-pair override)", got, want)
+	}
+}
+
+// TestCanonicalize_NilHorizonFallsBackToSettings: a pair with no horizon
+// resolves to a PDir whose Horizon equals the settings default. Pins the
+// fallback path for configs that omit per-pair horizon.
+func TestCanonicalize_NilHorizonFallsBackToSettings(t *testing.T) {
+	c := baseConfig()
+	// baseConfig() sets Settings.Horizon to 365d.
+	c.Pairs = []config.Pair{{
+		Name:   "p",
+		Source: "a@example.com",
+		Target: "b@example.com",
+	}}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"a@example.com": {ID: "a@example.com", AccessRole: "owner"},
+			"b@example.com": {ID: "b@example.com", AccessRole: "owner"},
+		},
+	}
+	can, err := c.Canonicalize(context.Background(), lister)
+	if err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	if got, want := can.PDirs[0].Horizon, 365*24*time.Hour; got != want {
+		t.Errorf("PDir.Horizon = %v, want %v (settings fallback)", got, want)
 	}
 }
 

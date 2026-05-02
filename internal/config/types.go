@@ -45,6 +45,12 @@ type Pair struct {
 	Target    string `toml:"target"`
 	Enabled   *bool  `toml:"enabled"`
 	TimeZone  string `toml:"time_zone"`
+
+	// Horizon optionally overrides [settings].horizon for this pair. nil
+	// (the unset case) means fall back to Settings.Horizon at canonicalization
+	// time. Pointer-typed so absence is distinguishable from an explicit
+	// zero. Same 1d..730d bounds as the settings field.
+	Horizon *Duration `toml:"horizon"`
 }
 
 // IsEnabled returns whether the pair should be processed. Enabled defaults

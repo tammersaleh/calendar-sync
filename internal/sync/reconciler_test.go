@@ -17,6 +17,10 @@ import (
 // makeTestPDir builds a config.PDir with a simple naming convention so a
 // test can wire two pdirs against shared or distinct sources/targets
 // without verbose struct literals at every call site.
+//
+// Horizon defaults to 30d, matching newTestReconciler's prior global value.
+// Tests that need a different per-pdir horizon construct the PDir directly
+// or override the field after this returns.
 func makeTestPDir(pair, source, target string, sourceWritable bool) config.PDir {
 	return config.PDir{
 		PairName:       pair,
@@ -24,6 +28,7 @@ func makeTestPDir(pair, source, target string, sourceWritable bool) config.PDir 
 		SourceCalendar: source,
 		TargetCalendar: target,
 		SourceWritable: sourceWritable,
+		Horizon:        30 * 24 * time.Hour,
 	}
 }
 
@@ -40,12 +45,13 @@ func makeCanonical(pdirs ...config.PDir) *config.Canonical {
 
 // newTestReconciler returns a Reconciler with sane defaults for the
 // reconciler tests. Callers override fields on the returned value
-// (Output, Horizon, OrphanConcurrency, etc.) before calling FullSync /
-// Tick.
+// (Output, OrphanConcurrency, etc.) before calling FullSync / Tick.
+//
+// Per-pdir horizon comes from the canonical's PDirs (default 30d set by
+// makeTestPDir). The reconciler itself no longer carries a horizon field.
 func newTestReconciler(api API, canonical *config.Canonical) *Reconciler {
 	return New(api, canonical,
 		WithNow(fixedNow(must2026())),
-		WithHorizon(30*24*time.Hour),
 		WithOrphanConcurrency(1),
 	)
 }
@@ -747,13 +753,13 @@ func TestFullSync_AggregatedCountsSumPerPdir(t *testing.T) {
 func TestFullSync_SourceListWireShape(t *testing.T) {
 	api := newStubAPI()
 	pd := makeTestPDir("p1", "src-A", "tgt-A", true)
+	pd.Horizon = 7 * 24 * time.Hour
 	canonical := makeCanonical(pd)
 	api.queueListFull("src-A", nil, "tok-1")
 	queueEmptyInventory(api, "tgt-A")
 
 	r := New(api, canonical,
 		WithNow(fixedNow(must2026())),
-		WithHorizon(7*24*time.Hour),
 	)
 	if _, err := r.FullSync(context.Background()); err != nil {
 		t.Fatalf("FullSync error: %v", err)
@@ -1005,7 +1011,7 @@ func TestFullSync_EmptyStagedToken_DoesNotClobber(t *testing.T) {
 
 	stamp := must2026()
 	r := New(api, canonical, WithNow(fixedNow(stamp)),
-		WithHorizon(30*24*time.Hour), WithOrphanConcurrency(1))
+		WithOrphanConcurrency(1))
 	r.syncTokens["src-A"] = "preexisting-tok"
 
 	res, err := r.FullSync(context.Background())
@@ -1039,7 +1045,7 @@ func TestFullSync_SetsLastFullSyncTimestamp(t *testing.T) {
 
 	stamp := must2026()
 	r := New(api, canonical, WithNow(fixedNow(stamp)),
-		WithHorizon(30*24*time.Hour), WithOrphanConcurrency(1))
+		WithOrphanConcurrency(1))
 	if _, err := r.FullSync(context.Background()); err != nil {
 		t.Fatalf("FullSync error: %v", err)
 	}
@@ -1102,15 +1108,11 @@ func TestNew_OptionsApply(t *testing.T) {
 	out := Output(func(_ Outcome) {})
 	r := New(nil, &config.Canonical{},
 		WithNow(now),
-		WithHorizon(time.Hour),
 		WithOrphanConcurrency(7),
 		WithOutput(out),
 	)
 	if r.Now == nil {
 		t.Errorf("Now option not applied")
-	}
-	if r.Horizon != time.Hour {
-		t.Errorf("Horizon = %v, want 1h", r.Horizon)
 	}
 	if r.OrphanConcurrency != 7 {
 		t.Errorf("OrphanConcurrency = %d, want 7", r.OrphanConcurrency)
@@ -1200,6 +1202,98 @@ func TestWithPropagateTargetEdits_OptionApplies(t *testing.T) {
 	r := New(nil, &config.Canonical{}, WithPropagateTargetEdits(true))
 	if !r.PropagateTargetEdits {
 		t.Error("WithPropagateTargetEdits(true) did not apply")
+	}
+}
+
+// ---------- Per-pair horizon scoping ----------
+
+// TestReconciler_FullListSourcesUsesMaxHorizonAcrossPdirs pins SPEC's
+// per-pair horizon scoping: when two pdirs share a source but have
+// different horizons, the source-list TimeMax is the MAX of the per-pdir
+// horizons. The shorter-horizon pdir's classifier filters per its own
+// horizon at apply time; the longer-horizon pdir needs the wider window
+// to see all the events it's responsible for.
+func TestReconciler_FullListSourcesUsesMaxHorizonAcrossPdirs(t *testing.T) {
+	api := newStubAPI()
+	pdShort := makeTestPDir("p-short", "src-A", "tgt-A", true)
+	pdShort.Horizon = 24 * time.Hour
+	pdLong := makeTestPDir("p-long", "src-A", "tgt-B", true)
+	pdLong.Horizon = 365 * 24 * time.Hour
+	canonical := makeCanonical(pdShort, pdLong)
+
+	api.queueListFull("src-A", nil, "tok-1")
+	queueEmptyInventory(api, "tgt-A")
+	queueEmptyInventory(api, "tgt-B")
+
+	r := New(api, canonical,
+		WithNow(fixedNow(must2026())),
+		WithOrphanConcurrency(1),
+	)
+	if _, err := r.FullSync(context.Background()); err != nil {
+		t.Fatalf("FullSync error: %v", err)
+	}
+
+	// Find the full source-list call for src-A.
+	var found *recordedCall
+	for i := range api.calls {
+		c := &api.calls[i]
+		if c.Op != "EventsList" {
+			continue
+		}
+		if c.ListParams.SyncToken != "" {
+			continue
+		}
+		if len(c.ListParams.PrivateExtendedProperty) > 0 {
+			continue
+		}
+		if c.CalendarID == "src-A" {
+			found = c
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("no full source-list call recorded")
+	}
+	want := must2026().Add(365 * 24 * time.Hour).Format(time.RFC3339)
+	if found.ListParams.TimeMax != want {
+		t.Errorf("TimeMax = %q, want %q (max horizon across pdirs sharing src-A)",
+			found.ListParams.TimeMax, want)
+	}
+}
+
+// TestReconciler_PerPDirClassifierHorizon: each pdir builds a Classifier
+// whose Horizon equals the pdir's own (not the source-list TimeMax). Pins
+// the wiring in buildClassifier.
+func TestReconciler_PerPDirClassifierHorizon(t *testing.T) {
+	pdShort := makeTestPDir("p-short", "src-A", "tgt-A", true)
+	pdShort.Horizon = 24 * time.Hour
+	pdLong := makeTestPDir("p-long", "src-B", "tgt-B", true)
+	pdLong.Horizon = 365 * 24 * time.Hour
+	canonical := makeCanonical(pdShort, pdLong)
+
+	r := New(nil, canonical, WithNow(fixedNow(must2026())))
+
+	cShort, _ := r.buildClassifier(pdShort, NewInventory("tgt-A"), &Counts{})
+	if got, want := cShort.Horizon, 24*time.Hour; got != want {
+		t.Errorf("Classifier(p-short).Horizon = %v, want %v", got, want)
+	}
+	cLong, _ := r.buildClassifier(pdLong, NewInventory("tgt-B"), &Counts{})
+	if got, want := cLong.Horizon, 365*24*time.Hour; got != want {
+		t.Errorf("Classifier(p-long).Horizon = %v, want %v", got, want)
+	}
+}
+
+// TestReconciler_SourceMaxHorizon_NoMatch returns 0 when no pdir matches
+// the source. Pins the helper's defensive contract; uniqueSources()
+// produces only canonical sources, so a "no match" outcome means a
+// programmer bug in the caller, not a runtime case.
+func TestReconciler_SourceMaxHorizon_NoMatch(t *testing.T) {
+	pd := makeTestPDir("p1", "src-A", "tgt-A", true)
+	pd.Horizon = 24 * time.Hour
+	canonical := makeCanonical(pd)
+	r := New(nil, canonical)
+	if got := r.sourceMaxHorizon("src-NEVER"); got != 0 {
+		t.Errorf("sourceMaxHorizon(unknown) = %v, want 0", got)
 	}
 }
 

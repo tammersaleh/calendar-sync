@@ -36,12 +36,16 @@ func (c *PairListCmd) Run(rt *Runtime) error {
 		if c.EnabledOnly && !pair.IsEnabled() {
 			continue
 		}
-		p.Emit(pairPayload{
+		row := pairPayload{
 			Name:    pair.Name,
 			Source:  pair.Source,
 			Target:  pair.Target,
 			Enabled: pair.IsEnabled(),
-		})
+		}
+		if pair.Horizon != nil {
+			row.Horizon = pair.Horizon.Compact()
+		}
+		p.Emit(row)
 		count++
 	}
 	p.Meta(metaCount{Count: count})

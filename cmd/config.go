@@ -47,12 +47,16 @@ func (c *ConfigShowCmd) Run(rt *Runtime) error {
 		}
 	} else {
 		for _, p := range cfg.Pairs {
-			body.Pairs = append(body.Pairs, pairPayload{
+			row := pairPayload{
 				Name:    p.Name,
 				Source:  p.Source,
 				Target:  p.Target,
 				Enabled: p.IsEnabled(),
-			})
+			}
+			if p.Horizon != nil {
+				row.Horizon = p.Horizon.Compact()
+			}
+			body.Pairs = append(body.Pairs, row)
 		}
 	}
 
@@ -77,12 +81,16 @@ func pairPayloadFromCanonical(p config.Pair, canonical *config.Canonical) pairPa
 		target = pd.TargetCalendar
 		break
 	}
-	return pairPayload{
+	row := pairPayload{
 		Name:    p.Name,
 		Source:  source,
 		Target:  target,
 		Enabled: p.IsEnabled(),
 	}
+	if p.Horizon != nil {
+		row.Horizon = p.Horizon.Compact()
+	}
+	return row
 }
 
 // ConfigValidateCmd implements `calendar-sync config validate`. SPEC
@@ -149,11 +157,16 @@ type settingsPayload struct {
 // `pair list`. v2.0.0 dropped the `direction` field; every pair is
 // implicitly source-to-target. The PDir-level direction (always "a_to_b")
 // still surfaces in `pair test` output via pairTestPayload.
+//
+// Horizon surfaces only when the pair set its own override; absence (the
+// settings-fallback case) drops the field via omitempty so the wire shape
+// matches the user's config exactly.
 type pairPayload struct {
 	Name    string `json:"name"`
 	Source  string `json:"source"`
 	Target  string `json:"target"`
 	Enabled bool   `json:"enabled"`
+	Horizon string `json:"horizon,omitempty"`
 }
 
 // configValidatePayload is SPEC line 609's wire shape:

@@ -54,7 +54,6 @@ type Logger interface {
 type Reconciler struct {
 	API       API
 	Now       func() time.Time
-	Horizon   time.Duration
 	Canonical *config.Canonical
 	Output    Output
 	Log       Logger
@@ -101,18 +100,13 @@ func (r *Reconciler) warn(msg string, args ...any) {
 // Option mutates a Reconciler at construction time. Reserved for daemon-
 // wiring knobs that don't belong in the type's required fields. Tests
 // today only ever set fields directly; the option pattern is here for
-// layer-7 ergonomics ("WithHorizon", "WithOrphanConcurrency", etc.).
+// layer-7 ergonomics ("WithOrphanConcurrency", etc.).
 type Option func(*Reconciler)
 
 // WithNow injects a fixed clock. Used by tests. Production callers omit it
 // and time.Now is used.
 func WithNow(now func() time.Time) Option {
 	return func(r *Reconciler) { r.Now = now }
-}
-
-// WithHorizon sets r.Horizon. Convenience for daemon wiring.
-func WithHorizon(h time.Duration) Option {
-	return func(r *Reconciler) { r.Horizon = h }
 }
 
 // WithOrphanConcurrency overrides SPEC's default-5 events.get cap.
@@ -257,6 +251,29 @@ func (r *Reconciler) InventorySize(target string) int {
 		return 0
 	}
 	return len(inv.Tuples())
+}
+
+// sourceMaxHorizon returns the max effective horizon across all pdirs that
+// use the given source. Source-list TimeMax must reach the longest-horizon
+// pdir's window so its classifier sees every event in scope; the
+// shorter-horizon pdir's classifier filters per its own horizon at apply
+// time.
+//
+// Returns 0 if no pdir matches the source. uniqueSources() is derived from
+// r.Canonical.PDirs, so a "no match" return is a programmer-bug shape (the
+// caller passed in a source that's not in the canonical) - the safe
+// default of 0 means "no TimeMax", which simply widens the window.
+func (r *Reconciler) sourceMaxHorizon(source string) time.Duration {
+	var max time.Duration
+	for _, pd := range r.Canonical.PDirs {
+		if pd.SourceCalendar != source {
+			continue
+		}
+		if pd.Horizon > max {
+			max = pd.Horizon
+		}
+	}
+	return max
 }
 
 // uniqueSources returns the canonical source IDs from r.Canonical.PDirs in
@@ -429,12 +446,20 @@ func (r *Reconciler) fullListSources(ctx context.Context) (
 
 	now := r.now()
 	timeMin := now.Format(time.RFC3339)
-	timeMax := ""
-	if r.Horizon > 0 {
-		timeMax = now.Add(r.Horizon).Format(time.RFC3339)
-	}
 
 	for _, source := range r.uniqueSources() {
+		// Per-source TimeMax: max horizon across pdirs sharing this source.
+		// Multiple pdirs can share a source with different horizons (e.g.
+		// 1d on one, 365d on another); the source-list needs events out to
+		// the longer window so the longer-horizon pdir's classifier sees
+		// them. The shorter-horizon pdir's classifier filters per its own
+		// horizon.
+		horizon := r.sourceMaxHorizon(source)
+		timeMax := ""
+		if horizon > 0 {
+			timeMax = now.Add(horizon).Format(time.RFC3339)
+		}
+
 		params := gws.EventsListParams{
 			CalendarID:   source,
 			TimeMin:      timeMin,
@@ -679,7 +704,7 @@ func (r *Reconciler) buildClassifier(
 	c := &Classifier{
 		API:              r.API,
 		Now:              r.Now,
-		Horizon:          r.Horizon,
+		Horizon:          pd.Horizon,
 		Pair:             pd.PairName,
 		Direction:        pd.Direction,
 		SourceCalendarID: pd.SourceCalendar,
@@ -824,7 +849,7 @@ func (r *Reconciler) runOrphanWalk(
 	walker := &OrphanWalker{
 		API:              r.API,
 		Now:              r.Now,
-		Horizon:          r.Horizon,
+		Horizon:          pd.Horizon,
 		Pair:             pd.PairName,
 		Direction:        pd.Direction,
 		SourceCalendarID: pd.SourceCalendar,

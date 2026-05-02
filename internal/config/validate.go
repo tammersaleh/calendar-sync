@@ -17,6 +17,13 @@ var ErrInvalid = errors.New("config invalid")
 // 63 characters max, lowercase alphanumeric plus hyphens (not at start).
 var nameRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
+// Horizon bounds shared by [settings].horizon and per-pair [[pairs]].horizon.
+// SPEC.md "Validation rules": 1d..730d inclusive.
+const (
+	minHorizon = 24 * time.Hour
+	maxHorizon = 730 * 24 * time.Hour
+)
+
 // Validate runs every SPEC.md "Validation rules" check that does NOT
 // require Calendar API access. Canonicalization-dependent rules (after-
 // canonicalization source != target, no two pdirs sharing a triple,
@@ -47,8 +54,6 @@ func (c Config) Validate() error {
 func validateSettings(s Settings) error {
 	const (
 		minPoll     = 15 * time.Second
-		minHorizon  = 24 * time.Hour
-		maxHorizon  = 730 * 24 * time.Hour
 		minFullSync = 1 * time.Hour
 		maxFullSync = 30 * 24 * time.Hour
 	)
@@ -107,6 +112,17 @@ func validatePair(idx int, p Pair) error {
 	if p.Source == p.Target {
 		return fmt.Errorf("%w: pairs[%q] cannot mirror a calendar to itself (source == target)",
 			ErrInvalid, p.Name)
+	}
+
+	// Per-pair horizon override is bounded by the same range as
+	// [settings].horizon. nil means "fall back to settings" and is allowed
+	// regardless; the bare zero-value Duration would otherwise fail the
+	// minimum check on every pair that omits the field.
+	if p.Horizon != nil {
+		if d := p.Horizon.Duration(); d < minHorizon || d > maxHorizon {
+			return fmt.Errorf("%w: pairs[%q].horizon %s outside allowed range %s..%s",
+				ErrInvalid, p.Name, d, minHorizon, maxHorizon)
+		}
 	}
 	return nil
 }

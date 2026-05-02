@@ -160,6 +160,65 @@ func TestConfigShowCmd_DoesNotEmitDirectionField(t *testing.T) {
 	}
 }
 
+// TestConfigShowCmd_PerPairHorizonWireShape pins the per-pair-horizon
+// scoping rollout's wire format: a pair with no override drops the
+// `horizon` field via omitempty (the settings default isn't echoed back as
+// a per-pair value); a pair with an explicit override emits the field in
+// compact form.
+func TestConfigShowCmd_PerPairHorizonWireShape(t *testing.T) {
+	body := `
+[settings]
+poll_interval = "60s"
+horizon = "365d"
+full_sync_interval = "24h"
+log_level = "info"
+log_format = "json"
+
+[[pairs]]
+name = "fallback"
+source = "a@example.com"
+target = "b@example.com"
+
+[[pairs]]
+name = "override"
+source = "c@example.com"
+target = "d@example.com"
+horizon = "1d"
+`
+	path := writeConfigFixture(t, body)
+	stdout := &bytes.Buffer{}
+	rt := &Runtime{
+		Stdout:  stdout,
+		Stderr:  &bytes.Buffer{},
+		Globals: Globals{Config: path},
+		Ctx:     context.Background(),
+		Gws:     &stubGws{},
+	}
+	if err := (&ConfigShowCmd{}).Run(rt); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	first := strings.SplitN(stdout.String(), "\n", 2)[0]
+
+	// Decode into untyped map to assert presence/absence of the omitempty
+	// field; struct-typed unmarshal would mask a missing key.
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(first), &raw); err != nil {
+		t.Fatalf("unmarshal: %v\nstdout=%s", err, stdout.String())
+	}
+	pairs, _ := raw["pairs"].([]any)
+	byName := map[string]map[string]any{}
+	for _, p := range pairs {
+		entry := p.(map[string]any)
+		byName[entry["name"].(string)] = entry
+	}
+	if h, present := byName["fallback"]["horizon"]; present {
+		t.Errorf("fallback pair must drop horizon via omitempty; got %v", h)
+	}
+	if h := byName["override"]["horizon"]; h != "24h" {
+		t.Errorf("override pair horizon = %v, want 24h", h)
+	}
+}
+
 func TestConfigShowCmd_CanonicalizeResolvesSource(t *testing.T) {
 	path := writeConfigFixture(t, validConfigTOML)
 	stdout := &bytes.Buffer{}

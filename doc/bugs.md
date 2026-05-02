@@ -40,6 +40,14 @@ Fix sketch: switch to `html/template` (handles XML-class escaping for content), 
 
 ## Fixed
 
+### B11 - sync orphan walk errors on already-cancelled mirrors
+
+Same root cause as B10 but in a different code path. `BuildInventory` uses `ShowDeleted:true` to surface tombstones for the cancelled-and-revived flow, then indexes them into the inventory. The orphan walk iterates the inventory and (correctly, given the visited set) classifies tombstones as orphaned, then tries `events.delete` on them - which Calendar API rejects with `api_invalid_request: Resource has been deleted`. The walker only catches `ErrAPINotFound`, so the error bubbles up as `partial_failure` and the entire sync tick errors out.
+
+Triggered on the very first `calendar-sync run` of the day-by-day rollout: 74 tombstones from the prior cleanup were indexed, all 74 looked orphaned (no source on a 1-day horizon), all 74 errored on delete.
+
+Fixed by skipping `ev.Status == gws.EventStatusCancelled` events at the inventory-build step. SPEC's cancelled-and-revived flow uses a per-event `events.get` triggered by 409 on insert - it doesn't depend on the inventory holding tombstones, so the skip is safe. Test pin: `TestBuildInventory_SkipsCancelledTombstones` (`internal/sync/inventory_test.go`) constructs a confirmed + cancelled mix and asserts only the confirmed reaches the inventory.
+
 ### B10 - `mirror prune` errors on already-cancelled events
 
 `listMirrors` queries `ShowDeleted:true` so it returns tombstones (events previously deleted via `events.delete`, which Calendar API stores with `status=cancelled` rather than physically removing). The candidate loop didn't filter these out, so prune would call `events.delete` on a tombstone, which returns `api_invalid_request: Resource has been deleted` - NOT the `NotFound` the existing carry-on branch catches. The function then returned the error early, skipping any remaining live mirrors and emitting no `_meta` trailer. Discovered during phased cleanup of the B1 leak: Phase 3 silently truncated after deleting 4 of 19 candidates because the 5th was a tombstone from Phase 2.

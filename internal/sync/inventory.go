@@ -132,6 +132,19 @@ func BuildInventory(ctx context.Context, api API, target string, log Logger) (*I
 		var added, skipped int
 		for i := range events {
 			ev := events[i]
+			// Tombstones (events deleted via events.delete; status=cancelled)
+			// reach this listing because ShowDeleted:true is set above. Skip
+			// them: SPEC's cancelled-and-revived flow inspects status via a
+			// per-event events.get triggered by a 409 on insert, not via the
+			// inventory. Indexing tombstones would mislead the orphan walk
+			// (which would try to events.delete them and hit
+			// api_invalid_request "Resource has been deleted") and the
+			// standard reconcile path (which would treat them as live mirrors
+			// needing drift checks).
+			if ev.Status == gws.EventStatusCancelled {
+				skipped++
+				continue
+			}
 			tuple, ok := parseSourceFromMirror(&ev)
 			if !ok {
 				skipped++

@@ -134,6 +134,42 @@ func TestBuildInventory_SkipsMirrorsMissingSourceTuple(t *testing.T) {
 	}
 }
 
+// TestBuildInventory_SkipsCancelledTombstones pins B11: mirrors with
+// status=cancelled (Calendar API tombstones from a previous events.delete)
+// must not enter the inventory. They reach the listing because we pass
+// ShowDeleted:true to surface them for the cancelled-and-revived path,
+// but indexing them here would have downstream effects: the orphan walk
+// would try to delete them again (Calendar API responds with
+// api_invalid_request "Resource has been deleted", which the walker
+// surfaces as a partial_failure), and the standard reconcile path
+// would treat them as live mirrors needing drift checks.
+//
+// SPEC's "Cancelled-and-revived" flow doesn't depend on the inventory
+// holding tombstones - revival is triggered by 409 on insert, then a
+// per-event events.get to inspect status.
+func TestBuildInventory_SkipsCancelledTombstones(t *testing.T) {
+	api := newStubAPI()
+	live := makeMirrorWithSource("live", "src-cal:src-evt-A", "2")
+	tomb := makeMirrorWithSource("tomb", "src-cal:src-evt-B", "2")
+	tomb.Status = gws.EventStatusCancelled
+	api.queueList([]gws.Event{*live, *tomb}, "")
+	api.queueList(nil, "")
+
+	inv, err := BuildInventory(context.Background(), api, "tgt-cal", nil)
+	if err != nil {
+		t.Fatalf("BuildInventory error: %v", err)
+	}
+	if got := len(inv.All()); got != 1 {
+		t.Errorf("expected only the live mirror to be indexed; got %d entries", got)
+	}
+	if _, ok := inv.Lookup(mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt-B"}); ok {
+		t.Errorf("cancelled tombstone src-evt-B must NOT be in inventory")
+	}
+	if _, ok := inv.Lookup(mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt-A"}); !ok {
+		t.Errorf("live mirror src-evt-A must remain in inventory")
+	}
+}
+
 func TestInventory_LookupSetDelete(t *testing.T) {
 	inv := NewInventory("tgt-cal")
 	if inv.Target() != "tgt-cal" {

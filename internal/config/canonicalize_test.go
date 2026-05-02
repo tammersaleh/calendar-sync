@@ -51,10 +51,9 @@ func baseConfig() config.Config {
 func TestCanonicalize_PrimaryAliasResolved(t *testing.T) {
 	c := baseConfig()
 	c.Pairs = append(c.Pairs, config.Pair{
-		Name:      "wp",
-		Direction: config.DirectionBidirectional,
-		Source:    "alice@example.com",
-		Target:    "primary",
+		Name:   "wp",
+		Source: "alice@example.com",
+		Target: "primary",
 	})
 
 	lister := &stubLister{
@@ -74,43 +73,68 @@ func TestCanonicalize_PrimaryAliasResolved(t *testing.T) {
 	if can.Calendars["alice.canonical@example.com"].OriginalRef != "primary" {
 		t.Errorf("OriginalRef = %q, want primary", can.Calendars["alice.canonical@example.com"].OriginalRef)
 	}
-	if len(can.PDirs) != 2 {
-		t.Errorf("len(PDirs) = %d, want 2 (bidirectional)", len(can.PDirs))
+	if len(can.PDirs) != 1 {
+		t.Errorf("len(PDirs) = %d, want 1 (every pair is one pdir post-v2.0.0)", len(can.PDirs))
 	}
 }
 
-func TestCanonicalize_DirectionExpansion(t *testing.T) {
-	tests := []struct {
-		direction string
-		wantPDirs int
-	}{
-		{config.DirectionBidirectional, 2},
-		{config.DirectionSourceToTarget, 1},
-		{config.DirectionTargetToSource, 1},
+// TestCanonicalize_AlwaysOnePDirPerPair pins the v2.0.0 invariant: every
+// enabled pair produces exactly one PDir, in the source→target direction.
+// Bidirectional setups must declare two pairs with swapped source/target
+// (which then produce two pdirs total).
+func TestCanonicalize_AlwaysOnePDirPerPair(t *testing.T) {
+	c := baseConfig()
+	c.Pairs = append(c.Pairs, config.Pair{
+		Name:   "p",
+		Source: "a@example.com",
+		Target: "b@example.com",
+	})
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"a@example.com": {ID: "a@example.com", AccessRole: "owner"},
+			"b@example.com": {ID: "b@example.com", AccessRole: "owner"},
+		},
 	}
-	for _, tc := range tests {
-		t.Run(tc.direction, func(t *testing.T) {
-			c := baseConfig()
-			c.Pairs = append(c.Pairs, config.Pair{
-				Name:      "p",
-				Direction: tc.direction,
-				Source:    "a@example.com",
-				Target:    "b@example.com",
-			})
-			lister := &stubLister{
-				responses: map[string]*gws.CalendarListEntry{
-					"a@example.com": {ID: "a@example.com", AccessRole: "owner"},
-					"b@example.com": {ID: "b@example.com", AccessRole: "owner"},
-				},
-			}
-			can, err := c.Canonicalize(context.Background(), lister)
-			if err != nil {
-				t.Fatalf("Canonicalize: %v", err)
-			}
-			if len(can.PDirs) != tc.wantPDirs {
-				t.Errorf("len(PDirs) = %d, want %d", len(can.PDirs), tc.wantPDirs)
-			}
-		})
+	can, err := c.Canonicalize(context.Background(), lister)
+	if err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	if len(can.PDirs) != 1 {
+		t.Fatalf("len(PDirs) = %d, want 1", len(can.PDirs))
+	}
+	if can.PDirs[0].Direction != config.PDirAtoB {
+		t.Errorf("PDir.Direction = %q, want %q (every pdir is a_to_b post-v2.0.0)",
+			can.PDirs[0].Direction, config.PDirAtoB)
+	}
+	if can.PDirs[0].SourceCalendar != "a@example.com" {
+		t.Errorf("SourceCalendar = %q, want a@example.com", can.PDirs[0].SourceCalendar)
+	}
+	if can.PDirs[0].TargetCalendar != "b@example.com" {
+		t.Errorf("TargetCalendar = %q, want b@example.com", can.PDirs[0].TargetCalendar)
+	}
+}
+
+// TestCanonicalize_RejectsDirectionField is the canonicalize-level
+// integration check: Canonicalize calls Validate first, so any TOML that
+// still sets `direction` must fail the canonicalize step too. Pinned so a
+// future refactor can't accidentally bypass Validate.
+func TestCanonicalize_RejectsDirectionField(t *testing.T) {
+	c := baseConfig()
+	c.Pairs = append(c.Pairs, config.Pair{
+		Name:      "p",
+		Direction: "source_to_target",
+		Source:    "a@example.com",
+		Target:    "b@example.com",
+	})
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"a@example.com": {ID: "a@example.com", AccessRole: "owner"},
+			"b@example.com": {ID: "b@example.com", AccessRole: "owner"},
+		},
+	}
+	_, err := c.Canonicalize(context.Background(), lister)
+	if !errors.Is(err, config.ErrInvalid) {
+		t.Errorf("err = %v; want ErrInvalid", err)
 	}
 }
 
@@ -118,17 +142,15 @@ func TestCanonicalize_DisabledPairSkipped(t *testing.T) {
 	c := baseConfig()
 	c.Pairs = []config.Pair{
 		{
-			Name:      "active",
-			Direction: config.DirectionSourceToTarget,
-			Source:    "a@example.com",
-			Target:    "b@example.com",
+			Name:   "active",
+			Source: "a@example.com",
+			Target: "b@example.com",
 		},
 		{
-			Name:      "off",
-			Direction: config.DirectionBidirectional,
-			Source:    "c@example.com",
-			Target:    "d@example.com",
-			Enabled:   enabled(false),
+			Name:    "off",
+			Source:  "c@example.com",
+			Target:  "d@example.com",
+			Enabled: enabled(false),
 		},
 	}
 	lister := &stubLister{
@@ -164,10 +186,9 @@ func TestCanonicalize_SourceWritableFromAccessRole(t *testing.T) {
 		t.Run(tc.role, func(t *testing.T) {
 			c := baseConfig()
 			c.Pairs = []config.Pair{{
-				Name:      "p",
-				Direction: config.DirectionSourceToTarget,
-				Source:    "src@example.com",
-				Target:    "dst@example.com",
+				Name:   "p",
+				Source: "src@example.com",
+				Target: "dst@example.com",
 			}}
 			lister := &stubLister{
 				responses: map[string]*gws.CalendarListEntry{
@@ -187,43 +208,29 @@ func TestCanonicalize_SourceWritableFromAccessRole(t *testing.T) {
 }
 
 func TestCanonicalize_AccessRoleValidation(t *testing.T) {
-	// sourceRole/targetRole are the access roles the lister returns for
-	// the pair's literal Source/Target fields; the direction determines
-	// which side actually plays the read vs write role.
+	// Every pair is implicitly source-to-target post-v2.0.0: the TOML
+	// source side reads (needs >= reader); the TOML target side writes
+	// (needs >= writer). The pre-v2.0.0 t2s and bidi cases collapse into
+	// the s2t case: bidirectional setups now declare two pairs with
+	// swapped source/target, so each row above is independently scoped.
 	tests := []struct {
 		name        string
-		direction   string
 		sourceRole  string
 		targetRole  string
 		wantInvalid bool
 	}{
-		// source_to_target: TOML source reads, TOML target writes.
-		{"s2t source freeBusyReader rejected", config.DirectionSourceToTarget, "freeBusyReader", "owner", true},
-		{"s2t source reader OK", config.DirectionSourceToTarget, "reader", "owner", false},
-		{"s2t target reader rejected", config.DirectionSourceToTarget, "owner", "reader", true},
-		{"s2t target writer OK", config.DirectionSourceToTarget, "owner", "writer", false},
-
-		// target_to_source: roles swap. TOML target is the actual read
-		// source (needs >= reader); TOML source is the actual write
-		// target (needs >= writer). Verify the swap is wired correctly.
-		{"t2s TOML-target=freeBusyReader rejected (it's the read source)", config.DirectionTargetToSource, "owner", "freeBusyReader", true},
-		{"t2s TOML-target=reader OK (read source)", config.DirectionTargetToSource, "owner", "reader", false},
-		{"t2s TOML-source=reader rejected (it's the write target)", config.DirectionTargetToSource, "reader", "owner", true},
-		{"t2s TOML-source=writer OK", config.DirectionTargetToSource, "writer", "owner", false},
-
-		// bidirectional: both calendars play both roles, both must be writer+.
-		{"bidi with source=reader rejected", config.DirectionBidirectional, "reader", "writer", true},
-		{"bidi with target=reader rejected", config.DirectionBidirectional, "writer", "reader", true},
-		{"bidi with both writer OK", config.DirectionBidirectional, "writer", "writer", false},
+		{"source freeBusyReader rejected", "freeBusyReader", "owner", true},
+		{"source reader OK", "reader", "owner", false},
+		{"target reader rejected", "owner", "reader", true},
+		{"target writer OK", "owner", "writer", false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			c := baseConfig()
 			c.Pairs = []config.Pair{{
-				Name:      "p",
-				Direction: tc.direction,
-				Source:    "src@example.com",
-				Target:    "dst@example.com",
+				Name:   "p",
+				Source: "src@example.com",
+				Target: "dst@example.com",
 			}}
 			lister := &stubLister{
 				responses: map[string]*gws.CalendarListEntry{
@@ -252,11 +259,10 @@ func TestCanonicalize_DisabledPairAccessRoleNotValidated(t *testing.T) {
 	// config will surface the failure at the next startup.
 	c := baseConfig()
 	c.Pairs = []config.Pair{{
-		Name:      "off",
-		Direction: config.DirectionBidirectional,
-		Source:    "fr@example.com",
-		Target:    "fr2@example.com",
-		Enabled:   enabled(false),
+		Name:    "off",
+		Source:  "fr@example.com",
+		Target:  "fr2@example.com",
+		Enabled: enabled(false),
 	}}
 	lister := &stubLister{
 		responses: map[string]*gws.CalendarListEntry{
@@ -286,10 +292,9 @@ func TestCanonicalize_SourceTargetCollideAfterCanonicalization(t *testing.T) {
 	// strings differ; canonicalize must.
 	c := baseConfig()
 	c.Pairs = []config.Pair{{
-		Name:      "selfsync",
-		Direction: config.DirectionSourceToTarget,
-		Source:    "primary",
-		Target:    "alice@example.com",
+		Name:   "selfsync",
+		Source: "primary",
+		Target: "alice@example.com",
 	}}
 	lister := &stubLister{
 		responses: map[string]*gws.CalendarListEntry{
@@ -308,8 +313,8 @@ func TestCanonicalize_PDirCollisionRejected(t *testing.T) {
 	// triple is a configuration bug; we'd produce duplicate mirrors.
 	c := baseConfig()
 	c.Pairs = []config.Pair{
-		{Name: "one", Direction: config.DirectionSourceToTarget, Source: "a@example.com", Target: "b@example.com"},
-		{Name: "two", Direction: config.DirectionSourceToTarget, Source: "a@example.com", Target: "b@example.com"},
+		{Name: "one", Source: "a@example.com", Target: "b@example.com"},
+		{Name: "two", Source: "a@example.com", Target: "b@example.com"},
 	}
 	lister := &stubLister{
 		responses: map[string]*gws.CalendarListEntry{
@@ -326,10 +331,9 @@ func TestCanonicalize_PDirCollisionRejected(t *testing.T) {
 func TestCanonicalize_ListerErrorPropagates(t *testing.T) {
 	c := baseConfig()
 	c.Pairs = []config.Pair{{
-		Name:      "p",
-		Direction: config.DirectionSourceToTarget,
-		Source:    "src@example.com",
-		Target:    "dst@example.com",
+		Name:   "p",
+		Source: "src@example.com",
+		Target: "dst@example.com",
 	}}
 	wantErr := errors.New("simulated network failure")
 	lister := &stubLister{err: wantErr}
@@ -345,8 +349,8 @@ func TestCanonicalize_DedupesCalendarLookups(t *testing.T) {
 	// exactly one CalendarListGet call per distinct reference.
 	c := baseConfig()
 	c.Pairs = []config.Pair{
-		{Name: "one", Direction: config.DirectionSourceToTarget, Source: "a@example.com", Target: "b@example.com"},
-		{Name: "two", Direction: config.DirectionSourceToTarget, Source: "a@example.com", Target: "c@example.com"},
+		{Name: "one", Source: "a@example.com", Target: "b@example.com"},
+		{Name: "two", Source: "a@example.com", Target: "c@example.com"},
 	}
 	lister := &stubLister{
 		responses: map[string]*gws.CalendarListEntry{
@@ -369,11 +373,10 @@ func TestCanonicalize_DedupesCalendarLookups(t *testing.T) {
 func TestCanonicalize_PreservesTimeZoneOnPDir(t *testing.T) {
 	c := baseConfig()
 	c.Pairs = []config.Pair{{
-		Name:      "tz",
-		Direction: config.DirectionSourceToTarget,
-		Source:    "a@example.com",
-		Target:    "b@example.com",
-		TimeZone:  "America/New_York",
+		Name:     "tz",
+		Source:   "a@example.com",
+		Target:   "b@example.com",
+		TimeZone: "America/New_York",
 	}}
 	lister := &stubLister{
 		responses: map[string]*gws.CalendarListEntry{
@@ -395,8 +398,8 @@ func TestCanonicalize_PropagatesValidationFailure(t *testing.T) {
 	// must short-circuit before making any gws calls.
 	c := baseConfig()
 	c.Pairs = []config.Pair{
-		{Name: "dup", Direction: config.DirectionSourceToTarget, Source: "a@example.com", Target: "b@example.com"},
-		{Name: "dup", Direction: config.DirectionSourceToTarget, Source: "c@example.com", Target: "d@example.com"},
+		{Name: "dup", Source: "a@example.com", Target: "b@example.com"},
+		{Name: "dup", Source: "c@example.com", Target: "d@example.com"},
 	}
 	lister := &stubLister{}
 

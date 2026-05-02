@@ -30,6 +30,14 @@ type Settings struct {
 // Pair is one [[pairs]] entry. Enabled is a *bool so an unset value
 // (the common case) defaults to true; only an explicit `enabled = false`
 // disables a pair.
+//
+// Direction is the deprecated v1 field, removed in v2.0.0. The struct
+// still binds it so toml.Unmarshal can populate the value and validation
+// can reject any config that still sets it (toml.Unmarshal silently
+// ignores unknown keys, so a non-bound field would produce a confusing
+// "no effect" rather than a clear migration hint). New configs must omit
+// the field entirely; bidirectional setups declare two pairs with
+// swapped source/target.
 type Pair struct {
 	Name      string `toml:"name"`
 	Direction string `toml:"direction"`
@@ -44,13 +52,6 @@ type Pair struct {
 func (p Pair) IsEnabled() bool {
 	return p.Enabled == nil || *p.Enabled
 }
-
-// Direction values per SPEC.md "[[pairs]]" schema.
-const (
-	DirectionSourceToTarget = "source_to_target"
-	DirectionTargetToSource = "target_to_source"
-	DirectionBidirectional  = "bidirectional"
-)
 
 // Log levels per SPEC.md.
 const (

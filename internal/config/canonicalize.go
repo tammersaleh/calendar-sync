@@ -12,21 +12,24 @@ import (
 // sync: pair-direction" explains why state lives at this granularity rather
 // than per-pair.
 //
-// Direction is the single-direction string: "a_to_b" (source→target) or
-// "b_to_a" (target→source). A bidirectional pair expands to two PDirs.
+// Direction is always "a_to_b" (source→target) post-v2.0.0; the field is
+// retained for output stability (SPEC's `<pair>:<direction>` failure
+// identifier and the per-Outcome `direction` JSONL field) and to keep the
+// pdir-collision triple meaningful. Bidirectional setups declare two pairs.
 type PDir struct {
-	PairName        string
-	Direction       string
-	SourceCalendar  string // canonical ID
-	TargetCalendar  string // canonical ID
-	SourceWritable  bool   // derived from source.AccessRole
-	TimeZone        string
+	PairName       string
+	Direction      string
+	SourceCalendar string // canonical ID
+	TargetCalendar string // canonical ID
+	SourceWritable bool   // derived from source.AccessRole
+	TimeZone       string
 }
 
-// Direction values for PDir (distinct from the Pair.Direction TOML enum).
+// Direction value for PDir. Pre-v2.0.0 there was also PDirBtoA for the
+// reverse direction of a bidirectional pair; that's gone. Every pdir is
+// a_to_b now.
 const (
 	PDirAtoB = "a_to_b"
-	PDirBtoA = "b_to_a"
 )
 
 // Calendar holds the resolved view of one calendar referenced in config.
@@ -160,8 +163,10 @@ func resolveCalendars(ctx context.Context, c Config, lister CalendarLister) (
 	return resolved, refToCanonical, nil
 }
 
-// expandPDirs walks the pair list and emits one or two PDirs per pair
-// based on direction. For each emitted PDir it validates:
+// expandPDirs walks the pair list and emits one PDir per enabled pair.
+// Every pair is implicitly source-to-target (v2.0.0 dropped the
+// `direction` field; see SPEC.md "[[pairs]]"). For each emitted PDir it
+// validates:
 //   - source != target after canonicalization (catches the case where
 //     two TOML refs resolve to the same canonical ID, e.g. "primary"
 //     and the user's literal email).
@@ -193,36 +198,13 @@ func expandPDirs(c Config, calendars map[string]Calendar, refToCanonical map[str
 				ErrInvalid, p.Name, sourceCal.CanonicalID)
 		}
 
-		switch p.Direction {
-		case DirectionSourceToTarget:
-			if err := requireSource(sourceCal, p.Name); err != nil {
-				return nil, err
-			}
-			if err := requireTarget(targetCal, p.Name); err != nil {
-				return nil, err
-			}
-			out = append(out, makePDir(p, sourceCal, targetCal, PDirAtoB))
-		case DirectionTargetToSource:
-			if err := requireSource(targetCal, p.Name); err != nil {
-				return nil, err
-			}
-			if err := requireTarget(sourceCal, p.Name); err != nil {
-				return nil, err
-			}
-			out = append(out, makePDir(p, targetCal, sourceCal, PDirBtoA))
-		case DirectionBidirectional:
-			// Both calendars play both roles; both must be writable.
-			if err := requireTarget(sourceCal, p.Name); err != nil {
-				return nil, err
-			}
-			if err := requireTarget(targetCal, p.Name); err != nil {
-				return nil, err
-			}
-			out = append(out,
-				makePDir(p, sourceCal, targetCal, PDirAtoB),
-				makePDir(p, targetCal, sourceCal, PDirBtoA),
-			)
+		if err := requireSource(sourceCal, p.Name); err != nil {
+			return nil, err
 		}
+		if err := requireTarget(targetCal, p.Name); err != nil {
+			return nil, err
+		}
+		out = append(out, makePDir(p, sourceCal, targetCal))
 	}
 	return out, nil
 }
@@ -243,10 +225,10 @@ func requireTarget(cal Calendar, pairName string) error {
 	return nil
 }
 
-func makePDir(p Pair, source, target Calendar, direction string) PDir {
+func makePDir(p Pair, source, target Calendar) PDir {
 	return PDir{
 		PairName:       p.Name,
-		Direction:      direction,
+		Direction:      PDirAtoB,
 		SourceCalendar: source.CanonicalID,
 		TargetCalendar: target.CanonicalID,
 		SourceWritable: AccessRoleAtLeast(source.AccessRole, AccessRoleWriter),

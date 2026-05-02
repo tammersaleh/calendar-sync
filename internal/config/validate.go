@@ -91,10 +91,8 @@ func validatePair(idx int, p Pair) error {
 			ErrInvalid, idx, p.Name)
 	}
 
-	switch p.Direction {
-	case DirectionSourceToTarget, DirectionTargetToSource, DirectionBidirectional:
-	default:
-		return fmt.Errorf("%w: pairs[%q].direction %q must be source_to_target, target_to_source, or bidirectional",
+	if p.Direction != "" {
+		return fmt.Errorf("%w: pair %q has direction = %q; the direction field was removed in v2.0.0. Remove the field (every pair is now source-to-target); for bidirectional sync, declare two pairs with swapped source/target",
 			ErrInvalid, p.Name, p.Direction)
 	}
 

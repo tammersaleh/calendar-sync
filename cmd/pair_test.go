@@ -45,13 +45,11 @@ log_format = "json"
 
 [[pairs]]
 name = "p1"
-direction = "bidirectional"
 source = "a@example.com"
 target = "b@example.com"
 
 [[pairs]]
 name = "p2"
-direction = "bidirectional"
 source = "c@example.com"
 target = "d@example.com"
 enabled = false

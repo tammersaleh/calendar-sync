@@ -48,11 +48,10 @@ func (c *ConfigShowCmd) Run(rt *Runtime) error {
 	} else {
 		for _, p := range cfg.Pairs {
 			body.Pairs = append(body.Pairs, pairPayload{
-				Name:      p.Name,
-				Direction: p.Direction,
-				Source:    p.Source,
-				Target:    p.Target,
-				Enabled:   p.IsEnabled(),
+				Name:    p.Name,
+				Source:  p.Source,
+				Target:  p.Target,
+				Enabled: p.IsEnabled(),
 			})
 		}
 	}
@@ -65,6 +64,8 @@ func (c *ConfigShowCmd) Run(rt *Runtime) error {
 
 // pairPayloadFromCanonical returns a pairPayload populated from canonical
 // resolution: source/target are the canonical IDs (post-primary-expansion).
+// Every pdir is a_to_b in v2.0.0+, so the pdir's SourceCalendar and
+// TargetCalendar map directly to the pair's source and target.
 func pairPayloadFromCanonical(p config.Pair, canonical *config.Canonical) pairPayload {
 	source := p.Source
 	target := p.Target
@@ -72,23 +73,15 @@ func pairPayloadFromCanonical(p config.Pair, canonical *config.Canonical) pairPa
 		if pd.PairName != p.Name {
 			continue
 		}
-		// a_to_b: pdir source maps to pair source.
-		if pd.Direction == config.PDirAtoB {
-			source = pd.SourceCalendar
-			target = pd.TargetCalendar
-		} else {
-			// b_to_a: pdir source maps to pair target.
-			source = pd.TargetCalendar
-			target = pd.SourceCalendar
-		}
+		source = pd.SourceCalendar
+		target = pd.TargetCalendar
 		break
 	}
 	return pairPayload{
-		Name:      p.Name,
-		Direction: p.Direction,
-		Source:    source,
-		Target:    target,
-		Enabled:   p.IsEnabled(),
+		Name:    p.Name,
+		Source:  source,
+		Target:  target,
+		Enabled: p.IsEnabled(),
 	}
 }
 
@@ -153,13 +146,14 @@ type settingsPayload struct {
 }
 
 // pairPayload is the wire shape for one pair entry in `config show` and
-// `pair list`. SPEC line 631's example includes name/direction/source/target/enabled.
+// `pair list`. v2.0.0 dropped the `direction` field; every pair is
+// implicitly source-to-target. The PDir-level direction (always "a_to_b")
+// still surfaces in `pair test` output via pairTestPayload.
 type pairPayload struct {
-	Name      string `json:"name"`
-	Direction string `json:"direction"`
-	Source    string `json:"source"`
-	Target    string `json:"target"`
-	Enabled   bool   `json:"enabled"`
+	Name    string `json:"name"`
+	Source  string `json:"source"`
+	Target  string `json:"target"`
+	Enabled bool   `json:"enabled"`
 }
 
 // configValidatePayload is SPEC line 609's wire shape:

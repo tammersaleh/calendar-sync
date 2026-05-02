@@ -147,7 +147,6 @@ dry_run            = true
 
 [[pairs]]
 name      = "work-personal"
-direction = "bidirectional"
 source    = "work@example.com"
 target    = "personal@example.com"
 `

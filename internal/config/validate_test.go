@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -17,10 +18,9 @@ func validConfig() Config {
 		},
 		Pairs: []Pair{
 			{
-				Name:      "work-personal",
-				Direction: DirectionBidirectional,
-				Source:    "alice@example.com",
-				Target:    "alice.personal@example.org",
+				Name:   "work-personal",
+				Source: "alice@example.com",
+				Target: "alice.personal@example.org",
 			},
 		},
 	}
@@ -165,24 +165,43 @@ func TestValidate_PairNameRegex(t *testing.T) {
 	}
 }
 
-func TestValidate_PairDirection(t *testing.T) {
-	for _, dir := range []string{DirectionSourceToTarget, DirectionTargetToSource, DirectionBidirectional} {
-		t.Run("ok/"+dir, func(t *testing.T) {
+// TestValidate_RejectsDirectionField pins the v2.0.0 breaking change:
+// every non-empty direction value is rejected with a migration hint
+// pointing at the two-pair pattern. Callers who set the field on any
+// pair (regardless of value) must update their config.
+func TestValidate_RejectsDirectionField(t *testing.T) {
+	for _, dir := range []string{
+		"source_to_target",
+		"target_to_source",
+		"bidirectional",
+		"a_to_b",
+		"left_to_right",
+		"BIDIRECTIONAL",
+	} {
+		t.Run(dir, func(t *testing.T) {
 			c := validConfig()
 			c.Pairs[0].Direction = dir
-			if err := c.Validate(); err != nil {
-				t.Errorf("rejected valid direction %q: %v", dir, err)
+			err := c.Validate()
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("err = %v; want ErrInvalid for direction=%q", err, dir)
+			}
+			if !strings.Contains(err.Error(), "removed in v2.0.0") {
+				t.Errorf("err message %q missing migration hint about v2.0.0", err.Error())
+			}
+			if !strings.Contains(err.Error(), "declare two pairs") {
+				t.Errorf("err message %q missing two-pair migration hint", err.Error())
 			}
 		})
 	}
-	for _, bad := range []string{"a_to_b", "left_to_right", "BIDIRECTIONAL", ""} {
-		t.Run("bad/"+bad, func(t *testing.T) {
-			c := validConfig()
-			c.Pairs[0].Direction = bad
-			if !errors.Is(c.Validate(), ErrInvalid) {
-				t.Errorf("accepted bad direction %q", bad)
-			}
-		})
+}
+
+// TestValidate_AcceptsEmptyDirection: post-2.0.0 the field is implicit;
+// callers MUST leave it unset and the validator must not complain.
+func TestValidate_AcceptsEmptyDirection(t *testing.T) {
+	c := validConfig()
+	c.Pairs[0].Direction = ""
+	if err := c.Validate(); err != nil {
+		t.Errorf("rejected empty direction (the new default): %v", err)
 	}
 }
 
@@ -210,10 +229,9 @@ func TestValidate_ZeroPairsIsAllowed(t *testing.T) {
 func TestValidate_DuplicatePairNames(t *testing.T) {
 	c := validConfig()
 	c.Pairs = append(c.Pairs, Pair{
-		Name:      c.Pairs[0].Name,
-		Direction: DirectionSourceToTarget,
-		Source:    "x@example.com",
-		Target:    "y@example.com",
+		Name:   c.Pairs[0].Name,
+		Source: "x@example.com",
+		Target: "y@example.com",
 	})
 	if !errors.Is(c.Validate(), ErrInvalid) {
 		t.Errorf("expected ErrInvalid for duplicate pair name")

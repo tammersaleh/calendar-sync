@@ -12,9 +12,10 @@ import (
 	"github.com/tammersaleh/calendar-sync/internal/gws"
 )
 
-// validConfigTOML is the smallest config that passes Validate. Direction
-// uses target_to_source so canonicalize only requires writer access on the
-// "primary" side.
+// validConfigTOML is the smallest config that passes Validate. Post-v2.0.0
+// every pair is implicitly source-to-target, so this fixture produces a
+// single pdir (work→personal). Tests that need a second pdir declare a
+// second [[pairs]] block locally.
 const validConfigTOML = `
 [settings]
 poll_interval      = "60s"
@@ -25,7 +26,6 @@ log_format         = "json"
 
 [[pairs]]
 name      = "work-personal"
-direction = "bidirectional"
 source    = "work@example.com"
 target    = "personal@example.com"
 `
@@ -191,8 +191,8 @@ func TestConfigValidateCmd_OK(t *testing.T) {
 	if payload.Pairs != 1 {
 		t.Errorf("pairs = %d, want 1", payload.Pairs)
 	}
-	if payload.PDirs != 2 {
-		t.Errorf("pdirs = %d, want 2 (bidirectional expands to 2)", payload.PDirs)
+	if payload.PDirs != 1 {
+		t.Errorf("pdirs = %d, want 1 (every pair is one pdir post-v2.0.0)", payload.PDirs)
 	}
 }
 

@@ -43,8 +43,8 @@ func TestRunCmd_EmptySourceListEmitsMetaOnly(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[0]), &meta); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if meta.Meta.PDirs != 2 {
-		t.Errorf("pdirs = %d, want 2 (bidirectional expansion)", meta.Meta.PDirs)
+	if meta.Meta.PDirs != 1 {
+		t.Errorf("pdirs = %d, want 1 (every pair is one pdir post-v2.0.0)", meta.Meta.PDirs)
 	}
 }
 
@@ -104,12 +104,13 @@ func TestRunCmd_PairFilterNoMatchMapsToPairNotFound(t *testing.T) {
 // one fails; final exit is partial_failure with `_meta.failures` listing
 // the failed `<pair>:<direction>` identifiers.
 //
-// We trigger a single-pdir failure by failing the inventory-rebuild for
-// one target calendar. The inventory-rebuild call is distinguishable from
-// the source-list call by the PrivateExtendedProperty filter
-// (calendar-sync:version=...). For the bidirectional pair work-personal,
-// failing inventory rebuild for personal@example.com kills the a_to_b
-// pdir (target=personal) but leaves b_to_a (target=work) intact.
+// We trigger the single-pair fixture's lone pdir to fail by failing the
+// inventory-rebuild for the target calendar. The inventory-rebuild call
+// is distinguishable from the source-list call by the
+// PrivateExtendedProperty filter (calendar-sync:version=...).
+// validConfigTOML is a one-pair fixture, so this is exactly one failure
+// out of one pdir; partial_failure still fires and the failures list
+// carries the lone "work-personal:a_to_b" identifier.
 func TestRunCmd_PartialFailureCollectsAllAndEmitsFailuresList(t *testing.T) {
 	tmp := shortTempDir(t)
 	t.Setenv("TMPDIR", tmp)
@@ -219,11 +220,31 @@ func TestRunCmd_PartialFailureSurfacesUnderlyingErrorViaHandleErr(t *testing.T) 
 
 // TestRunCmd_AllPDirsFailEmitsAllFailures: when every pdir fails, the
 // failures list mirrors the full pdir list. Ensures the loop never
-// short-circuits on the first failure.
+// short-circuits on the first failure. Uses a local 2-pair fixture so
+// the test still has more than one pdir post-v2.0.0 (validConfigTOML
+// declares only one pair = one pdir).
 func TestRunCmd_AllPDirsFailEmitsAllFailures(t *testing.T) {
 	tmp := shortTempDir(t)
 	t.Setenv("TMPDIR", tmp)
-	path := writeConfigFixture(t, validConfigTOML)
+	const twoPairTOML = `
+[settings]
+poll_interval      = "60s"
+horizon            = "365d"
+full_sync_interval = "24h"
+log_level          = "info"
+log_format         = "json"
+
+[[pairs]]
+name      = "work-personal"
+source    = "work@example.com"
+target    = "personal@example.com"
+
+[[pairs]]
+name      = "personal-work"
+source    = "personal@example.com"
+target    = "work@example.com"
+`
+	path := writeConfigFixture(t, twoPairTOML)
 
 	// Fail every inventory rebuild → both pdirs fail.
 	stub := &failingInventoryGws{
@@ -621,14 +642,12 @@ func TestRunCmd_DryRun_DuplicateSourceEventNoLongerEmitsBogusMigration(t *testin
 		t.Errorf("dry-run output contains migration_source_won; B2 fix regressed.\noutput:\n%s", out)
 	}
 
-	// Parse outcome lines (skip the _meta trailer). validConfigTOML uses
-	// direction=bidirectional which expands to two pdirs (a_to_b and
-	// b_to_a). dupSourceListGws returns the same events on every
-	// source-list call, so both pdirs see the duplicate. Per-pdir dedupe
-	// at runClassifyLoop kills the second occurrence in each, leaving
-	// exactly ONE outcome per pdir = TWO outcomes total. The key
-	// post-fix invariant is that NEITHER outcome is migration_source_won
-	// AND each pdir's count is 1 (not 2).
+	// Parse outcome lines (skip the _meta trailer). validConfigTOML
+	// declares ONE pair, which expands to ONE pdir (a_to_b) post-v2.0.0.
+	// dupSourceListGws returns the same event twice; per-pdir dedupe at
+	// runClassifyLoop kills the second occurrence, leaving exactly ONE
+	// outcome. The key post-fix invariant is that the outcome is NOT
+	// migration_source_won AND the per-pdir count is 1 (not 2).
 	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
 	var outcomes []map[string]interface{}
 	for _, ln := range lines {
@@ -644,10 +663,10 @@ func TestRunCmd_DryRun_DuplicateSourceEventNoLongerEmitsBogusMigration(t *testin
 		}
 		outcomes = append(outcomes, row)
 	}
-	// 2 outcomes (one per pdir, dedupe killed the duplicates). 4 outcomes
+	// 1 outcome (single pdir, dedupe killed the duplicate). 2 outcomes
 	// would mean dedupe regressed. 0 means a different regression.
-	if len(outcomes) != 2 {
-		t.Fatalf("expected 2 outcomes (one insert per pdir, dedupe within pdir); got %d:\n%s",
+	if len(outcomes) != 1 {
+		t.Fatalf("expected 1 outcome (single insert; dedupe within the lone pdir); got %d:\n%s",
 			len(outcomes), out)
 	}
 	for _, row := range outcomes {
@@ -688,7 +707,6 @@ dry_run            = true
 
 [[pairs]]
 name      = "work-personal"
-direction = "bidirectional"
 source    = "work@example.com"
 target    = "personal@example.com"
 `
@@ -945,7 +963,6 @@ log_format         = "json"
 
 [[pairs]]
 name      = "work-personal"
-direction = "bidirectional"
 source    = "work@example.com"
 target    = "personal@example.com"
 `

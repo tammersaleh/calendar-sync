@@ -37,11 +37,10 @@ func (c *PairListCmd) Run(rt *Runtime) error {
 			continue
 		}
 		p.Emit(pairPayload{
-			Name:      pair.Name,
-			Direction: pair.Direction,
-			Source:    pair.Source,
-			Target:    pair.Target,
-			Enabled:   pair.IsEnabled(),
+			Name:    pair.Name,
+			Source:  pair.Source,
+			Target:  pair.Target,
+			Enabled: pair.IsEnabled(),
 		})
 		count++
 	}

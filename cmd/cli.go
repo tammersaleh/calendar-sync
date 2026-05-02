@@ -79,24 +79,23 @@ type Runtime struct {
 // Returns the SPEC's exit code. kong-side parse errors emit a usage line on
 // stderr and surface as exit 64 (SPEC line 398).
 //
-// SAFETY: kong's helpFlag.BeforeReset (and VersionFlag's BeforeReset)
-// terminates by calling ctx.Kong.Exit(code) and returning nil. We can't
-// let those calls hit os.Exit because tests need to drive Run() in-process.
-// The previous implementation passed `kong.Exit(func(int) {})` which made
-// Exit a no-op - so Parse returned successfully after --help and the
+// SAFETY: kong's helpFlag.BeforeReset terminates Parse by calling
+// ctx.Kong.Exit(0) and returning nil. We can't let that hit os.Exit
+// because tests need to drive Run() in-process. The previous
+// implementation passed `kong.Exit(func(int) {})` which made Exit a
+// no-op - so Parse returned successfully after --help and the
 // subcommand's Run method got dispatched anyway, performing live writes
 // (B1). The fix below captures the kong-Exit signal into a local sentinel
-// and short-circuits before kctx.Run is called, so any kong-builtin flag
-// that terminates via Exit (currently --help and --version) bypasses the
-// subcommand entirely.
+// and short-circuits before kctx.Run is called. The same mechanism would
+// catch any future kong-builtin flag that terminates via Exit (e.g. a
+// kong.VersionFlag wired into the CLI).
 func Run(args []string, stdout, stderr io.Writer) int {
 	cli := &CLI{}
 
 	// kongExitCode captures any code passed to ctx.Kong.Exit during
 	// Parse. -1 means "Exit was never called". Anything >= 0 means a
 	// kong-builtin flag asked the program to terminate with that code
-	// (--help → 0; --version → 0; kong.Fatalf → 1). We honor it by
-	// returning before subcommand dispatch.
+	// (--help → 0). We honor it by returning before subcommand dispatch.
 	kongExitCode := -1
 
 	parser, err := kong.New(cli,

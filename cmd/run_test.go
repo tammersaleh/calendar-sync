@@ -422,7 +422,6 @@ func TestDryRunAPI_EventsDeleteSuppressesWrite(t *testing.T) {
 	}
 }
 
-
 // TestRunCmd_DryRun_DuplicateSourceEventTriggersBogusMigrationSourceWon is
 // scaffolding for the eventual regression test of
 // doc/dry-run-anomaly-analysis.md anomaly #1. The user's dry-run produced

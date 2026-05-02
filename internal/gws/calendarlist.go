@@ -23,6 +23,7 @@ type CalendarListEntry struct {
 // calendarID may be the literal "primary", an email address, or a group
 // calendar ID; gws/Calendar API resolves all three.
 func (c *Client) CalendarListGet(ctx context.Context, calendarID string) (*CalendarListEntry, error) {
+	c.debug("gws.CalendarListGet", "calendar_id", calendarID)
 	paramsJSON, err := json.Marshal(map[string]any{"calendarId": calendarID})
 	if err != nil {
 		return nil, fmt.Errorf("gws calendarList.get: marshal params: %w", err)

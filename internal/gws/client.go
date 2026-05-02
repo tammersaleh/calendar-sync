@@ -14,10 +14,25 @@ import (
 	"os/exec"
 )
 
+// Logger is the minimal slice of *output.Logger the gws client consumes,
+// re-declared here to avoid an import cycle (output depends on nothing in
+// this layer; gws is the lowest layer). Production code passes
+// *output.Logger which satisfies this interface naturally.
+//
+// A nil Logger is valid: every log call short-circuits before formatting,
+// so callers (tests in particular) can leave it unset without ceremony.
+type Logger interface {
+	Debug(msg string, args ...any)
+	Info(msg string, args ...any)
+	Warn(msg string, args ...any)
+	Error(msg string, args ...any)
+}
+
 // Client invokes gws as a subprocess. Construct with New; methods correspond
 // one-to-one to the Calendar API calls SPEC.md uses.
 type Client struct {
 	binPath string
+	log     Logger
 }
 
 // Option configures a Client.
@@ -29,6 +44,14 @@ func WithBinary(path string) Option {
 	return func(c *Client) { c.binPath = path }
 }
 
+// WithLogger wires a structured logger for per-call diagnostics. Every
+// Events* method emits one debug line at entry with the params shape; nil
+// (the default) silences all log output. SPEC §"Output and Logging" defines
+// the level + format vocabulary the layer-7 daemon configures upstream.
+func WithLogger(l Logger) Option {
+	return func(c *Client) { c.log = l }
+}
+
 // New returns a Client. Without options it invokes gws by name, picking up
 // whatever is first on PATH.
 func New(opts ...Option) *Client {
@@ -37,6 +60,14 @@ func New(opts ...Option) *Client {
 		opt(c)
 	}
 	return c
+}
+
+// debug is a nil-safe wrapper around Logger.Debug. Centralizing the nil
+// check keeps the per-method log call sites uniform.
+func (c *Client) debug(msg string, args ...any) {
+	if c.log != nil {
+		c.log.Debug(msg, args...)
+	}
 }
 
 // execute runs `<binPath> <args...>` and returns stdout, stderr, exit code,

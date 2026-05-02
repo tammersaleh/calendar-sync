@@ -106,6 +106,18 @@ type Result struct {
 	MirrorParentRecurrence []string
 }
 
+// Logger is the slog-style interface the recurring handler consumes for
+// per-step diagnostics. Re-declared here to avoid an import cycle (the
+// handler can't import internal/output without dragging in printer types
+// it doesn't need). Production code passes *output.Logger which satisfies
+// this interface naturally; nil is valid (every log call short-circuits).
+type Logger interface {
+	Debug(msg string, args ...any)
+	Info(msg string, args ...any)
+	Warn(msg string, args ...any)
+	Error(msg string, args ...any)
+}
+
 // Handler reconciles one source recurring-instance exception per SPEC.md
 // §"The recurring-instance handler". Construct one per pdir; it owns no
 // mutable state, so the same Handler may be reused across many Handle
@@ -135,6 +147,17 @@ type Handler struct {
 	// ReconcileParent is the recovery callback used when the inventory
 	// lacks the source's parent (see ParentReconciler).
 	ReconcileParent ParentReconciler
+
+	// Log is the per-step diagnostic logger; nil silences output. Wired
+	// from sync.Reconciler.Log via buildClassifier.
+	Log Logger
+}
+
+// debug is a nil-safe wrapper around h.Log.Debug.
+func (h *Handler) debug(msg string, args ...any) {
+	if h.Log != nil {
+		h.Log.Debug(msg, args...)
+	}
 }
 
 // Handle reconciles one source recurring-instance exception. The caller has
@@ -153,11 +176,21 @@ type Handler struct {
 // programmer-error nil-OriginalStartTime case, ReconcileParent failures).
 // Filtering and skip outcomes return a populated Result with no error.
 func (h *Handler) Handle(ctx context.Context, source *gws.Event) (Result, error) {
+	h.debug("recurring.Handle entry",
+		"source_event", source.ID,
+		"recurring_event_id", source.RecurringEventID,
+		"summary", source.Summary,
+		"status", source.Status,
+	)
 	mirrorParent, postWriteMirrorParent, ok, err := h.resolveMirrorParent(ctx, source)
 	if err != nil {
 		return Result{}, err
 	}
 	if !ok {
+		h.debug("recurring.Handle: parent not eligible -> skip",
+			"source_event", source.ID,
+			"recurring_event_id", source.RecurringEventID,
+		)
 		return Result{Action: mirror.ActionSkip, Reason: ReasonParentNotEligible}, nil
 	}
 
@@ -172,6 +205,11 @@ func (h *Handler) Handle(ctx context.Context, source *gws.Event) (Result, error)
 		postWriteMirrorParent = parentAfterRepair
 	}
 	if status.unmaterializable {
+		h.debug("recurring.Handle: instance unmaterializable -> skip",
+			"source_event", source.ID,
+			"recurring_event_id", source.RecurringEventID,
+			"mirror_parent", mirrorParent.ID,
+		)
 		return Result{
 			Action:                 mirror.ActionSkip,
 			Reason:                 ReasonInstanceUnmaterializable,
@@ -196,9 +234,18 @@ func (h *Handler) Handle(ctx context.Context, source *gws.Event) (Result, error)
 func (h *Handler) resolveMirrorParent(ctx context.Context, source *gws.Event) (parent, postWrite *gws.Event, ok bool, err error) {
 	tuple := mirror.SourceTuple{CalendarID: h.SourceCalendarID, EventID: source.RecurringEventID}
 	if mp, found := h.LookupMirrorParent(tuple); found {
+		h.debug("recurring.resolveMirrorParent: inventory hit",
+			"source_event", source.ID,
+			"recurring_event_id", source.RecurringEventID,
+			"mirror_parent", mp.ID,
+		)
 		return mp, nil, true, nil
 	}
 
+	h.debug("recurring.resolveMirrorParent: inventory miss -> repair",
+		"source_event", source.ID,
+		"recurring_event_id", source.RecurringEventID,
+	)
 	sourceParent, err := h.API.EventsGet(ctx, h.SourceCalendarID, source.RecurringEventID)
 	if err != nil {
 		return nil, nil, false, err
@@ -209,8 +256,17 @@ func (h *Handler) resolveMirrorParent(ctx context.Context, source *gws.Event) (p
 		return nil, nil, false, err
 	}
 	if mp == nil {
+		h.debug("recurring.resolveMirrorParent: parent not eligible (ReconcileParent returned nil)",
+			"source_event", source.ID,
+			"recurring_event_id", source.RecurringEventID,
+		)
 		return nil, nil, false, nil
 	}
+	h.debug("recurring.resolveMirrorParent: parent reconciled",
+		"source_event", source.ID,
+		"recurring_event_id", source.RecurringEventID,
+		"mirror_parent", mp.ID,
+	)
 	return mp, mp, true, nil
 }
 
@@ -244,6 +300,12 @@ func (h *Handler) locateMirrorInstance(ctx context.Context, source, mirrorParent
 	if err != nil {
 		return nil, nil, instanceLocateStatus{}, err
 	}
+	h.debug("recurring.locateMirrorInstance: first try",
+		"source_event", source.ID,
+		"mirror_parent", mirrorParent.ID,
+		"original_start", originalStart,
+		"items", len(first),
+	)
 	if len(first) > 0 {
 		inst := first[0]
 		return &inst, nil, instanceLocateStatus{}, nil
@@ -252,6 +314,10 @@ func (h *Handler) locateMirrorInstance(ctx context.Context, source, mirrorParent
 	// Repair path: re-fetch the source parent, force-rewrite the mirror
 	// parent, retry the lookup once. Per SPEC.md "Zero-result instance
 	// lookup".
+	h.debug("recurring.locateMirrorInstance: repair path",
+		"source_event", source.ID,
+		"mirror_parent", mirrorParent.ID,
+	)
 	sourceParent, err := h.API.EventsGet(ctx, h.SourceCalendarID, source.RecurringEventID)
 	if err != nil {
 		return nil, nil, instanceLocateStatus{}, err
@@ -272,6 +338,11 @@ func (h *Handler) locateMirrorInstance(ctx context.Context, source, mirrorParent
 	if err != nil {
 		return nil, repaired, instanceLocateStatus{}, err
 	}
+	h.debug("recurring.locateMirrorInstance: repair retry",
+		"source_event", source.ID,
+		"repaired_parent", repaired.ID,
+		"items", len(second),
+	)
 	if len(second) == 0 {
 		return nil, repaired, instanceLocateStatus{
 			unmaterializable: true,
@@ -353,12 +424,25 @@ func (h *Handler) cancelMirrorInstance(ctx context.Context, mirrorInstance *gws.
 func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *gws.Event) (Result, error) {
 	signal := mirror.ComputeDriftSignal(source, mirrorInstance)
 	desired := mirror.BuildInstancePayload(h.SourceCalendarID, source)
+	h.debug("recurring.applyDriftMatrix",
+		"source_event", source.ID,
+		"mirror_instance", mirrorInstance.ID,
+		"source_changed", signal.SourceChanged,
+		"mirror_drifted", signal.MirrorDrifted,
+		"needs_migration", signal.NeedsMigration,
+	)
 	if signal.NeedsMigration {
 		// Per SPEC.md "Schema version migration", recompute MirrorDrifted
 		// for v1 mirrors via direct managed-field comparison rather than
 		// the missing-checksum signal which would always say true.
 		signal.MirrorDrifted = mirror.Checksum(mirror.ManagedFieldsFromEvent(mirrorInstance)) !=
 			mirror.Checksum(mirror.ManagedFieldsFromEvent(desired))
+
+		h.debug("recurring.applyDriftMatrix: migration recompute",
+			"source_event", source.ID,
+			"source_changed", signal.SourceChanged,
+			"mirror_drifted_after_recompute", signal.MirrorDrifted,
+		)
 
 		switch {
 		case !signal.SourceChanged && !signal.MirrorDrifted:

@@ -689,15 +689,18 @@ Delete mirror events from a calendar.
 
 ```
 calendar-sync mirror prune <calendar> [flags]
-  --pair <name>        Only delete mirrors created by this pair.
-  --direction <dir>    With --pair, limit to a_to_b or b_to_a.
-  --orphaned           Only delete mirrors whose source no longer exists.
-  --all                Delete every mirror calendar-sync has ever created on this calendar.
-  --dry-run            List what would be deleted, do nothing.
-  --yes, -y            Skip the interactive confirmation.
+  --pair <name>            Only delete mirrors created by this pair.
+  --direction <dir>        With --pair, limit to a_to_b or b_to_a.
+  --orphaned               Only delete mirrors whose source no longer exists.
+  --all                    Delete every mirror calendar-sync has ever created on this calendar.
+  --prune-horizon <dur>    Narrow the selection to mirrors whose start falls in [now, now+dur].
+                           Inclusive on both edges. Distinct from sync horizon - prune is a one-shot
+                           operation, not the rolling sync window.
+  --dry-run                List what would be deleted, do nothing.
+  --yes, -y                Skip the interactive confirmation.
 ```
 
-Exactly one of `--pair`, `--orphaned`, `--all` must be provided. Without `--yes`, the command prompts (TTY only).
+Exactly one of `--pair`, `--orphaned`, `--all` must be provided. Without `--yes`, the command prompts (TTY only). `--prune-horizon` is a narrowing modifier on top of one of those broad selectors; events whose start can't be parsed (or is missing) are excluded when `--prune-horizon` is set, so the user must drop the flag for a final cleanup sweep that catches them.
 
 ```
 $ calendar-sync mirror prune primary --orphaned --yes

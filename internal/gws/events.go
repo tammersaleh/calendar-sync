@@ -54,6 +54,14 @@ type eventsPage struct {
 // per-tick reconciliation", token advancement is conditional on every
 // dependent pdir succeeding.
 func (c *Client) EventsList(ctx context.Context, params EventsListParams) (events []Event, nextSyncToken string, err error) {
+	c.debug("gws.EventsList",
+		"calendar_id", params.CalendarID,
+		"sync_token", truncateToken(params.SyncToken),
+		"time_min", params.TimeMin,
+		"time_max", params.TimeMax,
+		"single_events", params.SingleEvents,
+		"private_extended_property", params.PrivateExtendedProperty,
+	)
 	paramsJSON, err := json.Marshal(params)
 	if err != nil {
 		return nil, "", fmt.Errorf("gws events.list: marshal params: %w", err)
@@ -85,12 +93,18 @@ func (c *Client) EventsList(ctx context.Context, params EventsListParams) (event
 	if n := len(pages); n > 0 {
 		nextSyncToken = pages[n-1].NextSyncToken
 	}
+	c.debug("gws.EventsList result",
+		"calendar_id", params.CalendarID,
+		"events", len(events),
+		"next_sync_token", truncateToken(nextSyncToken),
+	)
 	return events, nextSyncToken, nil
 }
 
 // EventsGet fetches a single event by (calendarID, eventID). Used for
 // orphan-walk lookups and recurring-instance parent fetches per SPEC.md.
 func (c *Client) EventsGet(ctx context.Context, calendarID, eventID string) (*Event, error) {
+	c.debug("gws.EventsGet", "calendar_id", calendarID, "event_id", eventID)
 	paramsJSON, err := json.Marshal(map[string]any{
 		"calendarId": calendarID,
 		"eventId":    eventID,
@@ -140,6 +154,14 @@ type EventsInstancesParams struct {
 // MaxResults=1) and locating a specific mirror instance by OriginalStart
 // for the recurring-instance handler.
 func (c *Client) EventsInstances(ctx context.Context, params EventsInstancesParams) ([]Event, error) {
+	c.debug("gws.EventsInstances",
+		"calendar_id", params.CalendarID,
+		"event_id", params.EventID,
+		"original_start", params.OriginalStart,
+		"time_min", params.TimeMin,
+		"time_max", params.TimeMax,
+		"max_results", params.MaxResults,
+	)
 	paramsJSON, err := json.Marshal(params)
 	if err != nil {
 		return nil, fmt.Errorf("gws events.instances: marshal params: %w", err)
@@ -169,7 +191,22 @@ func (c *Client) EventsInstances(ctx context.Context, params EventsInstancesPara
 	for _, p := range pages {
 		out = append(out, p.Items...)
 	}
+	c.debug("gws.EventsInstances result",
+		"calendar_id", params.CalendarID,
+		"event_id", params.EventID,
+		"items", len(out),
+	)
 	return out, nil
+}
+
+// truncateToken returns the first 12 chars of a sync token plus an ellipsis,
+// or the full string if shorter. Sync tokens are opaque ~80-char blobs;
+// logging the prefix is enough to correlate calls across a debug stream.
+func truncateToken(s string) string {
+	if len(s) <= 12 {
+		return s
+	}
+	return s[:12] + "..."
 }
 
 // parseNDJSONPages decodes gws --page-all output: one JSON object per line,

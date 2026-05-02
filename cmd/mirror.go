@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/tammersaleh/calendar-sync/internal/config"
 	"github.com/tammersaleh/calendar-sync/internal/gws"
@@ -90,13 +91,29 @@ func (c *MirrorListCmd) Run(rt *Runtime) error {
 // MirrorPruneCmd implements `calendar-sync mirror prune`. SPEC §"calendar-sync
 // mirror prune" lines 684-712.
 type MirrorPruneCmd struct {
-	Calendar  string `arg:"" name:"calendar" help:"Calendar ID to prune."`
-	Pair      string `name:"pair" placeholder:"<name>" help:"Only delete mirrors created by this pair."`
-	Direction string `name:"direction" placeholder:"<dir>" help:"With --pair, limit to a_to_b or b_to_a."`
-	Orphaned  bool   `name:"orphaned" help:"Only delete mirrors whose source no longer exists."`
-	All       bool   `name:"all" help:"Delete every mirror calendar-sync has ever created on this calendar."`
-	DryRun    bool   `name:"dry-run" help:"List what would be deleted, do nothing."`
-	Yes       bool   `short:"y" name:"yes" help:"Skip the interactive confirmation."`
+	Calendar     string        `arg:"" name:"calendar" help:"Calendar ID to prune."`
+	Pair         string        `name:"pair" placeholder:"<name>" help:"Only delete mirrors created by this pair."`
+	Direction    string        `name:"direction" placeholder:"<dir>" help:"With --pair, limit to a_to_b or b_to_a."`
+	Orphaned     bool          `name:"orphaned" help:"Only delete mirrors whose source no longer exists."`
+	All          bool          `name:"all" help:"Delete every mirror calendar-sync has ever created on this calendar."`
+	PruneHorizon time.Duration `name:"prune-horizon" placeholder:"<dur>" help:"Only delete mirrors whose start falls in [now, now+dur]. Inclusive on both edges. Distinct from sync horizon."`
+	DryRun       bool          `name:"dry-run" help:"List what would be deleted, do nothing."`
+	Yes          bool          `short:"y" name:"yes" help:"Skip the interactive confirmation."`
+
+	// now is a test-injection hook for the prune-horizon window. Production
+	// leaves it nil (currentTime falls back to time.Now). kong ignores
+	// unexported fields.
+	now func() time.Time
+}
+
+// currentTime returns the wall-clock used to anchor --prune-horizon's
+// [now, now+dur] window. Tests assign c.now to a fixed function;
+// production uses time.Now.
+func (c *MirrorPruneCmd) currentTime() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
 }
 
 // Run validates the selector, builds the deletion candidate list, prompts
@@ -121,9 +138,26 @@ func (c *MirrorPruneCmd) Run(rt *Runtime) error {
 	}
 
 	candidates := []mirrorRow{}
+	var horizonNow, horizonEnd time.Time
+	if c.PruneHorizon > 0 {
+		horizonNow = c.currentTime()
+		horizonEnd = horizonNow.Add(c.PruneHorizon)
+	}
 	for _, m := range mirrors {
+		// listMirrors uses ShowDeleted:true so it returns tombstones (events
+		// previously deleted via events.delete; status=cancelled). Calling
+		// events.delete on those returns api_invalid_request "Resource has
+		// been deleted" - not a NotFound the existing carry-on branch
+		// catches. Skip them entirely; there's nothing to do for an
+		// already-deleted event.
+		if m.Status == gws.EventStatusCancelled {
+			continue
+		}
 		row, ok := buildMirrorRow(m, pdLookup, c.Pair, c.Direction)
 		if !ok {
+			continue
+		}
+		if c.PruneHorizon > 0 && !inPruneHorizonWindow(m.Start, horizonNow, horizonEnd) {
 			continue
 		}
 		if c.Orphaned {
@@ -345,6 +379,29 @@ func sourceAlive(ctx context.Context, api syncpkg.API, tuple mirror.SourceTuple)
 		return false, nil
 	}
 	return true, nil
+}
+
+// inPruneHorizonWindow returns true iff the event's start falls in
+// [now, end] (inclusive). Events without a parseable start are excluded -
+// the user must drop --prune-horizon to clean those up.
+func inPruneHorizonWindow(start *gws.EventDateTime, now, end time.Time) bool {
+	if start == nil {
+		return false
+	}
+	var t time.Time
+	var err error
+	switch {
+	case start.DateTime != "":
+		t, err = time.Parse(time.RFC3339, start.DateTime)
+	case start.Date != "":
+		t, err = time.Parse("2006-01-02", start.Date)
+	default:
+		return false
+	}
+	if err != nil {
+		return false
+	}
+	return !t.Before(now) && !t.After(end)
 }
 
 // validatePruneSelector enforces SPEC's "exactly one of --pair, --orphaned,

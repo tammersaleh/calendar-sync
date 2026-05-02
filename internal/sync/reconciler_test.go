@@ -1202,3 +1202,77 @@ func TestWithPropagateTargetEdits_OptionApplies(t *testing.T) {
 		t.Error("WithPropagateTargetEdits(true) did not apply")
 	}
 }
+
+// TestRunClassifyLoop_DedupesSourceTuple pins B2 Cause B
+// (doc/dry-run-anomaly-analysis.md anomaly #1): when events.list returns
+// the same source-tuple twice (typically because a `_R<timestamp>`-shaped
+// recurring parent appears both as a top-level event and as a
+// `recurring_event_id` on its child instances), the per-event classify
+// loop must process it exactly once.
+//
+// The bug surfaces in dry-run as a bogus migration_source_won outcome on
+// the second pass: the first call inserts the mirror with a broken
+// extended-properties cache (Cause A), then the second call sees the
+// broken cache and routes to the migration matrix.
+//
+// Production semantics aren't affected by Cause B alone (the second
+// Classify on a real Calendar API would just emit `skip(unchanged)`),
+// but the dedupe is a correctness safeguard regardless: a second pass
+// on the same source-tuple is at best a wasted RTT and at worst (with
+// the dryRunAPI defect) a misleading outcome.
+//
+// Behavior under the fix: only ONE outcome (the insert from the first
+// occurrence). The duplicate is silently skipped - no `skip(reason=...)`
+// emitted because SPEC's outcomes table doesn't define a reason for
+// "duplicate within the same classify pass" and inventing one would
+// surface as wire-format noise.
+func TestRunClassifyLoop_DedupesSourceTuple(t *testing.T) {
+	api := newStubAPI()
+	pd := makeTestPDir("p1", "src-A", "tgt-A", true)
+	canonical := makeCanonical(pd)
+
+	// Two copies of the same source event in the source-list response.
+	// This is the production shape `_R<timestamp>` recurring parents
+	// produce per the dry-run-anomaly-analysis.md doc.
+	src := makeNonRecurringSource("evt-1", "2026-04-29T20:00:00Z",
+		&gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"})
+	api.queueListFull("src-A", []gws.Event{*src, *src}, "token-1")
+	queueEmptyInventory(api, "tgt-A")
+
+	// Single insert + checksum patch from the first occurrence. We do NOT
+	// queue a second insert; if the loop runs Classify twice for the same
+	// source-tuple, the second call would consume the next queued response
+	// (or fail if the queue is empty), and the assertion below catches it.
+	insertedID := "cs2DEADBEEF"
+	inserted := &gws.Event{ID: insertedID, Summary: src.Summary, Updated: "2026-04-29T20:00:01Z"}
+	api.queueInsert(inserted)
+	api.queuePatch(inserted)
+
+	sink, captured := captureOutputs()
+	r := newTestReconciler(api, canonical)
+	r.Output = sink
+
+	res, err := r.FullSync(context.Background())
+	if err != nil {
+		t.Fatalf("FullSync error: %v", err)
+	}
+	pr, _ := pdirByPair(res.PDirs, "p1")
+	if pr.Err != nil {
+		t.Errorf("pdir failed: %v", pr.Err)
+	}
+	// Exactly one outcome - the insert. The duplicate occurrence is
+	// silently skipped at the top of the per-event loop.
+	if len(*captured) != 1 {
+		t.Errorf("got %d outcomes, want 1; outcomes=%+v", len(*captured), *captured)
+	} else if (*captured)[0].Action != mirror.ActionInsert {
+		t.Errorf("expected one insert outcome; got %+v", (*captured)[0])
+	}
+	if pr.Counts.Inserts != 1 {
+		t.Errorf("Counts.Inserts = %d, want 1", pr.Counts.Inserts)
+	}
+	if pr.Counts.EventsProcessed != 1 {
+		t.Errorf("Counts.EventsProcessed = %d, want 1 "+
+			"(dedupe must NOT count the duplicate as processed)",
+			pr.Counts.EventsProcessed)
+	}
+}

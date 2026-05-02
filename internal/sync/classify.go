@@ -89,6 +89,17 @@ type Classifier struct {
 	Inventory        *Inventory
 	Recurring        *recurring.Handler
 	Output           Output
+	// Log is the per-step diagnostic logger; nil silences output. The
+	// reconciler-side wiring populates this from the Reconciler's Log
+	// field; tests typically leave it nil.
+	Log Logger
+}
+
+// debug is a nil-safe wrapper around c.Log.Debug.
+func (c *Classifier) debug(msg string, args ...any) {
+	if c.Log != nil {
+		c.Log.Debug(msg, args...)
+	}
 }
 
 // Classify runs SPEC.md "Classification logic" 8-step switch for one

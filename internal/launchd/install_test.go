@@ -64,6 +64,7 @@ func TestInstall_HappyPath(t *testing.T) {
 	runner := &stubRunner{}
 	cfg := Config{
 		BinaryPath: "/usr/local/bin/calendar-sync",
+		ConfigPath: "/Users/alice/.config/calendar-sync/config.toml",
 	}
 	res, err := Install(context.Background(), cfg, runner)
 	if err != nil {
@@ -109,6 +110,9 @@ func TestInstall_HappyPath(t *testing.T) {
 		filepath.Join(logDir, "calendar-sync.err.log"),
 		"<key>Label</key><string>org.calendar-sync.agent</string>",
 		DefaultPATH,
+		// B7: config-path WatchPaths entry.
+		"<key>WatchPaths</key>",
+		"<string>/Users/alice/.config/calendar-sync/config.toml</string>",
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("plist body missing %q", want)
@@ -139,6 +143,7 @@ func TestInstall_NoLoad(t *testing.T) {
 	cfg := Config{
 		BinaryPath: "/path/to/calendar-sync",
 		NoLoad:     true,
+		ConfigPath: "/Users/alice/.config/calendar-sync/config.toml",
 	}
 	res, err := Install(context.Background(), cfg, runner)
 	if err != nil {
@@ -162,6 +167,7 @@ func TestInstall_NoLoad_NilRunner(t *testing.T) {
 	cfg := Config{
 		BinaryPath: "/path/to/calendar-sync",
 		NoLoad:     true,
+		ConfigPath: "/Users/alice/.config/calendar-sync/config.toml",
 	}
 	if _, err := Install(context.Background(), cfg, nil); err != nil {
 		t.Errorf("Install with NoLoad+nil runner: %v", err)
@@ -181,7 +187,10 @@ func TestInstall_PlistExistsErr(t *testing.T) {
 	}
 
 	runner := &stubRunner{}
-	cfg := Config{BinaryPath: "/bin/calendar-sync"}
+	cfg := Config{
+		BinaryPath: "/bin/calendar-sync",
+		ConfigPath: "/Users/alice/.config/calendar-sync/config.toml",
+	}
 	_, err := Install(context.Background(), cfg, runner)
 	if !errors.Is(err, ErrPlistExists) {
 		t.Fatalf("err = %v, want ErrPlistExists", err)
@@ -217,6 +226,7 @@ func TestInstall_ForceOverwrites(t *testing.T) {
 	cfg := Config{
 		BinaryPath: "/usr/local/bin/calendar-sync",
 		Force:      true,
+		ConfigPath: "/Users/alice/.config/calendar-sync/config.toml",
 	}
 	res, err := Install(context.Background(), cfg, runner)
 	if err != nil {
@@ -248,7 +258,10 @@ func TestInstall_LaunchctlNonZero(t *testing.T) {
 			{stderr: []byte("Bootstrap failed: 5: Input/output error"), exitCode: 5},
 		},
 	}
-	cfg := Config{BinaryPath: "/bin/calendar-sync"}
+	cfg := Config{
+		BinaryPath: "/bin/calendar-sync",
+		ConfigPath: "/Users/alice/.config/calendar-sync/config.toml",
+	}
 	_, err := Install(context.Background(), cfg, runner)
 	if !errors.Is(err, ErrLaunchctlFailed) {
 		t.Fatalf("err = %v, want ErrLaunchctlFailed", err)
@@ -274,7 +287,10 @@ func TestInstall_LaunchctlSubprocessErr(t *testing.T) {
 			{err: errors.New("exec: launchctl: not found"), exitCode: -1},
 		},
 	}
-	cfg := Config{BinaryPath: "/bin/calendar-sync"}
+	cfg := Config{
+		BinaryPath: "/bin/calendar-sync",
+		ConfigPath: "/Users/alice/.config/calendar-sync/config.toml",
+	}
 	_, err := Install(context.Background(), cfg, runner)
 	if !errors.Is(err, ErrLaunchctlFailed) {
 		t.Fatalf("err = %v, want ErrLaunchctlFailed", err)
@@ -312,6 +328,7 @@ func TestInstall_CustomLogDir(t *testing.T) {
 	cfg := Config{
 		BinaryPath: "/bin/calendar-sync",
 		LogDir:     "~/custom-logs",
+		ConfigPath: "/Users/alice/.config/calendar-sync/config.toml",
 	}
 	res, err := Install(context.Background(), cfg, runner)
 	if err != nil {
@@ -345,6 +362,7 @@ func TestInstall_CustomLabel(t *testing.T) {
 	cfg := Config{
 		BinaryPath: "/bin/calendar-sync",
 		Label:      "org.example.calsync",
+		ConfigPath: "/Users/alice/.config/calendar-sync/config.toml",
 	}
 	res, err := Install(context.Background(), cfg, runner)
 	if err != nil {

@@ -8,7 +8,7 @@ import (
 
 // TestRenderPlist_HappyPath renders the SPEC template with sample inputs
 // and asserts the resulting bytes match SPEC §"calendar-sync install"
-// example (lines 766-787) once the substitutions are applied.
+// example (lines 766-787) plus the WatchPaths directive (B7).
 func TestRenderPlist_HappyPath(t *testing.T) {
 	got, err := renderPlist(plistInputs{
 		Label:      "org.calendar-sync.agent",
@@ -16,6 +16,7 @@ func TestRenderPlist_HappyPath(t *testing.T) {
 		StdoutPath: "/Users/alice/Library/Logs/calendar-sync/calendar-sync.out.log",
 		StderrPath: "/Users/alice/Library/Logs/calendar-sync/calendar-sync.err.log",
 		PATH:       DefaultPATH,
+		ConfigPath: "/Users/alice/.config/calendar-sync/config.toml",
 	})
 	if err != nil {
 		t.Fatalf("renderPlist: %v", err)
@@ -40,6 +41,10 @@ func TestRenderPlist_HappyPath(t *testing.T) {
     <dict>
         <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
+    <key>WatchPaths</key>
+    <array>
+        <string>/Users/alice/.config/calendar-sync/config.toml</string>
+    </array>
 </dict>
 </plist>
 `
@@ -59,6 +64,7 @@ func TestRenderPlist_ParsesAsValidXML(t *testing.T) {
 		StdoutPath: "/tmp/out.log",
 		StderrPath: "/tmp/err.log",
 		PATH:       "/usr/bin",
+		ConfigPath: "/tmp/config.toml",
 	})
 	if err != nil {
 		t.Fatalf("renderPlist: %v", err)
@@ -87,6 +93,7 @@ func TestRenderPlist_RejectsEmptyFields(t *testing.T) {
 		StdoutPath: "O",
 		StderrPath: "E",
 		PATH:       "P",
+		ConfigPath: "C",
 	}
 	cases := []struct {
 		name string
@@ -97,6 +104,7 @@ func TestRenderPlist_RejectsEmptyFields(t *testing.T) {
 		{"stdout empty", func(p *plistInputs) { p.StdoutPath = "" }},
 		{"stderr empty", func(p *plistInputs) { p.StderrPath = "" }},
 		{"path empty", func(p *plistInputs) { p.PATH = "" }},
+		{"config empty", func(p *plistInputs) { p.ConfigPath = "" }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -119,6 +127,7 @@ func TestRenderPlist_SubstitutesAllFields(t *testing.T) {
 		StdoutPath: "OUT_SENTINEL",
 		StderrPath: "ERR_SENTINEL",
 		PATH:       "PATH_SENTINEL",
+		ConfigPath: "CONFIG_SENTINEL",
 	})
 	if err != nil {
 		t.Fatalf("renderPlist: %v", err)
@@ -129,9 +138,53 @@ func TestRenderPlist_SubstitutesAllFields(t *testing.T) {
 		"OUT_SENTINEL",
 		"ERR_SENTINEL",
 		"PATH_SENTINEL",
+		"CONFIG_SENTINEL",
 	} {
 		if !strings.Contains(string(got), want) {
 			t.Errorf("output missing %q", want)
 		}
 	}
 }
+
+// TestRenderPlist_WatchPathsContainsConfig pins B7: the rendered plist
+// includes a launchd `WatchPaths` directive listing the resolved config
+// path. launchd watches the listed paths and restarts the daemon when
+// any of them is modified - because the daemon's startup re-reads
+// config.toml from disk, a launchd-driven restart IS the config reload.
+//
+// Without this directive, editing config.toml requires
+// `calendar-sync uninstall && calendar-sync install` per SPEC line 971.
+// With it, the editor-save-and-rename pattern most editors use triggers
+// a kqueue event launchd interprets as "file changed" and the daemon
+// restarts within seconds.
+//
+// The XML structure launchd expects is:
+//
+//	<key>WatchPaths</key>
+//	<array>
+//	    <string>/path/to/config.toml</string>
+//	</array>
+//
+// We assert on the textual substring rather than parsing the full XML
+// because the surrounding plist tests (TestRenderPlist_HappyPath,
+// TestRenderPlist_ParsesAsValidXML) already pin XML correctness.
+func TestRenderPlist_WatchPathsContainsConfig(t *testing.T) {
+	got, err := renderPlist(plistInputs{
+		Label:      "org.calendar-sync.agent",
+		BinaryPath: "/usr/local/bin/calendar-sync",
+		StdoutPath: "/tmp/out.log",
+		StderrPath: "/tmp/err.log",
+		PATH:       DefaultPATH,
+		ConfigPath: "/Users/alice/.config/calendar-sync/config.toml",
+	})
+	if err != nil {
+		t.Fatalf("renderPlist: %v", err)
+	}
+	if !strings.Contains(string(got), "<key>WatchPaths</key>") {
+		t.Errorf("plist missing <key>WatchPaths</key>; got:\n%s", got)
+	}
+	if !strings.Contains(string(got), "<string>/Users/alice/.config/calendar-sync/config.toml</string>") {
+		t.Errorf("plist missing config path inside WatchPaths; got:\n%s", got)
+	}
+}
+

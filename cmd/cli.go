@@ -63,6 +63,12 @@ type Runtime struct {
 	// Production-mode gws.New(...) is constructed lazily inside the
 	// subcommand methods that need it; tests assign Gws to override.
 	Gws GwsClient
+
+	// Logger is the structured-log sink wired from --log-level / --log-format
+	// (or the matching settings.toml values). nil is valid: every log call
+	// short-circuits before formatting. Subcommand Run methods read this
+	// when they want to emit per-step diagnostics.
+	Logger *output.Logger
 }
 
 // Run is the package's main entry point. main.go calls Run with
@@ -72,15 +78,32 @@ type Runtime struct {
 //
 // Returns the SPEC's exit code. kong-side parse errors emit a usage line on
 // stderr and surface as exit 64 (SPEC line 398).
+//
+// SAFETY: kong's helpFlag.BeforeReset terminates Parse by calling
+// ctx.Kong.Exit(0) and returning nil. We can't let that hit os.Exit
+// because tests need to drive Run() in-process. The previous
+// implementation passed `kong.Exit(func(int) {})` which made Exit a
+// no-op - so Parse returned successfully after --help and the
+// subcommand's Run method got dispatched anyway, performing live writes
+// (B1). The fix below captures the kong-Exit signal into a local sentinel
+// and short-circuits before kctx.Run is called. The same mechanism would
+// catch any future kong-builtin flag that terminates via Exit (e.g. a
+// kong.VersionFlag wired into the CLI).
 func Run(args []string, stdout, stderr io.Writer) int {
 	cli := &CLI{}
+
+	// kongExitCode captures any code passed to ctx.Kong.Exit during
+	// Parse. -1 means "Exit was never called". Anything >= 0 means a
+	// kong-builtin flag asked the program to terminate with that code
+	// (--help → 0). We honor it by returning before subcommand dispatch.
+	kongExitCode := -1
 
 	parser, err := kong.New(cli,
 		kong.Name("calendar-sync"),
 		kong.Description("Google Calendar event mirroring tool."),
 		kong.Writers(stdout, stderr),
 		kong.UsageOnError(),
-		kong.Exit(func(int) {}),
+		kong.Exit(func(code int) { kongExitCode = code }),
 	)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -94,11 +117,20 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return 64
 	}
 
+	// If a kong-builtin flag (--help, --version, ...) called Exit during
+	// Parse, return that code now. Crucially: do NOT dispatch the
+	// subcommand. helpFlag's BeforeReset prints the usage to stdout and
+	// then calls Exit(0); the user wanted help, not the subcommand.
+	if kongExitCode >= 0 {
+		return kongExitCode
+	}
+
 	rt := &Runtime{
 		Stdout:  stdout,
 		Stderr:  stderr,
 		Globals: cli.Globals,
 		Ctx:     signalContext(),
+		Logger:  output.NewLogger(stderr, cli.Globals.LogFormat, cli.Globals.LogLevel),
 	}
 	if cli.Globals.Quiet {
 		rt.Stdout = nil
@@ -125,6 +157,13 @@ func signalContext() context.Context {
 // handleErr maps a subcommand's returned error to SPEC's stderr envelope
 // and returns the exit code to bubble up to the OS. The returned int is
 // always non-zero on a non-nil err.
+//
+// SPEC line 384's ErrorEnvelope has a `cause` field for the underlying
+// error message; we populate it from errors.Unwrap so a partial_failure
+// (where detail is just the pdir-name list) still surfaces the gws/Calendar
+// error that triggered the failure. Without the cause, an operator seeing
+// `{"error":"partial_failure","detail":"1 pdir(s) failed: foo:a_to_b"}` has
+// no idea WHY foo:a_to_b failed.
 func handleErr(stderr io.Writer, err error) int {
 	// kong-injected usage errors carry their own code; surface as 64.
 	var parseErr *kong.ParseError
@@ -133,12 +172,38 @@ func handleErr(stderr io.Writer, err error) int {
 		return 64
 	}
 	code, detail, hint := MapError(err)
+	cause := unwrapCause(err)
 	output.EmitError(stderr, output.ErrorEnvelope{
 		Error:  code,
 		Detail: detail,
 		Hint:   hint,
+		Cause:  cause,
 	})
 	return output.ExitCodeFor(code)
+}
+
+// unwrapCause returns the underlying-cause text used to populate
+// ErrorEnvelope.Cause. For *cmdError (the common case) it reads the
+// cause field directly; that field's Error() handles whatever shape the
+// cause is (single error, fmt.Errorf chain, errors.Join multi-error).
+// For non-cmdError types it falls back to errors.Unwrap and returns the
+// wrapped error's Error() text, or "" if there's no wrap.
+//
+// Reading cmdError.cause directly rather than going through errors.Unwrap
+// is what makes errors.Join causes work: errors.Unwrap on a joinError
+// returns nil (joinError implements Unwrap() []error, not Unwrap() error),
+// which would otherwise drop the Cause field via omitempty even though
+// the joined Error() text is exactly what operators need.
+func unwrapCause(err error) string {
+	var ce *cmdError
+	if errors.As(err, &ce) && ce.cause != nil {
+		return ce.cause.Error()
+	}
+	cause := errors.Unwrap(err)
+	if cause == nil {
+		return ""
+	}
+	return cause.Error()
 }
 
 // printer constructs the per-command JSONL Printer using the runtime's

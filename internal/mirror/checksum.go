@@ -34,6 +34,7 @@ type EventDateTime struct {
 type ManagedFields struct {
 	Description  string        `json:"description"`
 	End          EventDateTime `json:"end"`
+	Location     string        `json:"location"`
 	Recurrence   []string      `json:"recurrence,omitempty"`
 	Start        EventDateTime `json:"start"`
 	Summary      string        `json:"summary"`

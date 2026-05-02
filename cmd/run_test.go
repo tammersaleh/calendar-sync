@@ -15,6 +15,7 @@ import (
 
 	"github.com/tammersaleh/calendar-sync/internal/config"
 	"github.com/tammersaleh/calendar-sync/internal/gws"
+	"github.com/tammersaleh/calendar-sync/internal/mirror"
 )
 
 func TestRunCmd_EmptySourceListEmitsMetaOnly(t *testing.T) {
@@ -371,7 +372,7 @@ func TestDryRunAPI_PatchMergesIntoCachedInsertResource(t *testing.T) {
 			Private: map[string]string{
 				"calendar-sync:source":         "alice@example.com:src-evt",
 				"calendar-sync:source_updated": "2026-04-29T20:00:00Z",
-				"calendar-sync:version":        "2",
+				"calendar-sync:version":        mirror.SchemaVersion,
 			},
 		},
 	}
@@ -406,7 +407,7 @@ func TestDryRunAPI_PatchMergesIntoCachedInsertResource(t *testing.T) {
 	wantPrivate := map[string]string{
 		"calendar-sync:source":         "alice@example.com:src-evt",
 		"calendar-sync:source_updated": "2026-04-29T20:00:00Z",
-		"calendar-sync:version":        "2",
+		"calendar-sync:version":        mirror.SchemaVersion,
 		"calendar-sync:checksum":       "deadbeef",
 	}
 	for k, want := range wantPrivate {
@@ -494,7 +495,7 @@ func TestDryRunAPI_DeleteClearsCache(t *testing.T) {
 		ID:      "evt",
 		Summary: "v1",
 		ExtendedProperties: &gws.ExtendedProperties{
-			Private: map[string]string{"calendar-sync:version": "2"},
+			Private: map[string]string{"calendar-sync:version": mirror.SchemaVersion},
 		},
 	}
 	if _, err := api.EventsInsert(ctx, "cal", insertBody); err != nil {

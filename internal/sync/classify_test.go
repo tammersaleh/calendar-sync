@@ -1249,6 +1249,87 @@ func TestClassify_Step8_V1Mirror_BothChanged_MigrationSourceWon(t *testing.T) {
 	}
 }
 
+// TestClassify_Step8_V2Mirror_NeedsMigration_PatchesAsMigrationUpgrade pins
+// the v2 -> v3 migration path. With SchemaVersion bumped to "3", a mirror
+// stored at version="2" reports NeedsMigration=true via ComputeDriftSignal,
+// even though it carries a real checksum. The migration cell with no actual
+// drift (live managed fields match desired) routes to migration_upgrade
+// (rewrite mirror with version=3 + fresh checksum), NOT skip(unchanged).
+//
+// Builds the v2 mirror manually with version="2" rather than mirror.SchemaVersion
+// so this test exercises the v2 -> v3 cell specifically; if SchemaVersion
+// is bumped again this fixture stays version="2" and continues to pin the
+// migration path for legacy mirrors.
+func TestClassify_Step8_V2Mirror_NeedsMigration_PatchesAsMigrationUpgrade(t *testing.T) {
+	api := newStubAPI()
+	inv := NewInventory("tgt-cal")
+	sink, captured := captureOutputs()
+
+	source := makeNonRecurringSource("src-evt", "2026-04-29T20:00:00Z", &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"})
+
+	desired := mirror.BuildPayload("src-cal", source)
+	mirrorEv := &gws.Event{
+		ID:           "mi-1",
+		Status:       gws.EventStatusConfirmed,
+		Summary:      desired.Summary,
+		Description:  desired.Description,
+		Start:        desired.Start,
+		End:          desired.End,
+		Transparency: desired.Transparency,
+		Visibility:   desired.Visibility,
+		Updated:      source.Updated,
+		ExtendedProperties: &gws.ExtendedProperties{
+			Private: map[string]string{
+				mirror.ExtKeySource:        "src-cal:src-evt",
+				mirror.ExtKeySourceUpdated: source.Updated,
+				mirror.ExtKeyVersion:       "2",
+				// A v2 mirror DOES have a checksum, but it was computed over
+				// the v2 ManagedFields (no Location). The checksum here is
+				// arbitrary; ComputeDriftSignal sees version != SchemaVersion
+				// and routes to the migration path before consulting the
+				// stored checksum.
+				mirror.ExtKeyChecksum: "sha256:legacy-v2-checksum",
+			},
+		},
+	}
+	inv.Set(mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt"}, mirrorEv)
+
+	postMain := *mirrorEv
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+
+	c := newClassifier(t, api, inv, sink, classifyOptions{sourceWritable: true})
+	if err := c.Classify(context.Background(), source); err != nil {
+		t.Fatalf("Classify error: %v", err)
+	}
+	got := firstOutcome(t, *captured)
+	if got.Action != mirror.ActionPatch || got.Reason != ReasonMigrationUpgrade {
+		t.Errorf("got %s/%s, want patch/migration_upgrade", got.Action, got.Reason)
+	}
+	if got.Conflict != mirror.ConflictNone {
+		t.Errorf("migration_upgrade should have no conflict; got %q", got.Conflict)
+	}
+	patches := api.callsByOp("EventsPatch")
+	if len(patches) != 2 {
+		t.Fatalf("expected 2 patches (main + checksum); got %d", len(patches))
+	}
+	// Main patch body must carry the new SchemaVersion ("3") in the
+	// extended properties - that's the whole point of the upgrade.
+	body := patches[0].Body
+	if body == nil || body.ExtendedProperties == nil {
+		t.Fatal("main patch body missing ExtendedProperties")
+	}
+	if v := body.ExtendedProperties.Private[mirror.ExtKeyVersion]; v != mirror.SchemaVersion {
+		t.Errorf("main patch body version = %q, want %q", v, mirror.SchemaVersion)
+	}
+	// Migration upgrade must NOT touch the source.
+	for _, c := range api.calls {
+		if c.Op == "EventsPatch" && c.CalendarID == "src-cal" {
+			t.Errorf("migration_upgrade must not patch source; got %v", c)
+		}
+	}
+}
+
 // ---------- error propagation ----------
 
 func TestClassify_DeleteErrorPropagates(t *testing.T) {

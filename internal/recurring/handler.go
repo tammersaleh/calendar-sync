@@ -405,22 +405,25 @@ func (h *Handler) cancelMirrorInstance(ctx context.Context, mirrorInstance *gws.
 }
 
 // applyDriftMatrix applies SPEC.md "Drift detection model" / "Schema
-// version migration" four-way matrix to the located mirror instance. v1
-// mirrors get the live-vs-desired drift recomputation per SPEC's
-// migration rules.
+// version migration" four-way matrix to the located mirror instance.
+// Legacy mirrors (any version != current SchemaVersion) get the live-vs-
+// desired drift recomputation per SPEC's migration rules.
 //
-// Two cells of the v1 matrix diverge from the v2 matrix and are handled
-// here directly rather than by mirror.Classify:
+// Two cells of the migration matrix diverge from the standard matrix and
+// are handled here directly rather than by mirror.Classify:
 //
 //   - !source_changed && !mirror_drifted: SPEC routes this to
-//     patch+migration_upgrade (rewrite to add :checksum and bump :version
-//     to 2). v2 would skip(unchanged).
+//     patch+migration_upgrade (rewrite at the current SchemaVersion with
+//     a fresh checksum, picking up any new managed fields). The standard
+//     matrix would skip(unchanged).
 //   - source_changed && mirror_drifted: SPEC says source-wins-by-default
-//     during migration (no reliable user-edit timestamp to compare against
-//     for newer-wins). v2 uses newer-wins via Classify.
+//     during migration (v1 mirrors lack a reliable user-edit timestamp
+//     for newer-wins; v2 mirrors keep the same simpler behavior so the
+//     migration cell stays consistent across legacy versions). The
+//     standard matrix uses newer-wins via Classify.
 //
-// The other two cells (source-only, mirror-only) match the v2 behavior, so
-// after the recompute we fall through to Classify for those.
+// The other two cells (source-only, mirror-only) match the standard
+// behavior, so after the recompute we fall through to Classify for those.
 func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *gws.Event) (Result, error) {
 	signal := mirror.ComputeDriftSignal(source, mirrorInstance)
 	desired := mirror.BuildInstancePayload(h.SourceCalendarID, source)
@@ -446,10 +449,10 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 
 		switch {
 		case !signal.SourceChanged && !signal.MirrorDrifted:
-			// SPEC migration_upgrade: rewrite the mirror with version=2 and
-			// a fresh checksum. BuildInstancePayload already sets version=2
-			// in extended properties, so a normal patch+checksum-followup
-			// is the right shape.
+			// SPEC migration_upgrade: rewrite the mirror at the current
+			// SchemaVersion with a fresh checksum. BuildInstancePayload
+			// writes the current version in extended properties, so a
+			// normal patch+checksum-followup is the right shape.
 			desired.ID = ""
 			post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, desired)
 			if err != nil {

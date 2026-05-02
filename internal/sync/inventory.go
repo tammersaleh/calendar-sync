@@ -99,11 +99,12 @@ func (i *Inventory) Tuples() []mirror.SourceTuple {
 	return out
 }
 
-// BuildInventory runs SPEC.md "Mirror inventory rebuild": two events.list
-// calls (privateExtendedProperty=calendar-sync:version=2 then version=1),
-// merged into one map keyed by source-tuple. v1 entries are kept in
-// inventory; the sync layer detects them at reconciliation time via
-// mirror.ComputeDriftSignal's NeedsMigration field.
+// BuildInventory runs SPEC.md "Mirror inventory rebuild": one events.list
+// call per known schema version (current SchemaVersion plus every legacy
+// version still in the wild), merged into one map keyed by source-tuple.
+// Legacy entries are kept in inventory; the sync layer detects them at
+// reconciliation time via mirror.ComputeDriftSignal's NeedsMigration field
+// and routes them through the migration path.
 //
 // Mirrors that lack a parseable calendar-sync:source extended property are
 // skipped with their tuple effectively dropped on the floor; SPEC.md
@@ -117,9 +118,11 @@ func (i *Inventory) Tuples() []mirror.SourceTuple {
 func BuildInventory(ctx context.Context, api API, target string, log Logger) (*Inventory, error) {
 	inv := NewInventory(target)
 
-	// Two passes: v2 first, then v1. The order is for SPEC documentation
-	// fidelity; v2 mirrors are the common case and most relevant.
-	for _, version := range []string{mirror.SchemaVersion, "1"} {
+	// One pass per known schema version: current first (the common case),
+	// then every legacy version that may still exist on user calendars.
+	// Legacy entries are merged into the same inventory; reconciliation
+	// time decides whether to migrate them.
+	for _, version := range []string{mirror.SchemaVersion, "2", "1"} {
 		params := gws.EventsListParams{
 			CalendarID:             target,
 			ShowDeleted:            true,

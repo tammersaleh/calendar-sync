@@ -11,16 +11,16 @@ func TestChecksum(t *testing.T) {
 	// + hashlib.sha256) so a regression in our serializer or struct order
 	// fails one of these without depending on Go for both sides.
 	t.Run("known fixture: minimal all-empty", func(t *testing.T) {
-		// Canonical: {"description":"","end":{},"start":{},"summary":"","transparency":"","visibility":""}
+		// Canonical: {"description":"","end":{},"location":"","start":{},"summary":"","transparency":"","visibility":""}
 		got := Checksum(ManagedFields{})
-		want := "sha256:e4a973bfad828d49419d4e9734d54eb53c040156267a241ef0ea40faf1377ea8"
+		want := "sha256:0e82458983b2a3f68c54feb005433b5c1825490cd37c14f283288571af2468dc"
 		if got != want {
 			t.Fatalf("Checksum = %q, want %q", got, want)
 		}
 	})
 
 	t.Run("known fixture: typical mirror payload", func(t *testing.T) {
-		// Canonical: {"description":"with bob\n\n---\nSource: https://www.google.com/calendar/event?eid=ABC","end":{"dateTime":"2026-04-30T13:00:00Z","timeZone":"UTC"},"start":{"dateTime":"2026-04-30T12:00:00Z","timeZone":"UTC"},"summary":"Lunch","transparency":"opaque","visibility":"private"}
+		// Canonical: {"description":"with bob\n\n---\nSource: https://www.google.com/calendar/event?eid=ABC","end":{"dateTime":"2026-04-30T13:00:00Z","timeZone":"UTC"},"location":"","start":{"dateTime":"2026-04-30T12:00:00Z","timeZone":"UTC"},"summary":"Lunch","transparency":"opaque","visibility":"private"}
 		got := Checksum(ManagedFields{
 			Description:  "with bob\n\n---\nSource: https://www.google.com/calendar/event?eid=ABC",
 			Start:        EventDateTime{DateTime: "2026-04-30T12:00:00Z", TimeZone: "UTC"},
@@ -29,14 +29,14 @@ func TestChecksum(t *testing.T) {
 			Transparency: "opaque",
 			Visibility:   "private",
 		})
-		want := "sha256:5c23b7d9caa8108e61760b5a3405b14e7783aaf6ed13f6e7a3d4a1519bc8a245"
+		want := "sha256:8a21731a38c52f3fd7cdb6a4aadf05c9c93398289e7fc0525b6bcc600e7febf9"
 		if got != want {
 			t.Fatalf("Checksum = %q, want %q", got, want)
 		}
 	})
 
 	t.Run("known fixture: recurring event", func(t *testing.T) {
-		// Canonical (note Recurrence already in alphabetical order): {"description":"weekly","end":{"dateTime":"2026-04-30T13:00:00Z","timeZone":"UTC"},"recurrence":["EXDATE;TZID=UTC:20260507T120000","RRULE:FREQ=WEEKLY"],"start":{"dateTime":"2026-04-30T12:00:00Z","timeZone":"UTC"},"summary":"Standup","transparency":"opaque","visibility":"private"}
+		// Canonical (note Recurrence already in alphabetical order): {"description":"weekly","end":{"dateTime":"2026-04-30T13:00:00Z","timeZone":"UTC"},"location":"","recurrence":["EXDATE;TZID=UTC:20260507T120000","RRULE:FREQ=WEEKLY"],"start":{"dateTime":"2026-04-30T12:00:00Z","timeZone":"UTC"},"summary":"Standup","transparency":"opaque","visibility":"private"}
 		got := Checksum(ManagedFields{
 			Description:  "weekly",
 			Start:        EventDateTime{DateTime: "2026-04-30T12:00:00Z", TimeZone: "UTC"},
@@ -46,14 +46,14 @@ func TestChecksum(t *testing.T) {
 			Transparency: "opaque",
 			Visibility:   "private",
 		})
-		want := "sha256:4d156aba53fe505c8c8a961736f2a1c39d94bbcc4dd6345f8e5df3e0d7e1a782"
+		want := "sha256:09063340a3c3b222e05c2fe28724b8891d89bddd20d7ee894e58e360d33ab8de"
 		if got != want {
 			t.Fatalf("Checksum = %q, want %q", got, want)
 		}
 	})
 
 	t.Run("known fixture: all-day event", func(t *testing.T) {
-		// Canonical: {"description":"trip","end":{"date":"2026-05-02"},"start":{"date":"2026-05-01"},"summary":"Vacation","transparency":"opaque","visibility":"private"}
+		// Canonical: {"description":"trip","end":{"date":"2026-05-02"},"location":"","start":{"date":"2026-05-01"},"summary":"Vacation","transparency":"opaque","visibility":"private"}
 		got := Checksum(ManagedFields{
 			Description:  "trip",
 			Start:        EventDateTime{Date: "2026-05-01"},
@@ -62,7 +62,7 @@ func TestChecksum(t *testing.T) {
 			Transparency: "opaque",
 			Visibility:   "private",
 		})
-		want := "sha256:3284a9c295696420c3cfd92fcbbc241ccc12c2ca1e7df2e7eb35fd25d7c2c4d4"
+		want := "sha256:ccd5426ae88b48fec556ee6eef21c1dce2f65c6a63714f54c4db66c638102e64"
 		if got != want {
 			t.Fatalf("Checksum = %q, want %q", got, want)
 		}
@@ -119,8 +119,8 @@ func TestChecksum(t *testing.T) {
 		// silently shift the canonical form (and the hash).
 		got := Checksum(ManagedFields{Description: "1 < 2 && 3 > 2"})
 		// Precomputed against the canonical form
-		// {"description":"1 < 2 && 3 > 2","end":{},"start":{},"summary":"","transparency":"","visibility":""}
-		want := "sha256:00fc92f53551c0906f7f5e186136c9d875fa3fe0f234f953a5d90b471cf03eb8"
+		// {"description":"1 < 2 && 3 > 2","end":{},"location":"","start":{},"summary":"","transparency":"","visibility":""}
+		want := "sha256:ef62e5ff376f0b9047cb7a07f417a043402f804972634de1fc5386857c2b98cc"
 		if got != want {
 			t.Fatalf("Checksum with HTML-special chars = %q, want %q", got, want)
 		}
@@ -176,5 +176,37 @@ func TestChecksum(t *testing.T) {
 		mutate("recurrence added", func(m *ManagedFields) {
 			m.Recurrence = []string{"RRULE:FREQ=DAILY"}
 		})
+		mutate("location", func(m *ManagedFields) { m.Location = "Conference room A" })
+	})
+
+	t.Run("location: same value -> same hash", func(t *testing.T) {
+		// Pin that two ManagedFields with identical Location hash equal. This
+		// guards against accidental non-determinism in the location field
+		// (e.g. an unintended map-typed encoding).
+		a := Checksum(ManagedFields{Location: "Office"})
+		b := Checksum(ManagedFields{Location: "Office"})
+		if a != b {
+			t.Fatalf("same location produced different hashes: %q != %q", a, b)
+		}
+	})
+
+	t.Run("location: different value -> different hash", func(t *testing.T) {
+		a := Checksum(ManagedFields{Location: "Office A"})
+		b := Checksum(ManagedFields{Location: "Office B"})
+		if a == b {
+			t.Fatalf("different locations produced equal hashes: %q", a)
+		}
+	})
+
+	t.Run("location: empty equals zero-value", func(t *testing.T) {
+		// An explicit empty-string Location must hash the same as the zero
+		// value (no location set), because an event Google returns with no
+		// location and one with location="" are indistinguishable on the
+		// wire.
+		base := Checksum(ManagedFields{})
+		empty := Checksum(ManagedFields{Location: ""})
+		if base != empty {
+			t.Fatalf("zero vs empty-string location produced different hashes: %q != %q", base, empty)
+		}
 	})
 }

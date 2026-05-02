@@ -17,6 +17,7 @@ func ManagedFieldsFromEvent(e *gws.Event) ManagedFields {
 	return ManagedFields{
 		Summary:      e.Summary,
 		Description:  e.Description,
+		Location:     e.Location,
 		Start:        eventDateTimeFromGWS(e.Start),
 		End:          eventDateTimeFromGWS(e.End),
 		Recurrence:   e.Recurrence,

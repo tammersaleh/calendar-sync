@@ -1331,6 +1331,87 @@ func TestHandle_V1Mirror_BothChanged_MigrationSourceWon(t *testing.T) {
 	}
 }
 
+// TestHandle_V2Mirror_NeedsMigration_PatchesAsMigrationUpgrade pins the
+// v2 -> v3 migration path through the recurring handler. SchemaVersion bumped
+// to "3"; a v2 mirror reports NeedsMigration=true and the
+// !source_changed && !mirror_drifted cell routes to migration_upgrade
+// (rewrite at v3 with location + fresh checksum), not skip(unchanged).
+func TestHandle_V2Mirror_NeedsMigration_PatchesAsMigrationUpgrade(t *testing.T) {
+	api := newStubAPI()
+	mirrorParent := makeMirrorParent("mp-1")
+	source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
+
+	// Build a v2 mirror manually (with version="2", not mirror.SchemaVersion).
+	// Live managed fields match the v3 desired payload, so the migration
+	// recompute resolves MirrorDrifted=false.
+	desired := mirror.BuildInstancePayload("src-cal", source)
+	mi := &gws.Event{
+		ID:           "mi-1",
+		Status:       gws.EventStatusConfirmed,
+		Summary:      desired.Summary,
+		Description:  desired.Description,
+		Start:        desired.Start,
+		End:          desired.End,
+		Transparency: desired.Transparency,
+		Visibility:   desired.Visibility,
+		Updated:      source.Updated,
+		ExtendedProperties: &gws.ExtendedProperties{
+			Private: map[string]string{
+				mirror.ExtKeySource:        "src-cal:src-evt",
+				mirror.ExtKeySourceUpdated: source.Updated,
+				mirror.ExtKeyVersion:       "2",
+				// v2 mirrors carry a checksum, but it was computed over the
+				// v2 ManagedFields (no Location). NeedsMigration fires before
+				// the stored checksum is consulted.
+				mirror.ExtKeyChecksum: "sha256:legacy-v2-checksum",
+			},
+		},
+	}
+	api.queueInstances([]gws.Event{*mi})
+
+	postMain := *mi
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+
+	h := &Handler{
+		API:              api,
+		SourceCalendarID: "src-cal",
+		TargetCalendarID: "tgt-cal",
+		SourceWritable:   true,
+		LookupMirrorParent: func(_ mirror.SourceTuple) (*gws.Event, bool) {
+			return mirrorParent, true
+		},
+	}
+	got, err := h.Handle(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if got.Action != mirror.ActionPatch || got.Reason != ReasonMigrationUpgrade {
+		t.Errorf("expected patch(migration_upgrade) for v2 mirror under v3 schema; got %+v", got)
+	}
+	if got.Conflict != mirror.ConflictNone {
+		t.Errorf("migration_upgrade should not carry a conflict; got %q", got.Conflict)
+	}
+	patches := api.callsByOp("EventsPatch")
+	if len(patches) != 2 {
+		t.Fatalf("expected 2 EventsPatch (main + checksum followup); got %d", len(patches))
+	}
+	if patches[0].Body == nil || patches[0].Body.ExtendedProperties == nil {
+		t.Fatalf("main patch body missing ExtendedProperties; got %+v", patches[0].Body)
+	}
+	// The main patch body must carry the new SchemaVersion ("3") in
+	// extended properties - that's what the upgrade is for.
+	if v := patches[0].Body.ExtendedProperties.Private[mirror.ExtKeyVersion]; v != mirror.SchemaVersion {
+		t.Errorf("main patch body version = %q, want %q", v, mirror.SchemaVersion)
+	}
+	// Migration upgrade must NOT patch the source.
+	for _, c := range api.calls {
+		if c.Op == "EventsPatch" && c.CalendarID == "src-cal" {
+			t.Errorf("migration_upgrade must not patch source; got call %+v", c)
+		}
+	}
+}
+
 // ---------- helper-level tests ----------
 
 func TestComputeOriginalStart(t *testing.T) {

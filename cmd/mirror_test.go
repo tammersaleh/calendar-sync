@@ -15,14 +15,17 @@ import (
 )
 
 // inventoryGws returns canned inventory rows for EventsList queries that
-// match the v2/v1 schema-version filter; otherwise empty.
+// match the current SchemaVersion or any legacy version filter; otherwise
+// empty. The current-version events live on v2events for legacy fixture
+// names (the field is unrenamed to keep the fixture diff small).
 type inventoryGws struct {
 	stubGws
-	mu       sync.Mutex
-	v2events []gws.Event
-	v1events []gws.Event
-	deletes  []deleteCall
-	get      map[string]*gws.Event
+	mu             sync.Mutex
+	v2events       []gws.Event // mirrors at the current SchemaVersion
+	legacyV2events []gws.Event // mirrors stored at legacy version="2"
+	v1events       []gws.Event // mirrors stored at legacy version="1"
+	deletes        []deleteCall
+	get            map[string]*gws.Event
 }
 
 type deleteCall struct {
@@ -32,8 +35,11 @@ type deleteCall struct {
 
 func (i *inventoryGws) EventsList(_ context.Context, params gws.EventsListParams) ([]gws.Event, string, error) {
 	for _, p := range params.PrivateExtendedProperty {
-		if strings.HasSuffix(p, "=2") {
+		if strings.HasSuffix(p, "="+mirror.SchemaVersion) {
 			return i.v2events, "", nil
+		}
+		if strings.HasSuffix(p, "=2") {
+			return i.legacyV2events, "", nil
 		}
 		if strings.HasSuffix(p, "=1") {
 			return i.v1events, "", nil

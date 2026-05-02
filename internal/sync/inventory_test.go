@@ -26,12 +26,13 @@ func makeMirrorWithSource(id, source string, version string) *gws.Event {
 	}
 }
 
-func TestBuildInventory_V2Only(t *testing.T) {
+func TestBuildInventory_CurrentVersionOnly(t *testing.T) {
 	api := newStubAPI()
-	m1 := makeMirrorWithSource("m1", "src-cal:src-evt-A", "2")
-	m2 := makeMirrorWithSource("m2", "src-cal:src-evt-B", "2")
+	m1 := makeMirrorWithSource("m1", "src-cal:src-evt-A", mirror.SchemaVersion)
+	m2 := makeMirrorWithSource("m2", "src-cal:src-evt-B", mirror.SchemaVersion)
 	api.queueList([]gws.Event{*m1, *m2}, "")
-	api.queueList(nil, "") // no v1 mirrors
+	api.queueList(nil, "") // no v2 legacy mirrors
+	api.queueList(nil, "") // no v1 legacy mirrors
 
 	inv, err := BuildInventory(context.Background(), api, "tgt-cal", nil)
 	if err != nil {
@@ -43,24 +44,31 @@ func TestBuildInventory_V2Only(t *testing.T) {
 	if got, ok := inv.Lookup(mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt-B"}); !ok || got.ID != "m2" {
 		t.Errorf("expected m2 indexed by src-cal:src-evt-B; got=%v ok=%v", got, ok)
 	}
-	// The two events.list calls should carry the v=2 then v=1 filter.
+	// One events.list call per known schema version: current first, then
+	// each legacy version still in the wild. The order is current -> "2"
+	// -> "1" so a re-bump in the future stays self-documenting.
 	listCalls := api.callsByOp("EventsList")
-	if len(listCalls) != 2 {
-		t.Fatalf("expected 2 EventsList calls; got %d", len(listCalls))
+	if len(listCalls) != 3 {
+		t.Fatalf("expected 3 EventsList calls (current + 2 legacy); got %d", len(listCalls))
 	}
-	if !reflect.DeepEqual(listCalls[0].ListParams.PrivateExtendedProperty, []string{mirror.ExtKeyVersion + "=2"}) {
-		t.Errorf("first list filter = %v, want [calendar-sync:version=2]", listCalls[0].ListParams.PrivateExtendedProperty)
+	wantFilters := [][]string{
+		{mirror.ExtKeyVersion + "=" + mirror.SchemaVersion},
+		{mirror.ExtKeyVersion + "=2"},
+		{mirror.ExtKeyVersion + "=1"},
 	}
-	if !reflect.DeepEqual(listCalls[1].ListParams.PrivateExtendedProperty, []string{mirror.ExtKeyVersion + "=1"}) {
-		t.Errorf("second list filter = %v, want [calendar-sync:version=1]", listCalls[1].ListParams.PrivateExtendedProperty)
-	}
-	if !listCalls[0].ListParams.ShowDeleted || !listCalls[1].ListParams.ShowDeleted {
-		t.Errorf("inventory rebuild must request showDeleted=true; got %+v / %+v", listCalls[0].ListParams.ShowDeleted, listCalls[1].ListParams.ShowDeleted)
+	for i, want := range wantFilters {
+		if !reflect.DeepEqual(listCalls[i].ListParams.PrivateExtendedProperty, want) {
+			t.Errorf("list[%d] filter = %v, want %v", i, listCalls[i].ListParams.PrivateExtendedProperty, want)
+		}
+		if !listCalls[i].ListParams.ShowDeleted {
+			t.Errorf("list[%d] must request showDeleted=true", i)
+		}
 	}
 }
 
 func TestBuildInventory_V1Only(t *testing.T) {
 	api := newStubAPI()
+	api.queueList(nil, "") // current empty
 	api.queueList(nil, "") // v=2 empty
 	v1 := makeMirrorWithSource("v1mirror", "src-cal:src-evt-X", "1")
 	api.queueList([]gws.Event{*v1}, "")
@@ -74,11 +82,32 @@ func TestBuildInventory_V1Only(t *testing.T) {
 	}
 }
 
-func TestBuildInventory_MixedV2andV1(t *testing.T) {
+func TestBuildInventory_V2Only(t *testing.T) {
+	// v2 mirrors lack the location field but still carry a checksum + source
+	// tuple. They get indexed and are routed through the migration path at
+	// reconciliation time.
 	api := newStubAPI()
-	v2 := makeMirrorWithSource("m2", "src-cal:evtA", "2")
+	api.queueList(nil, "") // current empty
+	v2 := makeMirrorWithSource("v2mirror", "src-cal:src-evt-Y", "2")
 	api.queueList([]gws.Event{*v2}, "")
-	v1 := makeMirrorWithSource("m1", "src-cal:evtB", "1")
+	api.queueList(nil, "") // v1 empty
+
+	inv, err := BuildInventory(context.Background(), api, "tgt-cal", nil)
+	if err != nil {
+		t.Fatalf("BuildInventory error: %v", err)
+	}
+	if got, ok := inv.Lookup(mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt-Y"}); !ok || got.ID != "v2mirror" {
+		t.Errorf("expected v2 mirror indexed; got=%v ok=%v", got, ok)
+	}
+}
+
+func TestBuildInventory_MixedCurrentAndLegacy(t *testing.T) {
+	api := newStubAPI()
+	cur := makeMirrorWithSource("mcur", "src-cal:evtA", mirror.SchemaVersion)
+	api.queueList([]gws.Event{*cur}, "")
+	v2 := makeMirrorWithSource("mv2", "src-cal:evtB", "2")
+	api.queueList([]gws.Event{*v2}, "")
+	v1 := makeMirrorWithSource("mv1", "src-cal:evtC", "1")
 	api.queueList([]gws.Event{*v1}, "")
 
 	inv, err := BuildInventory(context.Background(), api, "tgt-cal", nil)
@@ -86,9 +115,12 @@ func TestBuildInventory_MixedV2andV1(t *testing.T) {
 		t.Fatalf("BuildInventory error: %v", err)
 	}
 	if _, ok := inv.Lookup(mirror.SourceTuple{CalendarID: "src-cal", EventID: "evtA"}); !ok {
-		t.Errorf("v2 mirror missing")
+		t.Errorf("current-version mirror missing")
 	}
 	if _, ok := inv.Lookup(mirror.SourceTuple{CalendarID: "src-cal", EventID: "evtB"}); !ok {
+		t.Errorf("v2 mirror missing")
+	}
+	if _, ok := inv.Lookup(mirror.SourceTuple{CalendarID: "src-cal", EventID: "evtC"}); !ok {
 		t.Errorf("v1 mirror missing")
 	}
 }
@@ -111,19 +143,20 @@ func TestBuildInventory_SkipsMirrorsMissingSourceTuple(t *testing.T) {
 	emptySource := &gws.Event{
 		ID: "empty-src",
 		ExtendedProperties: &gws.ExtendedProperties{Private: map[string]string{
-			mirror.ExtKeyVersion: "2",
+			mirror.ExtKeyVersion: mirror.SchemaVersion,
 		}},
 	}
 	malformed := &gws.Event{
 		ID: "malformed",
 		ExtendedProperties: &gws.ExtendedProperties{Private: map[string]string{
 			mirror.ExtKeySource:  "no-colon-here",
-			mirror.ExtKeyVersion: "2",
+			mirror.ExtKeyVersion: mirror.SchemaVersion,
 		}},
 	}
-	good := makeMirrorWithSource("good", "src-cal:src-evt-A", "2")
+	good := makeMirrorWithSource("good", "src-cal:src-evt-A", mirror.SchemaVersion)
 	api.queueList([]gws.Event{*missing, *emptySource, *malformed, *good}, "")
-	api.queueList(nil, "")
+	api.queueList(nil, "") // v=2 empty
+	api.queueList(nil, "") // v=1 empty
 
 	inv, err := BuildInventory(context.Background(), api, "tgt-cal", nil)
 	if err != nil {
@@ -149,11 +182,12 @@ func TestBuildInventory_SkipsMirrorsMissingSourceTuple(t *testing.T) {
 // per-event events.get to inspect status.
 func TestBuildInventory_SkipsCancelledTombstones(t *testing.T) {
 	api := newStubAPI()
-	live := makeMirrorWithSource("live", "src-cal:src-evt-A", "2")
-	tomb := makeMirrorWithSource("tomb", "src-cal:src-evt-B", "2")
+	live := makeMirrorWithSource("live", "src-cal:src-evt-A", mirror.SchemaVersion)
+	tomb := makeMirrorWithSource("tomb", "src-cal:src-evt-B", mirror.SchemaVersion)
 	tomb.Status = gws.EventStatusCancelled
 	api.queueList([]gws.Event{*live, *tomb}, "")
-	api.queueList(nil, "")
+	api.queueList(nil, "") // v=2 empty
+	api.queueList(nil, "") // v=1 empty
 
 	inv, err := BuildInventory(context.Background(), api, "tgt-cal", nil)
 	if err != nil {

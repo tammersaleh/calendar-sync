@@ -72,6 +72,7 @@ func pdirByPair(results []PDirResult, pair string) (PDirResult, bool) {
 // either inserts or skips.
 func queueEmptyInventory(api *stubAPI, target string) {
 	api.queueListInventory(target, mirror.SchemaVersion, nil)
+	api.queueListInventory(target, "2", nil)
 	api.queueListInventory(target, "1", nil)
 }
 
@@ -402,6 +403,7 @@ func TestFullSync_OrphanWalkError_PdirFails(t *testing.T) {
 	api.queueListFull("src-A", nil, "token-1")
 	mirrorEv := makeOrphanMirror("m-orphan", "src-A:orphaned-evt")
 	api.queueListInventory("tgt-A", mirror.SchemaVersion, []gws.Event{*mirrorEv})
+	api.queueListInventory("tgt-A", "2", nil)
 	api.queueListInventory("tgt-A", "1", nil)
 	api.queueGetErr("src-A", "orphaned-evt", errors.New("orphan get boom"))
 
@@ -431,6 +433,7 @@ func TestFullSync_OrphanWalk_PrunesMissingSource(t *testing.T) {
 	// Inventory still has a mirror for that vanished source.
 	mirrorEv := makeOrphanMirror("m-ghost", "src-A:ghost")
 	api.queueListInventory("tgt-A", mirror.SchemaVersion, []gws.Event{*mirrorEv})
+	api.queueListInventory("tgt-A", "2", nil)
 	api.queueListInventory("tgt-A", "1", nil)
 	// Orphan walk does events.get, which returns 404.
 	api.queueGetErr("src-A", "ghost", &gws.Error{Code: gws.CodeAPINotFound, ExitCode: 1})
@@ -903,6 +906,7 @@ func TestFullSync_RecurringDelegation_RoutesToHandler(t *testing.T) {
 		},
 	}
 	api.queueListInventory("tgt-A", mirror.SchemaVersion, []gws.Event{*mirrorParent})
+	api.queueListInventory("tgt-A", "2", nil)
 	api.queueListInventory("tgt-A", "1", nil)
 
 	// Step 2: events.instances on the mirror parent returns the mirror
@@ -968,6 +972,7 @@ func TestFullSync_OrphanWalk_SkipsVisitedEntries(t *testing.T) {
 		"2026-04-29T20:00:00Z", "2026-04-29T20:00:00Z",
 		src.Summary, src.Start, src.End)
 	api.queueListInventory("tgt-A", mirror.SchemaVersion, []gws.Event{*mirrorEv})
+	api.queueListInventory("tgt-A", "2", nil)
 	api.queueListInventory("tgt-A", "1", nil)
 	// Classify is idempotent: source.Updated == stored, mirror clean -> skip.
 

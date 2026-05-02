@@ -276,7 +276,8 @@ func (s *stubAPI) queueListIncrErr(calendarID string, err error) {
 }
 
 // queueListInventory enqueues a response for one of the inventory rebuild
-// list calls. version is "1" or "2" (mirror.SchemaVersion).
+// list calls. version may be a legacy version ("1", "2") or the current
+// mirror.SchemaVersion.
 func (s *stubAPI) queueListInventory(calendarID, version string, events []gws.Event) {
 	label := "list:" + calendarID + ":inv:" + mirror.ExtKeyVersion + "=" + version
 	s.listByLabel[label] = append(s.listByLabel[label],

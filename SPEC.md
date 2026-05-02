@@ -64,7 +64,7 @@ Every mirror event carries these private extended properties (`extendedPropertie
 | `calendar-sync:source`         | `alice@example.com:abc123def456`           | `<canonical_source_calendar_id>:<source_event_id>`. Identifies which source event this is a mirror of. Used by the orphan walk during full re-sync to look up the source. Inventory lookups use the deterministic mirror event ID instead - see below. |
 | `calendar-sync:source_updated` | `2026-04-29T23:00:00Z`                     | The source event's `updated` field at the time of the last reconciliation. The "did source change?" signal.      |
 | `calendar-sync:checksum`       | `sha256:c3a4...e891`                       | SHA-256 over a canonical serialization of the fields calendar-sync manages on the mirror. The "did mirror drift?" signal. (See "Drift detection model" below.) |
-| `calendar-sync:version`        | `2`                                        | Schema version. Current version is `2`. Bump if the property layout changes.                                     |
+| `calendar-sync:version`        | `3`                                        | Schema version. Current version is `3`. Bump if the property layout or managed-field set changes.                |
 
 The pair name and direction are deliberately *not* stored on the mirror. The deterministic mirror event ID (see below) is derived from the source event alone, so renaming a pair in config is a metadata-only operation that doesn't require touching any mirror events. Bulk operations like `mirror list --pair X` derive the pair-to-mirror mapping client-side from the current config plus the mirror's `calendar-sync:source` value (the source calendar ID identifies the pdir given the target calendar being listed).
 
@@ -132,6 +132,7 @@ These are the fields calendar-sync writes when it creates or patches a mirror, a
 
 - `summary` (string, possibly empty)
 - `description` (string, including the `\n\n---\nSource: <htmlLink>` trailer that calendar-sync appends)
+- `location` (string, possibly empty; copied verbatim from the source)
 - `start` (object with `dateTime` xor `date`, plus optional `timeZone`)
 - `end` (same shape as `start`)
 - `recurrence` (array of RRULE/RDATE/EXDATE strings; sorted alphabetically before hashing for stability; omitted entirely for non-recurring events and for instance overrides)
@@ -142,7 +143,7 @@ The canonical serialization is JSON with object keys sorted, no whitespace, RFC 
 
 **`reminders` is deliberately *not* in the checksum** even though we write `{"useDefault": false}` on every mirror payload. Two reasons: (1) Google does not bump the event's `updated` timestamp when only `reminders` change, so newer-wins conflict resolution would be unreliable for any drift signal that includes `reminders`. (2) Whether reminders fire on the mirror is a personal preference that's reasonable for the user to override. We set the safe default on creation; we don't fight subsequent changes.
 
-Other fields (attendees, location, conferenceData, organizer, eventType, etc.) are also not hashed. calendar-sync doesn't manage them on the mirror, and we don't fight the user if they edit them.
+Other fields (attendees, conferenceData, organizer, eventType, etc.) are also not hashed. calendar-sync doesn't manage them on the mirror, and we don't fight the user if they edit them.
 
 #### Computing the checksum from the post-write event
 
@@ -183,20 +184,25 @@ This is a deliberate trade-off: trying to repair a partial trailer risks corrupt
 
 #### Schema version migration
 
-A mirror with `calendar-sync:version=1` predates the checksum property. We can't simply assume `mirror_drifted=false` on first encounter - the user may have edited the v1 mirror at some point, and we'd silently adopt that edit as the new baseline.
+The current schema version is `3`. A mirror whose stored `calendar-sync:version` differs from the current value is a legacy mirror; calendar-sync supports migrating any prior version (v1, v2) to the current schema in a single write on first encounter.
 
-On first encounter of a `version=1` mirror, calendar-sync derives `mirror_drifted` by comparing the live mirror's managed fields to the desired payload computed from the source:
+Two characteristics of legacy mirrors block a naive drift check:
+
+- v1 mirrors predate the `calendar-sync:checksum` property. There is no stored hash to compare against, so the standard `mirror_drifted` signal is meaningless for them.
+- v2 mirrors lack the `location` managed field. Their stored checksum was computed over a smaller field set; the current Checksum function would always disagree, so `mirror_drifted` would always fire even on a clean mirror.
+
+On first encounter of any legacy mirror, calendar-sync derives `mirror_drifted` by comparing the live mirror's managed fields to the desired payload computed from the source:
 
 - `mirror_drifted = (any managed field on the mirror differs from the desired-from-source value)`.
 
 Then the four-way matrix runs as usual:
 
-- `!source_changed && !mirror_drifted`: no drift, just upgrade. Re-write the mirror with `version=2` and a fresh checksum. Action `patch`, reason `migration_upgrade`. The patch only touches the extended-property layout - no managed field changes.
+- `!source_changed && !mirror_drifted`: no drift, just upgrade. Re-write the mirror at the current `version` with a fresh checksum (and, for v2 mirrors, picking up the `location` field from source). Action `patch`, reason `migration_upgrade`.
 - `!source_changed && mirror_drifted`: drift handling as normal (`propagate` or `revert`).
 - `source_changed && !mirror_drifted`: `patch` from source as normal.
-- `source_changed && mirror_drifted`: source wins by default during migration (more conservative than newer-wins, since v1 mirrors have no reliable user-edit timestamp). A `warn` log records `migration_source_won` so the user knows v1 mirror edits may have been overwritten.
+- `source_changed && mirror_drifted`: source wins by default during migration (more conservative than newer-wins). A `warn` log records `migration_source_won` so the user knows mirror edits may have been overwritten. v1 mirrors fall under this rule because they have no reliable user-edit timestamp; v2 mirrors keep the same rule for simplicity and consistency, even though their `updated` timestamp is technically reliable.
 
-After this single migration write, the mirror is `version=2` and subsequent reconciliations use the standard drift detection model.
+After this single migration write, the mirror is at the current `version` and subsequent reconciliations use the standard drift detection model.
 
 ## Configuration
 
@@ -350,7 +356,7 @@ The user is responsible for ensuring this single `gws`-authenticated account has
 
 ## Privacy and the mirror payload
 
-By design, mirror events copy the source event's title and description verbatim. This is *not* a redaction tool. The destination calendar's writers and owners can read those details. The `visibility=private` setting only hides details from readers.
+By design, mirror events copy the source event's title, description, and location verbatim. This is *not* a redaction tool. The destination calendar's writers and owners can read those details. The `visibility=private` setting only hides details from readers.
 
 This is intentional: the user creating the pairs controls the destination calendars and the people who have writer access to them. In the typical case (mirroring between calendars the user owns), the only readers are the user and people they've explicitly shared with. If the user mirrors to a calendar with broader writer access, the leak is the user's responsibility.
 
@@ -360,7 +366,7 @@ Redaction modes (`title_template`, `redact_description`) are out of scope for th
 
 ### Edits flow back too
 
-Because mirror edits propagate to writable sources (see "Drift detection model"), edits to a mirror's title or description are **also visible to the source's other readers** after the next sync. If the user edits a work-mirrored event on their personal calendar to add private notes, those notes flow back to the work calendar where colleagues will see them. The user should treat their own mirror edits as if they were editing the source directly when the source is writable.
+Because mirror edits propagate to writable sources (see "Drift detection model"), edits to a mirror's title, description, or location are **also visible to the source's other readers** after the next sync. If the user edits a work-mirrored event on their personal calendar to add private notes, those notes flow back to the work calendar where colleagues will see them. The user should treat their own mirror edits as if they were editing the source directly when the source is writable.
 
 ## Output and Logging
 
@@ -489,7 +495,7 @@ A given `reason` is paired with one of six `action` values: `insert`, `patch`, `
 | `instance_unmaterializable`| `skip`                      | Recurring-instance lookup returned zero results even after re-patching the mirror parent (rare; see "Zero-result instance lookup").       |
 | `source_updated`           | `insert` or `patch`         | `source_changed=true && mirror_drifted=false`, or no mirror exists yet (then `insert`). Also covers `source_changed && mirror_drifted` resolved to source-wins (see `conflict_source_won` below). |
 | `target_edited`            | `propagate` or `revert`     | `mirror_drifted=true && source_changed=false`, or `source_changed && mirror_drifted` resolved to mirror-wins. `propagate` if `pdir.source_writable`, else `revert`. |
-| `migration_upgrade`        | `patch`                     | A v1 mirror with no source change and no drift, re-written to add the `calendar-sync:checksum` and bump `version` to 2. One-time per pre-existing mirror. |
+| `migration_upgrade`        | `patch`                     | A legacy mirror (v1 or v2) with no source change and no drift, re-written at the current `version` with a fresh `calendar-sync:checksum`. One-time per pre-existing mirror. |
 | `orphaned`                 | `delete`                    | Prune pass found a mirror whose source no longer exists.                                                                                 |
 
 Server-side `eventTypes` filtering means events of excluded types (`birthday`, `fromGmail`, `workingLocation`) never appear on the wire and so don't produce a `skip` event.
@@ -508,9 +514,9 @@ Possible `msg` values:
 
 - `conflict_source_won` - both signals true, source's `updated` won (or tied) and the mirror was patched from source. The accompanying stdout action carries `reason=source_updated`.
 - `conflict_target_won` - both signals true, mirror's `updated` won and drift handling fired. The accompanying stdout action carries `reason=target_edited`.
-- `migration_source_won` - same as `conflict_source_won` but during the v1→v2 migration, where there was no reliable user-edit timestamp to compare against; source wins by default. The action carries `reason=source_updated`.
+- `migration_source_won` - same as `conflict_source_won` but during a legacy schema migration (v1 or v2 → current). v1 mirrors have no reliable user-edit timestamp; v2 mirrors keep the same simpler rule for consistency. Source wins by default. The action carries `reason=source_updated`.
 
-The `source_updated` and `mirror_updated` fields show the timestamps that drove the newer-wins decision (omitted on `migration_source_won` since v1 mirrors have no comparable timestamp), so the user can verify it was the call they wanted.
+The `source_updated` and `mirror_updated` fields show the timestamps that drove the newer-wins decision (omitted on `migration_source_won` since the migration cell uses source-wins-by-default rather than a timestamp comparison), so the user can verify it was the call they wanted.
 
 #### Daemon-running detection
 
@@ -673,7 +679,7 @@ calendar-sync mirror list <calendar> [flags]
   --all                Fetch all pages.
 ```
 
-`--pair`/`--direction` filtering is applied client-side: the command lists all mirrors via `privateExtendedProperty=calendar-sync:version=2` (and `version=1` if any), parses each mirror's `calendar-sync:source` to recover the source calendar ID, and matches against the current config to determine which pdir produced it. Matching is uniquely defined because validation guarantees no two pdirs share the same `(canonical_source, canonical_target)` pair.
+`--pair`/`--direction` filtering is applied client-side: the command lists all mirrors via `privateExtendedProperty=calendar-sync:version=3` (plus one list per legacy version still in the wild), parses each mirror's `calendar-sync:source` to recover the source calendar ID, and matches against the current config to determine which pdir produced it. Matching is uniquely defined because validation guarantees no two pdirs share the same `(canonical_source, canonical_target)` pair.
 
 ```
 $ calendar-sync mirror list primary --pair work-to-personal
@@ -920,7 +926,7 @@ The mirror inventory and source listings are grown and pruned in place as the da
    Capture `nextSyncToken` from the final page into a *staging* variable - not into the in-memory per-source token yet. See step 8.
 
    The `timeMax` for the source-list is `now + horizon`, where `horizon` is the maximum effective horizon across all pdirs that share this source. When pdirs sharing a source have different horizons (e.g. 365d on one pdir, 1d on another during a gradual two-way rollout), the longer wins for the wire call so the longer-horizon pdir's classifier sees its events; the shorter-horizon pdir filters per its own horizon at classification time.
-6. **Mirror inventory per unique target.** For each distinct target calendar `T`, run the rebuild described in "Mirror inventory rebuild" - two `events.list` calls, one for `version=2` and one for `version=1`, merged into a single inventory. v1 entries are flagged for migration during reconciliation.
+6. **Mirror inventory per unique target.** For each distinct target calendar `T`, run the rebuild described in "Mirror inventory rebuild" - one `events.list` call per known schema version (current `version=3` plus each legacy version still in the wild), merged into a single inventory. Legacy entries are flagged for migration during reconciliation.
 7. **Reconcile.** For each enabled pdir `(P, D)` with source `S` and target `T`, walk the in-memory list of source events for `S`. For each event, run the classification logic (see below) using the `T` mirror inventory to look up existing mirrors. Track success/failure per pdir.
 8. **Commit syncTokens conditionally.** For each unique source `S`, install the staged `nextSyncToken` from step 5 into the in-memory per-source token *only if every pdir whose source matches `S` succeeded in step 7*. If any pdir for `S` failed, leave the in-memory token empty so the next cycle re-runs a full source-list for `S`. This is the same conditional-advancement rule that protects the per-tick path; both paths apply it.
 
@@ -986,14 +992,15 @@ After each full re-sync the in-memory inventories are replaced atomically.
 
 #### Mirror inventory rebuild
 
-For each unique target, the rebuild runs two `events.list` calls in sequence:
+For each unique target, the rebuild runs one `events.list` call per known schema version, in order:
 
-1. `privateExtendedProperty=calendar-sync:version=2` to find current-schema mirrors.
-2. `privateExtendedProperty=calendar-sync:version=1` to find legacy mirrors that haven't been migrated yet.
+1. `privateExtendedProperty=calendar-sync:version=3` to find current-schema mirrors.
+2. `privateExtendedProperty=calendar-sync:version=2` to find v2 legacy mirrors (lack the `location` managed field).
+3. `privateExtendedProperty=calendar-sync:version=1` to find v1 legacy mirrors (predate `calendar-sync:checksum`).
 
-Both responses are merged into the single in-memory inventory. v1 entries are flagged for migration; on first reconciliation each gets re-written with `version=2` and a fresh `calendar-sync:checksum` per the schema-migration rules.
+All responses are merged into the single in-memory inventory. Legacy entries are flagged for migration; on first reconciliation each gets re-written at the current `version` with a fresh `calendar-sync:checksum` per the schema-migration rules.
 
-Without the v1 query, mirrors that were inserted before the schema bump would never appear in inventory and would never be reconciled or cleaned up - they'd become permanent zombies.
+Without the legacy queries, mirrors that were inserted before the latest schema bump would never appear in inventory and would never be reconciled or cleaned up - they'd become permanent zombies.
 
 ### Classification logic
 
@@ -1073,6 +1080,7 @@ The standard drift detection covers parents and source-corresponding instances, 
   "id": "cs2<base32hex_hash>",
   "summary": "<source.summary>",
   "description": "<source.description>\n\n---\nSource: <source.htmlLink>",
+  "location": "<source.location>",
   "start": <source.start>,
   "end": <source.end>,
   "transparency": "opaque",
@@ -1084,20 +1092,20 @@ The standard drift detection covers parents and source-corresponding instances, 
       "calendar-sync:source": "<S>:<E.id>",
       "calendar-sync:source_updated": "<E.updated>",
       "calendar-sync:checksum": "sha256:<hex>",
-      "calendar-sync:version": "2"
+      "calendar-sync:version": "3"
     }
   }
 }
 ```
 
 Notes:
-- `summary` and `description` are copied verbatim.
+- `summary`, `description`, and `location` are copied verbatim.
 - `description` always ends with a blank line, `---`, and `Source: <htmlLink>`. If source description is empty, just the trailer.
 - `start`, `end` preserve the source's `dateTime`/`date` distinction and `timeZone`.
 - `transparency` forced to `opaque`. `visibility` forced to `private`.
 - `recurrence` is the source's array of RRULE/RDATE/EXDATE strings, omitted for non-recurring events. Omitted on mirror *instances* even when the parent has it.
 - `reminders.useDefault = false` is mandatory. Omitting it lets the destination calendar's default reminders fire on every mirror, which is wrong: mirrors should be silent.
-- `attendees`, `location`, `conferenceData` are deliberately omitted.
+- `attendees`, `conferenceData` are deliberately omitted.
 - `calendar-sync:checksum` is set by a follow-up `events.patch` after the main write, using the post-write Event resource as the input to the hash. See "Drift detection model" / "Computing the checksum from the post-write event" for the algorithm and rationale.
 
 The `propagate` action uses a **different payload shape**: only the drifted managed fields, with the description trailer stripped, written to the **source** event. The mirror is then re-written separately with the full payload above and a fresh checksum derived from the new source state.
@@ -1332,7 +1340,7 @@ What lives in process memory:
 
 What survives across daemon restarts:
 
-- `extendedProperties.private` on every mirror event. The provenance (`calendar-sync:source`, `calendar-sync:source_updated`, `calendar-sync:checksum`, `calendar-sync:version`) is colocated with the mirror itself on Google Calendar. A cold start re-derives the in-memory inventory by running the "Mirror inventory rebuild" subroutine (two `events.list` calls per target: one for `version=2`, one for `version=1`).
+- `extendedProperties.private` on every mirror event. The provenance (`calendar-sync:source`, `calendar-sync:source_updated`, `calendar-sync:checksum`, `calendar-sync:version`) is colocated with the mirror itself on Google Calendar. A cold start re-derives the in-memory inventory by running the "Mirror inventory rebuild" subroutine (one `events.list` call per known schema version per target).
 
 A cold start (process launch, restart after crash, system reboot) walks the same path described in "Daemon lifecycle: startup": canonicalize, list, build inventory, reconcile. Wall-clock cost on a real-world calendar setup is on the order of 10-20 seconds.
 
@@ -1376,6 +1384,7 @@ events.get?calendarId=<T>&eventId=<deterministic_mirror_id>
 
 Find every mirror calendar-sync has ever created on a calendar (used by the inventory rebuild and bulk operations):
 ```
+events.list?calendarId=<T>&privateExtendedProperty=calendar-sync:version=3
 events.list?calendarId=<T>&privateExtendedProperty=calendar-sync:version=2
 events.list?calendarId=<T>&privateExtendedProperty=calendar-sync:version=1
 ```

@@ -44,6 +44,9 @@ func DriftedFieldNames(live, desired *gws.Event) []string {
 	if liveFields.Description != desiredFields.Description {
 		fields = append(fields, "description")
 	}
+	if liveFields.Location != desiredFields.Location {
+		fields = append(fields, "location")
+	}
 	if liveFields.Start != desiredFields.Start {
 		fields = append(fields, "start")
 	}
@@ -63,7 +66,7 @@ func DriftedFieldNames(live, desired *gws.Event) []string {
 // BuildPropagatePatchBody constructs the events.patch body sent to the source
 // when propagating mirror drift back. The body carries only the drifted
 // fields per SPEC.md "Field-level propagate" (so untouched source fields
-// like attendees / location / conferenceData are preserved).
+// like attendees / conferenceData are preserved).
 //
 // The description value is the LIVE mirror's description with the trailer
 // stripped, per SPEC.md "Drift handling" step 3. If the trailer is the
@@ -81,6 +84,8 @@ func BuildPropagatePatchBody(live *gws.Event, drifted []string) *gws.Event {
 		case "description":
 			stripped, _ := StripTrailer(live.Description)
 			body.Description = stripped
+		case "location":
+			body.Location = live.Location
 		case "start":
 			body.Start = live.Start
 		case "end":

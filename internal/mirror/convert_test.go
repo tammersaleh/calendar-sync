@@ -11,6 +11,7 @@ func TestManagedFieldsFromEvent_ExtractsAllManagedFields(t *testing.T) {
 	e := &gws.Event{
 		Summary:      "x",
 		Description:  "y",
+		Location:     "Conference room A",
 		Start:        &gws.EventDateTime{DateTime: "2026-04-30T12:00:00Z", TimeZone: "UTC"},
 		End:          &gws.EventDateTime{Date: "2026-05-01"},
 		Recurrence:   []string{"RRULE:FREQ=DAILY"},
@@ -25,6 +26,7 @@ func TestManagedFieldsFromEvent_ExtractsAllManagedFields(t *testing.T) {
 	want := ManagedFields{
 		Summary:      "x",
 		Description:  "y",
+		Location:     "Conference room A",
 		Start:        EventDateTime{DateTime: "2026-04-30T12:00:00Z", TimeZone: "UTC"},
 		End:          EventDateTime{Date: "2026-05-01"},
 		Recurrence:   []string{"RRULE:FREQ=DAILY"},
@@ -52,10 +54,11 @@ func TestManagedFieldsFromEvent_NilStartEndProducesZero(t *testing.T) {
 func TestManagedFieldsFromEvent_ChecksumStableAcrossRoundTrip(t *testing.T) {
 	// The whole point of this conversion: extracting from a gws.Event
 	// produces a hash equal to constructing the equivalent ManagedFields
-	// directly. Pin that contract.
+	// directly. Pin that contract, including Location since v3.
 	e := &gws.Event{
 		Summary:      "Lunch",
 		Description:  "with bob",
+		Location:     "Office cafe",
 		Start:        &gws.EventDateTime{DateTime: "2026-04-30T12:00:00Z"},
 		End:          &gws.EventDateTime{DateTime: "2026-04-30T13:00:00Z"},
 		Transparency: "opaque",
@@ -65,6 +68,7 @@ func TestManagedFieldsFromEvent_ChecksumStableAcrossRoundTrip(t *testing.T) {
 	fromManual := Checksum(ManagedFields{
 		Summary:      "Lunch",
 		Description:  "with bob",
+		Location:     "Office cafe",
 		Start:        EventDateTime{DateTime: "2026-04-30T12:00:00Z"},
 		End:          EventDateTime{DateTime: "2026-04-30T13:00:00Z"},
 		Transparency: "opaque",

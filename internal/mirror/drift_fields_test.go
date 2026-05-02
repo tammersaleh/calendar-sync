@@ -62,6 +62,7 @@ func TestDriftedFieldNames_ResultIsAlphabeticallySorted(t *testing.T) {
 	source := &gws.Event{
 		Summary:      "Standup",
 		Description:  "body",
+		Location:     "Office",
 		Start:        &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"},
 		End:          &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z"},
 		Transparency: gws.TransparencyOpaque,
@@ -75,11 +76,52 @@ func TestDriftedFieldNames_ResultIsAlphabeticallySorted(t *testing.T) {
 	live.Transparency = gws.TransparencyTransparent
 	live.End = &gws.EventDateTime{DateTime: "2026-05-01T14:00:00Z"}
 	live.Summary = "Different"
+	live.Location = "Coffee shop"
 
 	got := DriftedFieldNames(&live, desired)
-	want := []string{"end", "summary", "transparency", "visibility"}
+	want := []string{"end", "location", "summary", "transparency", "visibility"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("DriftedFieldNames = %v, want %v (alphabetical)", got, want)
+	}
+}
+
+func TestDriftedFieldNames_LocationDrift(t *testing.T) {
+	// Location is a managed field as of v3; a live mirror with a different
+	// location than the source must report "location" as drifted.
+	source := &gws.Event{
+		Summary:      "Lunch",
+		Description:  "with bob",
+		Location:     "Office",
+		Start:        &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"},
+		End:          &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z"},
+		Transparency: gws.TransparencyOpaque,
+		Visibility:   gws.VisibilityPrivate,
+		HTMLLink:     "https://www.google.com/calendar/event?eid=ABC",
+	}
+	desired := BuildInstancePayload("src-cal", source)
+	live := *desired
+	live.Location = "Cafe across the street"
+
+	got := DriftedFieldNames(&live, desired)
+	want := []string{"location"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("DriftedFieldNames = %v, want %v", got, want)
+	}
+}
+
+func TestBuildPropagatePatchBody_IncludesLocation(t *testing.T) {
+	// When location drifts and SourceWritable=true, propagate carries the
+	// live mirror's location to the source via events.patch.
+	live := &gws.Event{
+		Summary:  "Lunch",
+		Location: "User-edited venue",
+	}
+	body := BuildPropagatePatchBody(live, []string{"location"})
+	if body.Location != "User-edited venue" {
+		t.Errorf("Location = %q, want %q", body.Location, "User-edited venue")
+	}
+	if body.Summary != "" {
+		t.Errorf("Summary should not be set (not in drifted list); got %q", body.Summary)
 	}
 }
 

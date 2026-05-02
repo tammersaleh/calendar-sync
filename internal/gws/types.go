@@ -5,14 +5,15 @@ package gws
 // gws response unmarshals straight in.
 //
 // The shape is deliberately a subset: only the fields the sync algorithm
-// actually consults. Fields we don't manage (location, conferenceData,
-// organizer, attendees beyond the source-owner check, etc.) are absent;
-// they round-trip through ExtendedProperties or are simply ignored.
+// actually consults. Fields we don't manage (conferenceData, organizer,
+// attendees beyond the source-owner check, etc.) are absent; they round-
+// trip through ExtendedProperties or are simply ignored.
 type Event struct {
 	ID                 string              `json:"id,omitempty"`
 	Status             string              `json:"status,omitempty"`
 	Summary            string              `json:"summary,omitempty"`
 	Description        string              `json:"description,omitempty"`
+	Location           string              `json:"location,omitempty"`
 	Start              *EventDateTime      `json:"start,omitempty"`
 	End                *EventDateTime      `json:"end,omitempty"`
 	Transparency       string              `json:"transparency,omitempty"`

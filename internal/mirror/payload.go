@@ -4,9 +4,12 @@ import "github.com/tammersaleh/calendar-sync/internal/gws"
 
 // SchemaVersion is the value calendar-sync writes to
 // extendedProperties.private["calendar-sync:version"] on every mirror it
-// creates. SPEC.md "Schema version migration" describes the v1→v2 upgrade
-// path; bumping this constant requires adding a new migration branch.
-const SchemaVersion = "2"
+// creates. SPEC.md "Schema version migration" describes the upgrade path
+// for legacy mirrors. v3 added `location` to the managed-field set.
+// Existing v1 and v2 mirrors are migrated on first reconciliation via the
+// direct managed-field comparison path; both legacy versions converge
+// onto v3 in a single write.
+const SchemaVersion = "3"
 
 // Extended-property keys SPEC.md "Mirror identification" mandates on every
 // mirror. The "calendar-sync:" prefix is the package's namespace; nothing
@@ -29,7 +32,7 @@ const trailerPrefix = "\n\n---\nSource: "
 //
 //   - id set to the deterministic mirror ID derived from
 //     (sourceCalendarID, source.ID).
-//   - summary, start, end, recurrence copied verbatim.
+//   - summary, location, start, end, recurrence copied verbatim.
 //   - description = source.description + the calendar-sync trailer.
 //   - transparency=opaque, visibility=private (forced regardless of
 //     source values).
@@ -54,6 +57,7 @@ func BuildPayload(sourceCalendarID string, source *gws.Event) *gws.Event {
 		ID:           DeterministicID(sourceCalendarID, source.ID),
 		Summary:      source.Summary,
 		Description:  source.Description + trailerPrefix + source.HTMLLink,
+		Location:     source.Location,
 		Start:        source.Start,
 		End:          source.End,
 		Recurrence:   source.Recurrence,

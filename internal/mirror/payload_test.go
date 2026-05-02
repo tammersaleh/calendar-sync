@@ -13,6 +13,7 @@ func TestBuildPayload_HappyPath(t *testing.T) {
 		ID:          "evt-abc",
 		Summary:     "Lunch",
 		Description: "with bob",
+		Location:    "Office cafe",
 		Start:       &gws.EventDateTime{DateTime: "2026-04-30T12:00:00Z", TimeZone: "UTC"},
 		End:         &gws.EventDateTime{DateTime: "2026-04-30T13:00:00Z", TimeZone: "UTC"},
 		Updated:     "2026-04-29T23:00:00.000Z",
@@ -27,6 +28,9 @@ func TestBuildPayload_HappyPath(t *testing.T) {
 	}
 	if got.Summary != "Lunch" {
 		t.Errorf("Summary = %q, want Lunch", got.Summary)
+	}
+	if got.Location != "Office cafe" {
+		t.Errorf("Location = %q, want %q", got.Location, "Office cafe")
 	}
 	if got.Transparency != gws.TransparencyOpaque {
 		t.Errorf("Transparency = %q, want opaque", got.Transparency)
@@ -44,6 +48,42 @@ func TestBuildPayload_HappyPath(t *testing.T) {
 	// Start/End passed through by reference.
 	if got.Start != source.Start {
 		t.Errorf("Start should be the same pointer as source.Start")
+	}
+}
+
+func TestBuildPayload_LocationCopiedFromSource(t *testing.T) {
+	// Location is a managed field as of v3 (SPEC.md "Managed fields and the
+	// checksum"). BuildPayload copies it verbatim from source onto the
+	// mirror.
+	source := &gws.Event{
+		ID:       "evt-loc",
+		Location: "1234 Main St, Springfield",
+		HTMLLink: "https://www.google.com/calendar/event?eid=LOC",
+	}
+	got := BuildPayload("c@example.com", source)
+	if got.Location != source.Location {
+		t.Errorf("Location = %q, want %q (copied verbatim from source)", got.Location, source.Location)
+	}
+}
+
+func TestBuildPayload_LocationEmptyStaysEmpty(t *testing.T) {
+	// Source with no location -> mirror with no location. Don't synthesize.
+	source := &gws.Event{
+		ID:       "evt-noloc",
+		HTMLLink: "https://www.google.com/calendar/event?eid=N",
+	}
+	got := BuildPayload("c@example.com", source)
+	if got.Location != "" {
+		t.Errorf("Location = %q, want empty", got.Location)
+	}
+}
+
+func TestSchemaVersion_IsThree(t *testing.T) {
+	// Pin the v3 bump (SPEC.md "Schema version migration"). v3 added
+	// Location to the managed-fields set; bumping the constant routes
+	// existing v1 and v2 mirrors through the migration path.
+	if SchemaVersion != "3" {
+		t.Errorf("SchemaVersion = %q, want %q", SchemaVersion, "3")
 	}
 }
 

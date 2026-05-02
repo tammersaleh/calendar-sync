@@ -8,28 +8,35 @@ import (
 	"github.com/tammersaleh/calendar-sync/internal/mirror"
 )
 
-// reconcileMigration runs SPEC.md "Schema version migration" for a v1 mirror
-// hit. The standard mirror.ComputeDriftSignal would return MirrorDrifted=true
-// for a v1 mirror because there's no stored checksum to compare against;
-// this function recomputes MirrorDrifted via direct managed-field comparison
+// reconcileMigration runs SPEC.md "Schema version migration" for any mirror
+// whose stored calendar-sync:version differs from the current SchemaVersion
+// (v1 or v2 today; future legacy versions automatically). The standard
+// mirror.ComputeDriftSignal would return MirrorDrifted=true for a v1 mirror
+// (no stored checksum) and is unreliable for any pre-current-version mirror
+// whose stored checksum was computed over a smaller managed-field set; this
+// function recomputes MirrorDrifted via direct managed-field comparison
 // (live vs desired-from-source) and then routes by the four-way matrix:
 //
 //   - !source_changed && !mirror_drifted: migration_upgrade. Re-write the
-//     mirror with version=2 + a fresh checksum. SPEC.md "Schema version
-//     migration" routes this cell here rather than to skip(unchanged).
+//     mirror at the current SchemaVersion with a fresh checksum. SPEC.md
+//     "Schema version migration" routes this cell here rather than to
+//     skip(unchanged).
 //   - source_changed && mirror_drifted: source-wins-by-default. SPEC says
-//     newer-wins isn't reliable for v1 mirrors (no user-edit timestamp),
-//     so we patch from source unconditionally with conflict=migration_
-//     source_won.
+//     newer-wins isn't reliable across schema versions (v1 mirrors lack a
+//     usable user-edit timestamp; v2 mirrors have one but we keep v1
+//     semantics for simplicity and consistency), so we patch from source
+//     unconditionally with conflict=migration_source_won.
 //   - source_changed && !mirror_drifted: standard patch(source_updated).
-//     The cell behaves identically to the v2 matrix; falls through to the
-//     existing patch path so the v1/v2 paths converge afterward.
+//     The cell behaves identically to the standard matrix; falls through
+//     to the existing patch path so the legacy/current paths converge
+//     afterward.
 //   - !source_changed && mirror_drifted: standard propagate or revert.
 //     Falls through to mirror.Classify for the same reason.
 //
-// The two cells that diverge from v2 are handled inline; the other two fall
-// through to the standard mirror.Classify dispatch. This mirrors the
-// recurring handler's v1 routing in internal/recurring/handler.go.
+// The two cells that diverge from the standard matrix are handled inline;
+// the other two fall through to the standard mirror.Classify dispatch.
+// This mirrors the recurring handler's migration routing in
+// internal/recurring/handler.go.
 func (c *Classifier) reconcileMigration(
 	ctx context.Context,
 	source, mirrorEvent *gws.Event,
@@ -43,7 +50,8 @@ func (c *Classifier) reconcileMigration(
 
 	switch {
 	case !signal.SourceChanged && !signal.MirrorDrifted:
-		// migration_upgrade: rewrite with version=2 + checksum.
+		// migration_upgrade: rewrite at the current SchemaVersion with a
+		// fresh checksum.
 		return c.doMigrationUpgrade(ctx, source, mirrorEvent, desired)
 
 	case signal.SourceChanged && signal.MirrorDrifted:
@@ -51,9 +59,9 @@ func (c *Classifier) reconcileMigration(
 		return c.doMigrationSourceWon(ctx, source, mirrorEvent, desired)
 	}
 
-	// Source-only or mirror-only: identical to v2. Fall through to the
-	// standard outcome dispatch so the propagate/revert/patch logic stays
-	// in one place.
+	// Source-only or mirror-only: identical to the standard matrix. Fall
+	// through to the standard outcome dispatch so the propagate/revert/
+	// patch logic stays in one place.
 	outcome := mirror.Classify(signal, c.SourceWritable, source.Updated, mirrorEvent.Updated)
 	switch outcome.Action {
 	case mirror.ActionSkip:
@@ -77,11 +85,12 @@ func (c *Classifier) reconcileMigration(
 // doMigrationUpgrade is SPEC.md "Schema version migration"'s
 // !source_changed && !mirror_drifted cell. The mirror's managed fields
 // already match the source; we just need to rewrite the extended-property
-// layout (version=2 + fresh :checksum).
+// layout (current SchemaVersion + fresh :checksum, plus any new managed
+// fields the legacy schema didn't carry).
 //
-// BuildPayload already sets calendar-sync:version=2 in the extended
-// properties; the patch+checksum-followup pair is the same primitive as
-// any other patch path.
+// BuildPayload writes the current SchemaVersion in the extended properties;
+// the patch+checksum-followup pair is the same primitive as any other
+// patch path.
 func (c *Classifier) doMigrationUpgrade(
 	ctx context.Context,
 	source, mirrorEvent *gws.Event,
@@ -106,11 +115,12 @@ func (c *Classifier) doMigrationUpgrade(
 }
 
 // doMigrationSourceWon is SPEC.md "Schema version migration"'s
-// source_changed && mirror_drifted cell. v1 mirrors have no reliable
-// user-edit timestamp, so the SPEC mandates source-wins-by-default
-// rather than newer-wins. The mirror's edits are overwritten regardless
-// of timestamps; the conflict logging surfaces this to the user as
-// migration_source_won.
+// source_changed && mirror_drifted cell. Legacy mirrors take source-wins
+// during migration regardless of stored timestamps: v1 mirrors lack a
+// reliable user-edit timestamp, and v2 mirrors keep the same simpler
+// behavior so the migration cell stays consistent across legacy versions.
+// The mirror's edits are overwritten regardless of timestamps; the
+// conflict logging surfaces this to the user as migration_source_won.
 func (c *Classifier) doMigrationSourceWon(
 	ctx context.Context,
 	source, mirrorEvent *gws.Event,

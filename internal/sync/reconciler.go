@@ -728,6 +728,17 @@ func (r *Reconciler) buildClassifier(
 // `visited` may be nil; Tick passes nil because there's no orphan walk on
 // per-tick reconciliation. FullSync passes a non-nil map for the orphan
 // walk that follows.
+//
+// Source-tuple dedupe (B2 cause B): events.list can return the same
+// source-tuple twice in a single response - the documented case is a
+// `_R<timestamp>`-shaped recurring parent that appears both as a
+// top-level event and as a `recurring_event_id` on its own child
+// instances. A second Classify on the same tuple is at best a wasted
+// no-op and at worst (with the dryRunAPI defect) routes to the
+// migration matrix and emits a bogus migration_source_won outcome.
+// We track seen tuples per call and silently skip subsequent
+// occurrences. SPEC's outcomes table doesn't define a "duplicate"
+// reason; emitting one would surface as wire-format noise.
 func (r *Reconciler) runClassifyLoop(
 	ctx context.Context,
 	c *Classifier,
@@ -741,19 +752,35 @@ func (r *Reconciler) runClassifyLoop(
 		"target_calendar", c.TargetCalendarID,
 		"events", len(events),
 	)
+	seen := make(map[mirror.SourceTuple]bool, len(events))
 	var errs []error
 	for i := range events {
 		ev := events[i]
+		tuple := mirror.SourceTuple{
+			CalendarID: c.SourceCalendarID,
+			EventID:    ev.ID,
+		}
+
 		// Track visited BEFORE Classify - the orphan walk needs to know we
 		// SAW this source-tuple even if Classify errored on it. (The
 		// alternative - skip on error - would treat a transient API
 		// failure as "this source vanished" and delete the mirror.)
+		// Tracking happens regardless of dedupe state; recording the
+		// tuple a second time is a no-op on the visited set.
 		if visited != nil {
-			visited[mirror.SourceTuple{
-				CalendarID: c.SourceCalendarID,
-				EventID:    ev.ID,
-			}] = true
+			visited[tuple] = true
 		}
+
+		if seen[tuple] {
+			r.debug("sync.runClassifyLoop duplicate",
+				"pair", c.Pair,
+				"direction", c.Direction,
+				"source_event", ev.ID,
+				"recurring_event_id", ev.RecurringEventID,
+			)
+			continue
+		}
+		seen[tuple] = true
 
 		r.debug("sync.runClassifyLoop event",
 			"pair", c.Pair,

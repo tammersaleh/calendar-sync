@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.1](https://github.com/tammersaleh/calendar-sync/compare/v1.1.0...v1.1.1) (2026-05-02)
+
+
+### Bug Fixes
+
+* skip status=cancelled tombstones in BuildInventory (B11) ([a0552d9](https://github.com/tammersaleh/calendar-sync/commit/a0552d9017b0842a36ca00f092242492508a0386))
+
 ## [1.1.0](https://github.com/tammersaleh/calendar-sync/compare/v1.0.0...v1.1.0) (2026-05-02)
 
 

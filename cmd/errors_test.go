@@ -284,6 +284,22 @@ func TestUnwrapCause(t *testing.T) {
 			err:  fmt.Errorf("outer: %w", errors.New("inner")),
 			want: "inner",
 		},
+		{
+			// Production partial_failure shape: Reconciler.runClassifyLoop
+			// aggregates per-event classify errors via errors.Join, and the
+			// joined value becomes cmdError.cause. errors.Unwrap returns nil
+			// on a joinError, so the previous implementation silently dropped
+			// the cause; reading cmdError.cause directly preserves it.
+			name: "cmdError wrapping errors.Join surfaces the joined text",
+			err: newCmdError("partial_failure", "1 pdir(s) failed", "",
+				errors.Join(
+					fmt.Errorf("classify a/b: %w", gws.ErrAPIConflict),
+					fmt.Errorf("classify a/c: %w", gws.ErrAPIConflict),
+				)),
+			want: fmt.Errorf("classify a/b: %w", gws.ErrAPIConflict).Error() +
+				"\n" +
+				fmt.Errorf("classify a/c: %w", gws.ErrAPIConflict).Error(),
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

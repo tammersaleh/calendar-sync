@@ -157,17 +157,23 @@ func handleErr(stderr io.Writer, err error) int {
 	return output.ExitCodeFor(code)
 }
 
-// unwrapCause does a single-step errors.Unwrap on err and returns the
-// wrapped error's Error() text, or "" if err doesn't wrap anything. Used
-// by handleErr to populate ErrorEnvelope.Cause without duplicating the
-// top-level detail (which is err.Error() for non-cmdError types).
+// unwrapCause returns the underlying-cause text used to populate
+// ErrorEnvelope.Cause. For *cmdError (the common case) it reads the
+// cause field directly; that field's Error() handles whatever shape the
+// cause is (single error, fmt.Errorf chain, errors.Join multi-error).
+// For non-cmdError types it falls back to errors.Unwrap and returns the
+// wrapped error's Error() text, or "" if there's no wrap.
 //
-// For *cmdError, Unwrap returns the cause field directly - the underlying
-// gws/sync error operators want surfaced. For other error types, the
-// behavior depends on whether they implement Unwrap; non-wrapping errors
-// return "" and the omitempty rule on Cause drops it cleanly from the
-// JSON envelope.
+// Reading cmdError.cause directly rather than going through errors.Unwrap
+// is what makes errors.Join causes work: errors.Unwrap on a joinError
+// returns nil (joinError implements Unwrap() []error, not Unwrap() error),
+// which would otherwise drop the Cause field via omitempty even though
+// the joined Error() text is exactly what operators need.
 func unwrapCause(err error) string {
+	var ce *cmdError
+	if errors.As(err, &ce) && ce.cause != nil {
+		return ce.cause.Error()
+	}
 	cause := errors.Unwrap(err)
 	if cause == nil {
 		return ""

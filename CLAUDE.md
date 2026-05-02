@@ -220,11 +220,11 @@ The gate lives in the Reconciler rather than in mirror.Classify so Classify stay
 
 The same pattern (`internal/gws.Logger`) exists in the gws layer for the same reason. When extending, add new logger calls inside nil-safe wrappers (`r.debug`, `c.debug`, `h.debug`) on the receiver - direct `r.Log.Debug(...)` without the nil check breaks tests that don't set Log.
 
-### `cmdError.Unwrap` carries cause; `handleErr` populates `ErrorEnvelope.Cause`
+### `cmdError.cause` carries cause; `handleErr` populates `ErrorEnvelope.Cause`
 
-The partial_failure path wraps the first PDir error as the cmdError's cause field via `newCmdError(code, detail, hint, cause)`. cmdError.Unwrap returns that field, so `errors.Unwrap(err)` from handleErr gives the underlying gws/sync error. SPEC line 384's `cause` field is now populated from that single-step unwrap (see `cmd/cli.go:unwrapCause`).
+The partial_failure path wraps the first PDir error as the cmdError's cause field via `newCmdError(code, detail, hint, cause)`. `cmd/cli.go:unwrapCause` reads `ce.cause.Error()` directly via type assertion when err is a *cmdError, then falls back to `errors.Unwrap(err)` for non-cmdError types.
 
-Don't try to make the cause "smarter" - a single-step unwrap is exactly right for cmdError chains. The omitempty rule on the field handles non-cmdError fall-throughs cleanly.
+Reading the field directly is required, not stylistic. `Reconciler.runClassifyLoop` aggregates per-event classify errors via `errors.Join`, and `errors.Unwrap` returns nil on the resulting joinError (it implements `Unwrap() []error`, not `Unwrap() error`). A single-step `errors.Unwrap(cmdErr)` would therefore drop the cause whenever the pdir failed with multiple events - which is the production partial_failure shape.
 
 ## Sandbox
 

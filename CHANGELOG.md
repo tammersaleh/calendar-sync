@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.0](https://github.com/tammersaleh/calendar-sync/compare/v2.0.0...v2.1.0) (2026-05-02)
+
+
+### Features
+
+* include location in managed fields (v3 schema) ([02e0c89](https://github.com/tammersaleh/calendar-sync/commit/02e0c89cb959d494dfe42eb790cb843f94b895a6))
+
 ## [2.0.0](https://github.com/tammersaleh/calendar-sync/compare/v1.1.3...v2.0.0) (2026-05-02)
 
 

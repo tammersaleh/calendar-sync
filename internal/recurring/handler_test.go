@@ -138,11 +138,14 @@ func (s *stubAPI) callsByOp(op string) []recordedCall {
 	return out
 }
 
-// makeV2Mirror builds a v2 mirror with the given live fields and a checksum
+// makeCleanCurrentMirror builds a clean current-schema mirror (whatever
+// mirror.SchemaVersion resolves to) with the given live fields and a checksum
 // that hashes the same fields - representing a clean (non-drifted) mirror.
+// Migration tests that need a genuinely v2 mirror build it inline with a
+// literal "2" version rather than using this helper.
 // To represent a drifted mirror, pass different live fields then call
 // driftMirror with the user's edits.
-func makeV2Mirror(id, storedSourceUpdated, liveUpdated string, fields managedFieldHints) *gws.Event {
+func makeCleanCurrentMirror(id, storedSourceUpdated, liveUpdated string, fields managedFieldHints) *gws.Event {
 	e := &gws.Event{
 		ID:           id,
 		Status:       gws.EventStatusConfirmed,
@@ -239,7 +242,7 @@ func TestHandle_Step1_MirrorParentInInventory(t *testing.T) {
 	api := newStubAPI()
 	mirrorParent := makeMirrorParent("mp-1")
 	source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
-	mirrorInst := makeV2Mirror("mi-1", "2026-04-29T20:00:00Z", "2026-04-29T20:00:00Z", managedFieldHints{
+	mirrorInst := makeCleanCurrentMirror("mi-1", "2026-04-29T20:00:00Z", "2026-04-29T20:00:00Z", managedFieldHints{
 		summary:     source.Summary,
 		description: source.Description + "\n\n---\nSource: " + source.HTMLLink,
 		start:       source.Start,
@@ -296,7 +299,7 @@ func TestHandle_Step1_RepairsMirrorParentViaReconciler(t *testing.T) {
 	api.queueGet("src-cal", "src-parent", sourceParent)
 
 	// Once parent recovered, locate instance -> matches -> drift no-change.
-	mirrorInst := makeV2Mirror("mi-1", "2026-04-29T20:00:00Z", "2026-04-29T20:00:00Z", managedFieldHints{
+	mirrorInst := makeCleanCurrentMirror("mi-1", "2026-04-29T20:00:00Z", "2026-04-29T20:00:00Z", managedFieldHints{
 		summary:     source.Summary,
 		description: source.Description + "\n\n---\nSource: " + source.HTMLLink,
 		start:       source.Start,
@@ -404,7 +407,7 @@ func TestHandle_Step2_InstanceFoundOnFirstLookup(t *testing.T) {
 	api := newStubAPI()
 	mirrorParent := makeMirrorParent("mp-1")
 	source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
-	mi := makeV2Mirror("mi-1", source.Updated, source.Updated, managedFieldHints{
+	mi := makeCleanCurrentMirror("mi-1", source.Updated, source.Updated, managedFieldHints{
 		summary:     source.Summary,
 		description: source.Description + "\n\n---\nSource: " + source.HTMLLink,
 		start:       source.Start,
@@ -450,7 +453,7 @@ func TestHandle_Step2_AllDayOriginalStart(t *testing.T) {
 		RecurringEventID:  "src-parent",
 		OriginalStartTime: &gws.EventDateTime{Date: "2026-05-01"}, // YYYY-MM-DD only
 	}
-	mi := makeV2Mirror("mi-1", source.Updated, source.Updated, managedFieldHints{
+	mi := makeCleanCurrentMirror("mi-1", source.Updated, source.Updated, managedFieldHints{
 		summary:     source.Summary,
 		description: source.Description + "\n\n---\nSource: " + source.HTMLLink,
 		start:       source.Start,
@@ -512,7 +515,7 @@ func TestHandle_Step2_RepairAfterZeroResults(t *testing.T) {
 	api.queuePatch(&postChecksumParent)
 
 	// Retry instances: returns the now-materialized instance.
-	mi := makeV2Mirror("mi-1", source.Updated, source.Updated, managedFieldHints{
+	mi := makeCleanCurrentMirror("mi-1", source.Updated, source.Updated, managedFieldHints{
 		summary:     source.Summary,
 		description: source.Description + "\n\n---\nSource: " + source.HTMLLink,
 		start:       source.Start,
@@ -711,7 +714,7 @@ func TestHandle_Step3_CancellationFamily(t *testing.T) {
 			source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
 			c.mutateSrc(source)
 
-			mi := makeV2Mirror("mi-1", source.Updated, source.Updated, managedFieldHints{
+			mi := makeCleanCurrentMirror("mi-1", source.Updated, source.Updated, managedFieldHints{
 				summary:     source.Summary,
 				description: source.Description + "\n\n---\nSource: " + source.HTMLLink,
 				start:       source.Start,
@@ -772,7 +775,7 @@ func TestHandle_Step3_DriftNoChange(t *testing.T) {
 	api := newStubAPI()
 	mirrorParent := makeMirrorParent("mp-1")
 	source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
-	mi := makeV2Mirror("mi-1", source.Updated, source.Updated, managedFieldHints{
+	mi := makeCleanCurrentMirror("mi-1", source.Updated, source.Updated, managedFieldHints{
 		summary:     source.Summary,
 		description: source.Description + "\n\n---\nSource: " + source.HTMLLink,
 		start:       source.Start,
@@ -807,7 +810,7 @@ func TestHandle_Step3_SourceChangedOnly_PatchesMirror(t *testing.T) {
 	source := makeSourceException("2026-04-30T10:00:00Z", "2026-05-01T12:00:00Z", "Standup updated")
 
 	// Mirror records older source_updated; managed fields are mirror's still-current state.
-	mi := makeV2Mirror("mi-1", "2026-04-29T20:00:00Z", "2026-04-29T20:00:00Z", managedFieldHints{
+	mi := makeCleanCurrentMirror("mi-1", "2026-04-29T20:00:00Z", "2026-04-29T20:00:00Z", managedFieldHints{
 		summary:     "Standup",
 		description: "Standup\n\n---\nSource: " + source.HTMLLink,
 		start:       source.Start,
@@ -873,7 +876,7 @@ func TestHandle_Step3_MirrorDriftedOnly_Propagate(t *testing.T) {
 	// drift the live summary to simulate a user edit. SourceUpdated stored
 	// on the mirror matches source.Updated so SourceChanged=false; the
 	// hash mismatch produces MirrorDrifted=true.
-	mi := makeV2Mirror("mi-1", source.Updated, "2026-04-30T08:00:00Z", managedFieldHints{
+	mi := makeCleanCurrentMirror("mi-1", source.Updated, "2026-04-30T08:00:00Z", managedFieldHints{
 		summary:     source.Summary,
 		description: source.Description + "\n\n---\nSource: " + source.HTMLLink,
 		start:       source.Start,
@@ -955,7 +958,7 @@ func TestHandle_Step3_MirrorDriftedOnly_Revert(t *testing.T) {
 	mirrorParent := makeMirrorParent("mp-1")
 	source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
 
-	mi := makeV2Mirror("mi-1", source.Updated, "2026-04-30T08:00:00Z", managedFieldHints{
+	mi := makeCleanCurrentMirror("mi-1", source.Updated, "2026-04-30T08:00:00Z", managedFieldHints{
 		summary:     source.Summary,
 		description: source.Description + "\n\n---\nSource: " + source.HTMLLink,
 		start:       source.Start,
@@ -1011,7 +1014,7 @@ func TestHandle_Step3_BothChanged_SourceNewer_Patch(t *testing.T) {
 	// Mirror's stored source_updated is older (SourceChanged=true) AND
 	// the live fields drift from the stored checksum (MirrorDrifted=true).
 	// Build clean, then drift.
-	mi := makeV2Mirror("mi-1", "2026-04-29T20:00:00Z", "2026-04-30T10:00:00Z", managedFieldHints{
+	mi := makeCleanCurrentMirror("mi-1", "2026-04-29T20:00:00Z", "2026-04-30T10:00:00Z", managedFieldHints{
 		summary:     "Standup",
 		description: "Standup\n\n---\nSource: " + source.HTMLLink,
 		start:       source.Start,
@@ -1055,7 +1058,7 @@ func TestHandle_Step3_BothChanged_MirrorNewer_Propagate(t *testing.T) {
 	source := makeSourceException("2026-04-30T09:00:00Z", "2026-05-01T12:00:00Z", "Source new")
 
 	// Mirror's live `updated` is newer than source.Updated, AND fields drift.
-	mi := makeV2Mirror("mi-1", "2026-04-29T20:00:00Z", "2026-04-30T10:00:00Z", managedFieldHints{
+	mi := makeCleanCurrentMirror("mi-1", "2026-04-29T20:00:00Z", "2026-04-30T10:00:00Z", managedFieldHints{
 		summary:     "Standup",
 		description: "Standup\n\n---\nSource: " + source.HTMLLink,
 		start:       source.Start,
@@ -1101,7 +1104,7 @@ func TestHandle_Step3_BothChanged_MirrorNewer_Revert(t *testing.T) {
 	mirrorParent := makeMirrorParent("mp-1")
 	source := makeSourceException("2026-04-30T09:00:00Z", "2026-05-01T12:00:00Z", "Source new")
 
-	mi := makeV2Mirror("mi-1", "2026-04-29T20:00:00Z", "2026-04-30T10:00:00Z", managedFieldHints{
+	mi := makeCleanCurrentMirror("mi-1", "2026-04-29T20:00:00Z", "2026-04-30T10:00:00Z", managedFieldHints{
 		summary:     "Standup",
 		description: "Standup\n\n---\nSource: " + source.HTMLLink,
 		start:       source.Start,

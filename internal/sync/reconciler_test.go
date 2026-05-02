@@ -911,7 +911,7 @@ func TestFullSync_RecurringDelegation_RoutesToHandler(t *testing.T) {
 
 	// Step 2: events.instances on the mirror parent returns the mirror
 	// instance.
-	mirrorInst := makeCleanV2Mirror("mi-1", "src-A:src-evt",
+	mirrorInst := makeCleanCurrentMirror("mi-1", "src-A:src-evt",
 		"2026-04-29T20:00:00Z", "2026-04-30T08:00:00Z",
 		"Standup", source.Start, source.End,
 	)
@@ -968,7 +968,7 @@ func TestFullSync_OrphanWalk_SkipsVisitedEntries(t *testing.T) {
 
 	// Inventory has a mirror for that exact source. Classify should run a
 	// patch (matching by source-tuple); orphan walk skips it.
-	mirrorEv := makeCleanV2Mirror("m1", "src-A:evt-1",
+	mirrorEv := makeCleanCurrentMirror("m1", "src-A:evt-1",
 		"2026-04-29T20:00:00Z", "2026-04-29T20:00:00Z",
 		src.Summary, src.Start, src.End)
 	api.queueListInventory("tgt-A", mirror.SchemaVersion, []gws.Event{*mirrorEv})

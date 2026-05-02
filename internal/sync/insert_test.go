@@ -25,7 +25,7 @@ func TestClassify_Step8_Insert_409_AliveExisting_ReconcilesAsHit(t *testing.T) {
 
 	api.queueInsertErr(&gws.Error{Code: gws.CodeAPIConflict, ExitCode: 1})
 	deterministic := mirror.DeterministicID("src-cal", "src-evt")
-	existing := makeCleanV2Mirror(deterministic, "src-cal:src-evt",
+	existing := makeCleanCurrentMirror(deterministic, "src-cal:src-evt",
 		source.Updated, "2026-04-29T20:00:00Z",
 		source.Summary, source.Start, source.End)
 	api.queueGet("tgt-cal", deterministic, existing)
@@ -62,7 +62,7 @@ func TestClassify_Step8_Insert_409_AliveExisting_RunsDriftDetection(t *testing.T
 	deterministic := mirror.DeterministicID("src-cal", "src-evt")
 	// stored source_updated older than source.Updated -> SourceChanged=true.
 	// Mirror's live managed fields are clean (match its stored checksum).
-	existing := makeCleanV2Mirror(deterministic, "src-cal:src-evt",
+	existing := makeCleanCurrentMirror(deterministic, "src-cal:src-evt",
 		"2026-04-29T20:00:00Z", "2026-04-29T20:00:00Z",
 		"Standup", source.Start, source.End)
 	api.queueGet("tgt-cal", deterministic, existing)
@@ -102,7 +102,7 @@ func TestClassify_Step8_Insert_409_CancelledExisting_Revives(t *testing.T) {
 	}
 	api.queueGet("tgt-cal", deterministic, cancelled)
 
-	postMain := makeCleanV2Mirror(deterministic, "src-cal:src-evt",
+	postMain := makeCleanCurrentMirror(deterministic, "src-cal:src-evt",
 		source.Updated, "2026-04-29T20:00:00Z",
 		source.Summary, source.Start, source.End)
 	api.queuePatch(postMain)

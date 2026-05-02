@@ -60,12 +60,12 @@ func addHourToDateTime(s string) string {
 	return t.Add(time.Hour).Format(time.RFC3339)
 }
 
-// makeCleanV2Mirror builds a v2 mirror whose live managed fields match the
+// makeCleanCurrentMirror builds a clean current-schema mirror whose live managed fields match the
 // stored checksum (i.e. MirrorDrifted=false). storedSourceUpdated is what
 // the mirror recorded as the source's updated at last write; liveUpdated is
 // the mirror's own updated. To produce drift, mutate the returned event
 // before passing it to Classify.
-func makeCleanV2Mirror(id, source, storedSourceUpdated, liveUpdated string, summary string, start, end *gws.EventDateTime) *gws.Event {
+func makeCleanCurrentMirror(id, source, storedSourceUpdated, liveUpdated string, summary string, start, end *gws.EventDateTime) *gws.Event {
 	e := &gws.Event{
 		ID:           id,
 		Status:       gws.EventStatusConfirmed,
@@ -216,7 +216,7 @@ func TestClassify_Step2_RecurringDelegation_UpdatesInventory(t *testing.T) {
 		Summary:    "Standup",
 		Recurrence: []string{"RRULE:FREQ=WEEKLY"},
 	}
-	mirrorInst := makeCleanV2Mirror("mi-1", "src-cal:src-evt",
+	mirrorInst := makeCleanCurrentMirror("mi-1", "src-cal:src-evt",
 		"2026-04-29T20:00:00Z", "2026-04-30T08:00:00Z",
 		"Standup", source.Start, source.End,
 	)
@@ -321,7 +321,7 @@ func TestClassify_Step2_RecurringDelegation_BothPostWritesUpdated(t *testing.T) 
 	api.queuePatch(repairedParent) // checksum followup
 
 	// Step 2 retries events.instances; now it returns one instance.
-	mirrorInst := makeCleanV2Mirror("mi-1", "src-cal:src-evt",
+	mirrorInst := makeCleanCurrentMirror("mi-1", "src-cal:src-evt",
 		"2026-04-29T20:00:00Z", "2026-04-30T08:00:00Z",
 		"Standup", source.Start, source.End,
 	)
@@ -408,7 +408,7 @@ func TestClassify_Step2_RecurringDelegation_CancellationKeepsInventoryEntry(t *t
 	}
 
 	// Step 2 finds the live (not-yet-cancelled) mirror instance.
-	mirrorInst := makeCleanV2Mirror("mi-1", "src-cal:src-evt",
+	mirrorInst := makeCleanCurrentMirror("mi-1", "src-cal:src-evt",
 		"2026-04-29T20:00:00Z", "2026-04-30T08:00:00Z",
 		"Standup",
 		&gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z"},
@@ -488,7 +488,7 @@ func TestClassify_Step3_Cancelled_DeleteWhenMirrorPresent(t *testing.T) {
 	source := makeNonRecurringSource("src-evt", "2026-04-29T20:00:00Z", &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"})
 	source.Status = gws.EventStatusCancelled
 
-	mirrorEv := makeCleanV2Mirror("mi-1", "src-cal:src-evt",
+	mirrorEv := makeCleanCurrentMirror("mi-1", "src-cal:src-evt",
 		"2026-04-29T20:00:00Z", "2026-04-29T20:00:00Z",
 		"Standup", source.Start, source.End)
 	inv.Set(mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt"}, mirrorEv)
@@ -610,7 +610,7 @@ func TestClassify_Steps4_5_6_FilterFamily(t *testing.T) {
 
 			tuple := mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt"}
 			if c.mirrorInInv {
-				mirrorEv := makeCleanV2Mirror("mi-1", "src-cal:src-evt",
+				mirrorEv := makeCleanCurrentMirror("mi-1", "src-cal:src-evt",
 					"2026-04-29T20:00:00Z", "2026-04-29T20:00:00Z",
 					"Standup", source.Start, source.End)
 				inv.Set(tuple, mirrorEv)
@@ -658,7 +658,7 @@ func TestClassify_Step7_NonRecurring_StartPastHorizon_DeleteOrSkip(t *testing.T)
 	// horizon 30d -> events more than 30d out are outside.
 	source := makeNonRecurringSource("src-evt", "2026-04-29T20:00:00Z", &gws.EventDateTime{DateTime: "2026-12-01T12:00:00Z"})
 
-	mirrorEv := makeCleanV2Mirror("mi-1", "src-cal:src-evt",
+	mirrorEv := makeCleanCurrentMirror("mi-1", "src-cal:src-evt",
 		"2026-04-29T20:00:00Z", "2026-04-29T20:00:00Z",
 		"Standup", source.Start, source.End)
 	inv.Set(mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt"}, mirrorEv)
@@ -711,7 +711,7 @@ func TestClassify_Step7_RecurringParent_HasInstanceInWindow_FallsThrough(t *test
 	api.queueInstances([]gws.Event{{ID: "any-instance"}})
 
 	// Expect a successful insert path because there's no mirror in inventory.
-	insertResp := makeCleanV2Mirror(mirror.DeterministicID("src-cal", "src-evt"),
+	insertResp := makeCleanCurrentMirror(mirror.DeterministicID("src-cal", "src-evt"),
 		"src-cal:src-evt",
 		"2026-04-29T20:00:00Z", "2026-04-30T08:00:00Z",
 		source.Summary, source.Start, source.End,
@@ -800,7 +800,7 @@ func TestClassify_Step8_InventoryMiss_Insert(t *testing.T) {
 	source := makeNonRecurringSource("src-evt", "2026-04-29T20:00:00Z", &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"})
 
 	deterministic := mirror.DeterministicID("src-cal", "src-evt")
-	insertedMirror := makeCleanV2Mirror(deterministic, "src-cal:src-evt",
+	insertedMirror := makeCleanCurrentMirror(deterministic, "src-cal:src-evt",
 		source.Updated, "2026-04-30T08:00:00Z",
 		source.Summary, source.Start, source.End,
 	)
@@ -847,7 +847,7 @@ func TestClassify_Step8_InventoryHit_Unchanged_Skip(t *testing.T) {
 	sink, captured := captureOutputs()
 
 	source := makeNonRecurringSource("src-evt", "2026-04-29T20:00:00Z", &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"})
-	mirrorEv := makeCleanV2Mirror("mi-1", "src-cal:src-evt",
+	mirrorEv := makeCleanCurrentMirror("mi-1", "src-cal:src-evt",
 		source.Updated, "2026-04-29T20:00:00Z",
 		source.Summary, source.Start, source.End)
 	inv.Set(mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt"}, mirrorEv)
@@ -875,7 +875,7 @@ func TestClassify_Step8_InventoryHit_SourceChanged_Patch(t *testing.T) {
 
 	// stored source_updated older -> SourceChanged=true. Mirror managed fields
 	// match its stored checksum -> MirrorDrifted=false.
-	mirrorEv := makeCleanV2Mirror("mi-1", "src-cal:src-evt",
+	mirrorEv := makeCleanCurrentMirror("mi-1", "src-cal:src-evt",
 		"2026-04-29T20:00:00Z", "2026-04-29T20:00:00Z",
 		"Standup", source.Start, source.End)
 	inv.Set(mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt"}, mirrorEv)
@@ -919,7 +919,7 @@ func TestClassify_Step8_InventoryHit_MirrorDriftedOnly_Propagate(t *testing.T) {
 
 	// Build a clean mirror, then drift the live summary so the stored checksum
 	// no longer matches.
-	mirrorEv := makeCleanV2Mirror("mi-1", "src-cal:src-evt",
+	mirrorEv := makeCleanCurrentMirror("mi-1", "src-cal:src-evt",
 		source.Updated, "2026-04-30T08:00:00Z",
 		source.Summary, source.Start, source.End)
 	mirrorEv.Summary = "User edit"
@@ -969,7 +969,7 @@ func TestClassify_Step8_InventoryHit_MirrorDriftedOnly_Revert(t *testing.T) {
 
 	source := makeNonRecurringSource("src-evt", "2026-04-29T20:00:00Z", &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"})
 
-	mirrorEv := makeCleanV2Mirror("mi-1", "src-cal:src-evt",
+	mirrorEv := makeCleanCurrentMirror("mi-1", "src-cal:src-evt",
 		source.Updated, "2026-04-30T08:00:00Z",
 		source.Summary, source.Start, source.End)
 	mirrorEv.Summary = "User edit"
@@ -1008,7 +1008,7 @@ func TestClassify_Step8_InventoryHit_BothChanged_SourceNewer(t *testing.T) {
 
 	// Mirror's stored source_updated older AND live fields differ. Mirror's
 	// own Updated older than source -> source-newer wins.
-	mirrorEv := makeCleanV2Mirror("mi-1", "src-cal:src-evt",
+	mirrorEv := makeCleanCurrentMirror("mi-1", "src-cal:src-evt",
 		"2026-04-29T20:00:00Z", "2026-04-30T10:00:00Z",
 		"Standup", source.Start, source.End)
 	mirrorEv.Summary = "User edit"
@@ -1048,7 +1048,7 @@ func TestClassify_Step8_InventoryHit_BothChanged_MirrorNewer_Propagate(t *testin
 	source := makeNonRecurringSource("src-evt", "2026-04-30T09:00:00Z", &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"})
 	source.Summary = "Source new"
 
-	mirrorEv := makeCleanV2Mirror("mi-1", "src-cal:src-evt",
+	mirrorEv := makeCleanCurrentMirror("mi-1", "src-cal:src-evt",
 		"2026-04-29T20:00:00Z", "2026-04-30T10:00:00Z", // mirror Updated NEWER
 		"Standup", source.Start, source.End)
 	mirrorEv.Summary = "User edit"
@@ -1091,7 +1091,7 @@ func TestClassify_Step8_InventoryHit_BothChanged_MirrorNewer_Revert(t *testing.T
 	source := makeNonRecurringSource("src-evt", "2026-04-30T09:00:00Z", &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"})
 	source.Summary = "Source new"
 
-	mirrorEv := makeCleanV2Mirror("mi-1", "src-cal:src-evt",
+	mirrorEv := makeCleanCurrentMirror("mi-1", "src-cal:src-evt",
 		"2026-04-29T20:00:00Z", "2026-04-30T10:00:00Z",
 		"Standup", source.Start, source.End)
 	mirrorEv.Summary = "User edit"
@@ -1340,7 +1340,7 @@ func TestClassify_DeleteErrorPropagates(t *testing.T) {
 	source := makeNonRecurringSource("src-evt", "2026-04-29T20:00:00Z", &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"})
 	source.Status = gws.EventStatusCancelled
 
-	mirrorEv := makeCleanV2Mirror("mi-1", "src-cal:src-evt",
+	mirrorEv := makeCleanCurrentMirror("mi-1", "src-cal:src-evt",
 		source.Updated, source.Updated,
 		"Standup", source.Start, source.End)
 	inv.Set(mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt"}, mirrorEv)

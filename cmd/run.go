@@ -67,8 +67,10 @@ func (c *RunCmd) run(rt *Runtime, canonical *config.Canonical, count *int) error
 			"Check `calendar-sync pair list` for available pairs.", nil)
 	}
 
+	// SPEC line 253: `[settings].dry_run = true` must suppress writes the
+	// same way `--dry-run` does. Either source of truth flips the wrapper.
 	api := rt.gwsClient()
-	if c.DryRun {
+	if c.DryRun || canonical.Settings.DryRun {
 		api = newDryRunAPI(api)
 	}
 

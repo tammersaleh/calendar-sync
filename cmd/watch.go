@@ -30,7 +30,13 @@ func (c *WatchCmd) Run(rt *Runtime) error {
 		return err
 	}
 
+	// SPEC line 253: `[settings].dry_run = true` must suppress writes. The
+	// daemon has no `--dry-run` flag (long-running by design), so settings
+	// is the only way to flip the wrapper for `watch`.
 	api := rt.gwsClient()
+	if canonical.Settings.DryRun {
+		api = newDryRunAPI(api)
+	}
 	opts := []syncpkg.Option{
 		syncpkg.WithHorizon(canonical.Settings.Horizon.Duration()),
 		syncpkg.WithPropagateTargetEdits(canonical.Settings.PropagateTargetEdits),

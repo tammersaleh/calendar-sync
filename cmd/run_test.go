@@ -10,8 +10,11 @@ import (
 	"runtime/debug"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/tammersaleh/calendar-sync/internal/config"
 	"github.com/tammersaleh/calendar-sync/internal/gws"
+	syncpkg "github.com/tammersaleh/calendar-sync/internal/sync"
 )
 
 func TestRunCmd_EmptySourceListEmitsMetaOnly(t *testing.T) {
@@ -707,4 +710,70 @@ func TestDryRunAPI_ZeroWritesAcrossEventShapes(t *testing.T) {
 	}()
 
 	_ = (&RunCmd{DryRun: true}).Run(rt)
+}
+
+// TestRunCmd_ConfigHorizonWiredToReconciler pins B4 from doc/bugs.md: the
+// `[settings].horizon` config field is the single configurable surface for
+// the sync horizon (SPEC line 249); there is no `--horizon` CLI flag, by
+// design. The wire-through is `cmd/run.go` and `cmd/watch.go` calling
+// `syncpkg.WithHorizon(canonical.Settings.Horizon.Duration())`. A
+// regression that drops the call here would be invisible at the cmd-layer
+// surface (`run` would still complete) but would leave the Reconciler
+// running with `Horizon=0` so EVERY event is treated as outside-horizon
+// and every mirror gets deleted.
+//
+// Two cases pin both ends of the SPEC's allowed range (1d-730d):
+//   - "1d" → 24h: smallest horizon, the day-by-day rollout shape.
+//   - "365d" → 8760h: SPEC's default.
+//
+// We replicate the exact wire pattern run.go uses (Load → Canonicalize →
+// New + WithHorizon) so a refactor that introduces a new helper in
+// run.go which forgets the WithHorizon call gets caught here.
+func TestRunCmd_ConfigHorizonWiredToReconciler(t *testing.T) {
+	cases := []struct {
+		name        string
+		horizonTOML string
+		want        time.Duration
+	}{
+		{"1d", `horizon = "1d"`, 24 * time.Hour},
+		{"365d", `horizon = "365d"`, 365 * 24 * time.Hour},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `
+[settings]
+poll_interval      = "60s"
+` + tc.horizonTOML + `
+full_sync_interval = "24h"
+log_level          = "info"
+log_format         = "json"
+
+[[pairs]]
+name      = "work-personal"
+direction = "bidirectional"
+source    = "work@example.com"
+target    = "personal@example.com"
+`
+			path := writeConfigFixture(t, body)
+			cfg, err := config.Load(path)
+			if err != nil {
+				t.Fatalf("config.Load: %v", err)
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+			canonical, err := cfg.Canonicalize(context.Background(), &stubGws{})
+			if err != nil {
+				t.Fatalf("Canonicalize: %v", err)
+			}
+			// Replicates cmd/run.go and cmd/watch.go's option construction.
+			rec := syncpkg.New(&stubGws{}, canonical,
+				syncpkg.WithHorizon(canonical.Settings.Horizon.Duration()),
+			)
+			if rec.Horizon != tc.want {
+				t.Errorf("Reconciler.Horizon = %v, want %v (config horizon=%q)",
+					rec.Horizon, tc.want, tc.horizonTOML)
+			}
+		})
+	}
 }

@@ -204,15 +204,21 @@ When `gws` is not on PATH, `internal/gws/client.go` returns `&Error{Code: CodeGW
 
 `run.go` no longer returns on the first PDirResult.Err. Per SPEC §"Partial failure semantics" (lines 1287-1303) every pdir runs to completion; failures are collected, the meta line is emitted with `failures: [...]`, and only THEN does `cmdError(partial_failure)` get returned. Tests should assert on the meta line (last stdout line) plus the MapError code, not on early termination.
 
-### `propagate_target_edits` gates two-way sync at the Reconciler
+### `propagate_target_edits` gates two-way sync per-pdir
 
-`config.Settings.PropagateTargetEdits` (default false) is ANDed with `pd.SourceWritable` inside `Reconciler.buildClassifier` to produce the effective writability the Classifier and recurring.Handler see. The downstream drift-matrix code is unchanged - it still consumes `SourceWritable` as before. This means:
+`config.PDir.PropagateTargetEdits` (resolved from `Pair.PropagateTargetEdits` when set, else `Settings.PropagateTargetEdits`) is ANDed with `pd.SourceWritable` inside `Reconciler.buildClassifier` to produce the effective writability the Classifier and recurring.Handler see. The downstream drift-matrix code is unchanged - it still consumes `SourceWritable` as before. Per-pair scoping lets operators ramp two-way sync one direction at a time. A read-only source (`accessRole < writer`) can never propagate regardless of the setting; the gate is a SUBSET, not an override.
 
-- Default install: even a calendar with `accessRole=writer` is treated as read-only by the drift-matrix; mirror-side edits revert.
-- `[settings].propagate_target_edits = true`: SPEC's two-way behavior is in effect.
-- A read-only source (`accessRole < writer`) can never propagate regardless of the setting; the gate is a SUBSET, not an override.
+The gate lives in the Reconciler rather than in mirror.Classify so Classify stays a pure function. Tests that exercise the matrix directly (classify_test.go) bypass the gate by constructing a Classifier with explicit SourceWritable; tests that want to pin the gate (reconciler_test.go's TestBuildClassifier_Gate*) drive `Reconciler.buildClassifier` directly with `pd.PropagateTargetEdits` set on the test PDir.
 
-The gate lives in the Reconciler rather than in mirror.Classify so Classify stays a pure function of `(signal, sourceWritable, ...)`. Tests that exercise the matrix directly (classify_test.go) bypass the gate by constructing a Classifier with explicit SourceWritable; tests that want to pin the gate (reconciler_test.go's TestBuildClassifier_Gate*) drive `Reconciler.buildClassifier` directly.
+### Per-pair horizon resolved at canonicalization
+
+`Pair.Horizon *Duration` (TOML optional, nil = fall back to `Settings.Horizon`) is resolved during `expandPDirs` into `PDir.Horizon time.Duration` (the effective per-pdir value). Downstream consumers (`Classifier.Horizon`, `OrphanWalker.Horizon`) read the resolved per-pdir value. The Reconciler-level horizon is GONE - `WithHorizon` removed in commit fcf1bf3.
+
+The source-list TimeMax uses `Reconciler.sourceMaxHorizon(source)` which returns the max effective horizon across all pdirs that share the source. Two pdirs sharing one source with different horizons get a single source-list call with the longer horizon's TimeMax; per-pdir filtering happens at classification time.
+
+### `Pair.Direction` field exists only for v1->v2 migration rejection
+
+Per commit 88d77d0, the `direction` config field is removed. The `Pair.Direction` Go field stays in `internal/config/types.go` SOLELY so `validatePair` can detect non-empty values and reject with a migration hint. `toml.Unmarshal` silently ignores unknown TOML keys, so dropping the Go field would mean a user's stale `direction = "..."` is silently inert rather than producing a clear migration error. The field can be removed in a future major version once any in-the-wild configs have migrated.
 
 ### Logger threading uses re-declared interfaces, not output package imports
 

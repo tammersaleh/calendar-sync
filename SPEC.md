@@ -49,7 +49,7 @@ The primary deployment is `calendar-sync watch`, a long-running daemon launchd s
 
 ### The unit of sync: pair-direction
 
-The atomic unit calendar-sync operates on is a **pair-direction (pdir)**: a `(pair_name, direction)` tuple where direction is `a_to_b` or `b_to_a`. A bidirectional pair expands to two pdirs. A unidirectional pair expands to one. Every piece of sync state is keyed by pdir.
+The atomic unit calendar-sync operates on is a **pair-direction (pdir)**: a `(pair_name, direction)` tuple. Every pair expands to exactly one pdir with direction `a_to_b` (source-to-target). Bidirectional sync is achieved by declaring two pairs with swapped source/target. Every piece of sync state is keyed by pdir. The `direction` field in JSONL output and per-pdir state identifiers (`<pair>:a_to_b`) is retained for output stability, but `a_to_b` is the only value emitted.
 
 This is intentional and corrects an early design where state was keyed by source calendar. Source-keyed state breaks when a single source fans out to multiple destinations: advancing the syncToken after one destination starves the others, and a partial failure on any destination loses events forever.
 
@@ -124,7 +124,7 @@ Together they give us an unambiguous classification of every mirror at reconcili
 
 Equal timestamps tiebreak to source. Google reports `updated` to milliseconds; concurrent edits within the same millisecond are vanishingly rare in practice.
 
-"Source is writable" in the table above means BOTH the source calendar's `accessRole >= writer` AND `[settings].propagate_target_edits = true`. The setting defaults to false: a fresh install runs one-way (mirror edits revert) until the operator opts in. A read-only source can never propagate regardless of the setting.
+"Source is writable" in the table above means BOTH the source calendar's `accessRole >= writer` AND the pdir's effective `propagate_target_edits = true`. The effective value is `[[pairs]].propagate_target_edits` when set, otherwise `[settings].propagate_target_edits` (which itself defaults to false). A fresh install runs one-way (mirror edits revert) until the operator opts in. Per-pair scoping lets operators ramp two-way sync one direction at a time after validating the read path. A read-only source can never propagate regardless of the setting.
 
 #### Managed fields and the checksum
 
@@ -223,18 +223,21 @@ horizon = "365d"
 full_sync_interval = "24h"
 log_level = "info"
 log_format = "json"
+propagate_target_edits = true
 
 [[pairs]]
-name = "work-personal"
-direction = "bidirectional"
+name = "work-to-personal"
 source = "alice@example.com"
 target = "primary"
 
+# Optional per-pair overrides of [settings] fields. Useful for ramping
+# two-way sync one direction at a time:
 [[pairs]]
-name = "work-family"
-direction = "source_to_target"
-source = "alice@example.com"
-target = "family@group.calendar.google.com"
+name = "personal-to-work"
+source = "primary"
+target = "alice@example.com"
+horizon = "1d"                      # narrower than the 365d default
+propagate_target_edits = false      # keep this direction read-only for now
 ```
 
 calendar-sync uses whatever account `gws auth status` reports. Multi-account support is out of scope; the user is responsible for ensuring the `gws`-authenticated account has appropriate access to every calendar referenced in config (typically achieved by sharing each calendar with the gws-authenticated account in Google Calendar's UI).
@@ -251,20 +254,21 @@ calendar-sync uses whatever account `gws auth status` reports. Multi-account sup
 | `log_level`          | string   | `info`  | One of `debug`, `info`, `warn`, `error`.                                                                                     |
 | `log_format`         | string   | `json`  | One of `json` (JSONL to stderr), `text` (human-readable to stderr).                                                          |
 | `dry_run`            | bool     | `false` | If true, log what would change but make no API writes. Reads still happen.                                                   |
-| `propagate_target_edits` | bool | `false` | Two-way sync gate. When false (default), drift on a writable-source pdir routes to `revert` instead of `propagate` - the source is never modified. When true, SPEC's two-way behavior in §"Drift detection model" is in effect. Pdirs whose source is read-only (`accessRole < writer`) always revert regardless. The default-off posture lets operators verify the one-way path before opting into bidirectional sync. |
+| `propagate_target_edits` | bool | `false` | Default two-way sync gate for any pair without an override. When false, drift on a writable-source pdir routes to `revert` instead of `propagate` - the source is never modified. When true, SPEC's two-way behavior in §"Drift detection model" is in effect. Per-pair `[[pairs]].propagate_target_edits` overrides this default. Pdirs whose source is read-only (`accessRole < writer`) always revert regardless. The default-off posture lets operators verify the one-way path before opting in. |
 
 Duration strings follow Go's `time.ParseDuration` syntax (`30s`, `5m`, `24h`) plus `d` (days) which calendar-sync adds.
 
 #### `[[pairs]]`
 
-| Field       | Type   | Required  | Description                                                                                                                                                  |
-|-------------|--------|-----------|--------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `name`      | string | yes       | Unique. Used in logs and as the human-facing identifier for `--pair` flags on `mirror list`/`mirror prune`. Must match `^[a-z0-9][a-z0-9-]{0,62}$`.        |
-| `direction` | string | yes       | One of `source_to_target`, `target_to_source`, `bidirectional`.                                                                                              |
-| `source`    | string | yes       | Calendar ID for the "left" calendar.                                                                                                                         |
-| `target`    | string | yes       | Calendar ID for the "right" calendar.                                                                                                                        |
-| `enabled`   | bool   | no (true) | If false, the pair is skipped entirely.                                                                                                                      |
-| `time_zone` | string | no        | IANA name (e.g. `America/New_York`). Used as the `timeZone` on mirrored events when the source event is all-day. Defaults to the destination calendar's default. |
+| Field                    | Type     | Required  | Description                                                                                                                                                  |
+|--------------------------|----------|-----------|--------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `name`                   | string   | yes       | Unique. Used in logs and as the human-facing identifier for `--pair` flags on `mirror list`/`mirror prune`. Must match `^[a-z0-9][a-z0-9-]{0,62}$`.          |
+| `source`                 | string   | yes       | Calendar ID for the source calendar. Events from here mirror onto target.                                                                                    |
+| `target`                 | string   | yes       | Calendar ID for the target calendar. Mirrors are written here.                                                                                               |
+| `enabled`                | bool     | no (true) | If false, the pair is skipped entirely.                                                                                                                      |
+| `time_zone`              | string   | no        | IANA name (e.g. `America/New_York`). Used as the `timeZone` on mirrored events when the source event is all-day. Defaults to the destination calendar's default. |
+| `horizon`                | duration | no        | Optional override of `[settings].horizon` for this pair. Same `1d`..`730d` bounds. Falls back to the settings value when unset.                              |
+| `propagate_target_edits` | bool     | no        | Optional override of `[settings].propagate_target_edits` for this pair. Falls back to the settings value when unset. Useful for ramping two-way sync one direction at a time. |
 
 Calendar IDs accepted: an email address (`alice@example.com`), the literal `primary` (which calendar-sync resolves to its canonical ID), or a group calendar ID (`<hash>@group.calendar.google.com`).
 
@@ -273,54 +277,60 @@ Calendar IDs accepted: an email address (`alice@example.com`), the literal `prim
 Run on every command that touches config. Failures exit with code 1 and a JSON error to stderr (see Output).
 
 - `name` is unique across all pairs.
-- `direction` is one of the three allowed values (case-sensitive).
+- `direction` field on `[[pairs]]` is rejected if present. The field was removed in v2.0.0; validation fails with a migration hint pointing users at the two-pair pattern (declare two `[[pairs]]` entries with swapped source/target for bidirectional sync; remove the field for the new default of source-to-target).
 - After canonicalization, `source != target`. Mirroring a calendar to itself is rejected.
-- After canonicalization and pdir expansion, no two pdirs share the same `(canonical_source, canonical_target, direction)` triple. Two pdirs writing identical mirrors to the same calendar is a configuration bug.
+- After canonicalization and pdir expansion, no two pdirs share the same `(canonical_source, canonical_target)` pair. Two pdirs writing identical mirrors to the same calendar is a configuration bug. (Direction is always `a_to_b` post-v2.0.0, so the prior triple collapses to a pair.)
 - `poll_interval >= 15s`.
-- `horizon` is between `1d` and `730d` inclusive.
+- `horizon` is between `1d` and `730d` inclusive. The same range applies to per-pair `[[pairs]].horizon` when set.
 - `full_sync_interval` is between `1h` and `30d` inclusive.
 - `log_level` is one of the four allowed values.
 - `log_format` is `json` or `text`.
 - **Access role** (resolved during canonicalization via `gws calendar calendarList get` for each unique calendar reference; the response's `accessRole` field is one of `freeBusyReader`, `reader`, `writer`, `owner`):
   - The source calendar's `accessRole` is `>= reader` (i.e. `reader`, `writer`, or `owner`). `freeBusyReader` is rejected because we cannot read event details.
   - The target calendar's `accessRole` is `>= writer` (`writer` or `owner`). A read-only target means we can never write mirrors there.
-  - For `direction = bidirectional`, both calendars are `>= writer` (each is a target in one of the two pdirs).
   - The pdir's `source_writable` flag (used by drift handling) is `true` iff the source's `accessRole` is `>= writer`. A `source_writable=false` pdir can still mirror events from source to target; it just `revert`s any mirror drift instead of `propagate`ing.
 
 ### Examples
 
-#### Minimal: one bidirectional pair
+#### Minimal: one source-to-target pair
 
 ```toml
 [[pairs]]
 name = "primary-pair"
-direction = "bidirectional"
 source = "alice@example.com"
 target = "primary"
 ```
 
-#### Three pairs, mixed directions
+#### Four pairs, including a bidirectional declared as two
 
 ```toml
 [settings]
 poll_interval = "60s"
 horizon = "365d"
+propagate_target_edits = true
 
+# Bidirectional sync between work and personal: declared as two pairs with
+# swapped source/target. The second pair narrows its horizon as part of a
+# gradual two-way rollout.
 [[pairs]]
-name = "work-personal"
-direction = "bidirectional"
+name = "work-to-personal"
 source = "alice@example.com"
 target = "primary"
 
 [[pairs]]
-name = "work-family"
-direction = "source_to_target"
+name = "personal-to-work"
+source = "primary"
+target = "alice@example.com"
+horizon = "30d"
+propagate_target_edits = false
+
+[[pairs]]
+name = "work-to-family"
 source = "alice@example.com"
 target = "family@group.calendar.google.com"
 
 [[pairs]]
-name = "personal-family"
-direction = "source_to_target"
+name = "personal-to-family"
 source = "primary"
 target = "family@group.calendar.google.com"
 enabled = false
@@ -360,8 +370,8 @@ Most commands produce JSONL (newline-delimited JSON) ending with a `_meta` trail
 
 ```
 $ calendar-sync pair list
-{"name":"work-personal","direction":"bidirectional","source":"alice@example.com","target":"primary","enabled":true}
-{"name":"work-family","direction":"source_to_target","source":"alice@example.com","target":"family@group.calendar.google.com","enabled":true}
+{"name":"work-to-personal","source":"alice@example.com","target":"primary","enabled":true}
+{"name":"work-to-family","source":"alice@example.com","target":"family@group.calendar.google.com","enabled":true}
 {"_meta":{"count":2}}
 ```
 
@@ -385,7 +395,7 @@ Diagnostic logs. Format controlled by `settings.log_format`:
 Errors that prevent a command from running go to stderr as a single JSON object:
 
 ```json
-{"error":"config_invalid","detail":"pair 'work-personal' has invalid direction 'left_to_right'","hint":"direction must be one of source_to_target, target_to_source, bidirectional","cause":"<wrapped, optional>"}
+{"error":"config_invalid","detail":"pair 'work-personal' has direction = 'bidirectional'; the direction field was removed in v2.0.0","hint":"remove the field for source-to-target (the new default); for bidirectional sync, declare two pairs with swapped source/target","cause":"<wrapped, optional>"}
 ```
 
 ### Exit codes
@@ -442,7 +452,7 @@ A one-shot full reconcile. Useful for: testing config changes before installing 
 ```
 calendar-sync run [flags]
   --pair <name>        Reconcile only the named pair. May be repeated. Default: all enabled pairs.
-  --direction <dir>    Limit to one direction within each pair. One of a_to_b, b_to_a. Default: both where applicable.
+  --direction <dir>    Limit to one direction within each pair. Only `a_to_b` is currently meaningful (every pair is implicitly source-to-target post-v2.0.0).
   --dry-run            Plan and print actions but make no API writes. Reads still happen.
   --timeout <dur>      Wall-clock cap for the entire command. Default: 5m.
 ```
@@ -543,10 +553,7 @@ calendar-sync run
 calendar-sync install
 
 # Reconcile only one pair
-calendar-sync run --pair work-personal
-
-# Reconcile only one direction of one pair
-calendar-sync run --pair work-personal --direction a_to_b
+calendar-sync run --pair work-to-personal
 ```
 
 ### calendar-sync init
@@ -588,7 +595,7 @@ Stdout:
 
 ```
 $ calendar-sync config show
-{"settings":{"poll_interval":"60s","horizon":"365d","full_sync_interval":"24h","log_level":"info","log_format":"json","dry_run":false},"pairs":[{"name":"work-personal","direction":"bidirectional","source":"alice@example.com","target":"primary","enabled":true}]}
+{"settings":{"poll_interval":"60s","horizon":"365d","full_sync_interval":"24h","log_level":"info","log_format":"json","dry_run":false,"propagate_target_edits":true},"pairs":[{"name":"work-to-personal","source":"alice@example.com","target":"primary","enabled":true}]}
 {"_meta":{"count":1}}
 ```
 
@@ -631,7 +638,7 @@ calendar-sync pair list [flags]
 
 ```
 $ calendar-sync pair list
-{"name":"work-personal","direction":"bidirectional","source":"alice@example.com","target":"primary","enabled":true}
+{"name":"work-to-personal","source":"alice@example.com","target":"primary","enabled":true}
 {"_meta":{"count":1}}
 ```
 
@@ -643,7 +650,7 @@ Equivalent to `calendar-sync run --pair <name> --dry-run` for a single pair, wit
 
 ```
 calendar-sync pair test <name> [flags]
-  --direction <dir>    Limit to one direction. One of a_to_b, b_to_a.
+  --direction <dir>    Limit to one direction. Only `a_to_b` is currently meaningful (every pair is implicitly source-to-target post-v2.0.0).
 ```
 
 #### Errors
@@ -659,18 +666,18 @@ List mirror events on a calendar.
 
 ```
 calendar-sync mirror list <calendar> [flags]
-  --pair <name>        Only mirrors created by this pair (any direction).
-  --direction <dir>    With --pair, limit to a_to_b or b_to_a.
+  --pair <name>        Only mirrors created by this pair.
+  --direction <dir>    With --pair. Only `a_to_b` is currently meaningful (every pdir is a_to_b post-v2.0.0).
   --orphaned           Only mirrors whose source no longer exists. Triggers per-mirror source lookup.
   --limit <n>          Max items to return. Default: 250.
   --all                Fetch all pages.
 ```
 
-`--pair`/`--direction` filtering is applied client-side: the command lists all mirrors via `privateExtendedProperty=calendar-sync:version=2` (and `version=1` if any), parses each mirror's `calendar-sync:source` to recover the source calendar ID, and matches against the current config to determine which pdir produced it. Matching is uniquely defined because validation guarantees no two pdirs share the same `(canonical_source, canonical_target, direction)` triple.
+`--pair`/`--direction` filtering is applied client-side: the command lists all mirrors via `privateExtendedProperty=calendar-sync:version=2` (and `version=1` if any), parses each mirror's `calendar-sync:source` to recover the source calendar ID, and matches against the current config to determine which pdir produced it. Matching is uniquely defined because validation guarantees no two pdirs share the same `(canonical_source, canonical_target)` pair.
 
 ```
-$ calendar-sync mirror list primary --pair work-personal --direction a_to_b
-{"id":"cs2abc...","summary":"Standup","start":"2026-04-30T15:00:00Z","end":"2026-04-30T15:30:00Z","source":"alice@example.com:abc123","source_updated":"2026-04-29T23:00:00Z","pair":"work-personal","direction":"a_to_b"}
+$ calendar-sync mirror list primary --pair work-to-personal
+{"id":"cs2abc...","summary":"Standup","start":"2026-04-30T15:00:00Z","end":"2026-04-30T15:30:00Z","source":"alice@example.com:abc123","source_updated":"2026-04-29T23:00:00Z","pair":"work-to-personal","direction":"a_to_b"}
 {"_meta":{"count":1,"has_more":false}}
 ```
 
@@ -690,7 +697,7 @@ Delete mirror events from a calendar.
 ```
 calendar-sync mirror prune <calendar> [flags]
   --pair <name>            Only delete mirrors created by this pair.
-  --direction <dir>        With --pair, limit to a_to_b or b_to_a.
+  --direction <dir>        With --pair. Only `a_to_b` is currently meaningful (every pdir is a_to_b post-v2.0.0).
   --orphaned               Only delete mirrors whose source no longer exists.
   --all                    Delete every mirror calendar-sync has ever created on this calendar.
   --prune-horizon <dur>    Narrow the selection to mirrors whose start falls in [now, now+dur].
@@ -729,8 +736,8 @@ Stdout when daemon reachable:
 
 ```
 {"reachable":true,"pid":54321,"started_at":"2026-04-30T08:00:00Z","poll_interval":"60s","full_sync_interval":"24h","last_full_sync_at":"2026-04-30T08:00:00Z"}
-{"pdir":"work-personal:a_to_b","source_calendar":"alice@example.com","target_calendar":"alice.personal@example.org","mirrors":1245,"last_tick_at":"2026-04-30T20:55:30Z","last_tick_status":"ok","last_tick_inserts":0,"last_tick_patches":1,"last_tick_deletes":0,"last_tick_propagates":0,"last_tick_reverts":0,"last_tick_skips":2}
-{"pdir":"work-personal:b_to_a","source_calendar":"alice.personal@example.org","target_calendar":"alice@example.com","mirrors":782,"last_tick_at":"2026-04-30T20:55:30Z","last_tick_status":"ok","last_tick_inserts":0,"last_tick_patches":0,"last_tick_deletes":0,"last_tick_propagates":0,"last_tick_reverts":0,"last_tick_skips":1}
+{"pdir":"work-to-personal:a_to_b","source_calendar":"alice@example.com","target_calendar":"alice.personal@example.org","mirrors":1245,"last_tick_at":"2026-04-30T20:55:30Z","last_tick_status":"ok","last_tick_inserts":0,"last_tick_patches":1,"last_tick_deletes":0,"last_tick_propagates":0,"last_tick_reverts":0,"last_tick_skips":2}
+{"pdir":"personal-to-work:a_to_b","source_calendar":"alice.personal@example.org","target_calendar":"alice@example.com","mirrors":782,"last_tick_at":"2026-04-30T20:55:30Z","last_tick_status":"ok","last_tick_inserts":0,"last_tick_patches":0,"last_tick_deletes":0,"last_tick_propagates":0,"last_tick_reverts":0,"last_tick_skips":1}
 {"_meta":{"count":2}}
 ```
 
@@ -911,6 +918,8 @@ The mirror inventory and source listings are grown and pruned in place as the da
    }' --page-all
    ```
    Capture `nextSyncToken` from the final page into a *staging* variable - not into the in-memory per-source token yet. See step 8.
+
+   The `timeMax` for the source-list is `now + horizon`, where `horizon` is the maximum effective horizon across all pdirs that share this source. When pdirs sharing a source have different horizons (e.g. 365d on one pdir, 1d on another during a gradual two-way rollout), the longer wins for the wire call so the longer-horizon pdir's classifier sees its events; the shorter-horizon pdir filters per its own horizon at classification time.
 6. **Mirror inventory per unique target.** For each distinct target calendar `T`, run the rebuild described in "Mirror inventory rebuild" - two `events.list` calls, one for `version=2` and one for `version=1`, merged into a single inventory. v1 entries are flagged for migration during reconciliation.
 7. **Reconcile.** For each enabled pdir `(P, D)` with source `S` and target `T`, walk the in-memory list of source events for `S`. For each event, run the classification logic (see below) using the `T` mirror inventory to look up existing mirrors. Track success/failure per pdir.
 8. **Commit syncTokens conditionally.** For each unique source `S`, install the staged `nextSyncToken` from step 5 into the in-memory per-source token *only if every pdir whose source matches `S` succeeded in step 7*. If any pdir for `S` failed, leave the in-memory token empty so the next cycle re-runs a full source-list for `S`. This is the same conditional-advancement rule that protects the per-tick path; both paths apply it.
@@ -1226,7 +1235,7 @@ Complete list of error codes:
 | `pdir_not_found`         | 1    | CLI              | `--pdir <id>` does not match any configured pdir.                                                    |
 | `calendar_not_found`     | 1    | API              | Calendar ID returned 404.                                                                            |
 | `calendar_canonicalize_failed` | 1 | API           | Could not resolve a configured calendar ID (including `primary`) to its canonical ID.                |
-| `access_role_insufficient` | 1 | Config         | A calendar's `accessRole` is too low for its declared role (`reader` for a target, or `freeBusyReader` for either side, or `bidirectional` with one side `<= reader`). |
+| `access_role_insufficient` | 1 | Config         | A calendar's `accessRole` is too low for its declared role (`reader` for a target, or `freeBusyReader` for either side).                                              |
 | `selector_required`      | 1    | `mirror prune`   | None of `--pair`, `--orphaned`, `--all` provided.                                                    |
 | `confirmation_required`  | 1    | Interactive      | Non-TTY and `--yes` not provided for a destructive command.                                          |
 | `gws_not_found`          | 1    | Subprocess       | `gws` not on `$PATH`.                                                                                |

@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.2](https://github.com/tammersaleh/calendar-sync/compare/v1.1.1...v1.1.2) (2026-05-02)
+
+
+### Bug Fixes
+
+* parse gws API error envelope from stdout, not stderr (B13) ([7cc7c0a](https://github.com/tammersaleh/calendar-sync/commit/7cc7c0a928d01dfad3953e9b98e9da267a1275df))
+
 ## [1.1.1](https://github.com/tammersaleh/calendar-sync/compare/v1.1.0...v1.1.1) (2026-05-02)
 
 

@@ -24,6 +24,20 @@ error: HTTP request failed
 
 `Using keyring backend: keyring` is gws's own informational stderr leaking into the formatted error string. Not safety-critical but obscures the real error.
 
+### B8 - `config.FindPath` can return relative paths; launchd `WatchPaths` is undefined for them
+
+`config.FindPath` returns `--config` / `$CALENDAR_SYNC_CONFIG` values verbatim. A user who runs `calendar-sync install --config ./config.toml` would land a relative-path entry in the plist's `WatchPaths` array. launchd's documentation calls relative paths there undefined behavior; in practice it appears not to fire kqueue events for them, defeating B7's auto-reload.
+
+Pre-existing in `internal/config/loader.go:25-44`; not introduced by B7. Normal install path (XDG default, `~/.config/...`) is always absolute, so default users don't hit it.
+
+Fix sketch: `filepath.Abs` the result of `config.FindPath` (or just inside the launchd plist generator path before stamping into WatchPaths). Add a unit test that drives FindPath with a relative `--config` and asserts the returned path is absolute.
+
+### B9 - plist generator does not XML-escape the config path
+
+`internal/launchd/install.go` uses `text/template` (not `html/template`) to render the plist. A config path containing `&`, `<`, or `>` would produce malformed XML and `launchctl load` would reject it. Pre-existing limitation; unlikely to bite default users (`~/.config/calendar-sync/config.toml` has no special chars), but a user with a path like `/tmp/sync&backup/config.toml` gets a broken plist.
+
+Fix sketch: switch to `html/template` (handles XML-class escaping for content), or wrap the path in `xml.EscapeText` before stamping. Test should generate a plist with `&`, `<`, `>` in the config path and verify the output parses as valid XML.
+
 ## Fixed
 
 ### F1 - `partial_failure` envelope dropped underlying error

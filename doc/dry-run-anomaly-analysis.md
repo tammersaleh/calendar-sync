@@ -75,12 +75,26 @@ for i := range events {
 }
 ```
 
-So if `events` contains a duplicate, the same source ID enters Classify twice. Possible reasons the source list could double-deliver:
+So if `events` contains a duplicate, the same source ID enters Classify twice. The mechanism is now confirmed by the instrumented debug run (commit `0a3869a`+); see "What the debug log showed" below.
 
-- gws `--page-all` overlap on page boundaries (gws bug; not yet ruled in or out).
-- Calendar API `events.list?singleEvents=false` returning a recurring exception twice in some edge case (the `_R<timestamp>` suffix in every problematic ID hints at a recurring-exception edge case; SPEC §"Recurring Events" addresses materialized exceptions, not the singleEvents=false wire shape pinned by Calendar API).
+The 15 problematic source IDs all use the `_R<timestamp>` suffix shape (e.g. `22si2itigr2gho9abp8dk4kh8v_R20260323T163000`). The standard exception-event ID format is `<parent>_<YYYYMMDDTHHMMSSZ>`; the `_R<timestamp>` form is what Calendar emits for certain "anchored" override shapes (typically a recurring-instance reschedule whose new RRULE generates further occurrences). The same parent ID appears in two roles in the source list:
 
-The 14 problematic source IDs all use the `_R<timestamp>` suffix shape (e.g. `22si2itigr2gho9abp8dk4kh8v_R20260323T163000`). The standard exception-event ID format is `<parent>_<YYYYMMDDTHHMMSSZ>`; the `_R<timestamp>` form is what Calendar emits for certain "anchored" override shapes whose semantics aren't well-documented externally. The `_<timestamp>Z` form (e.g. `22si2itigr2gho9abp8dk4kh8v_20260504T163000Z` - showing up in the dry-run output as `instance_unmaterializable`) does flow through the recurring handler, which suggests its `recurringEventId` field is set; the `_R<timestamp>` form's INSERT outcome (which can only come from `internal/sync/reconcile.go:reconcileNormal`, not from `internal/sync/classify.go:classifyRecurringInstance`) implies its `recurringEventId` is empty. That is: the source list returns these exception-shaped events as if they were standalone non-recurring events.
+- **As a `recurring_event_id` value** on its child instances (e.g. `22si2itigr2gho9abp8dk4kh8v_20260504T163000Z`, with `recurring_event_id = 22si2itigr2gho9abp8dk4kh8v_R20260323T163000`). These flow into the recurring handler.
+- **As a top-level event** in its own right - because the `_R<timestamp>` parent has its own RRULE and therefore is itself a recurring event that `events.list` returns alongside its instances. With no `recurring_event_id` of its own, this top-level entry routes to `reconcileNormal` rather than the recurring handler.
+
+### What the debug log showed
+
+Tracing source event ID `22si2itigr2gho9abp8dk4kh8v_R20260323T163000` through the live debug stderr:
+
+1. First entry into the classify loop is for an instance: `source=22si2itigr2gho9abp8dk4kh8v_20260504T163000Z`, `recurring_event_id=22si2itigr2gho9abp8dk4kh8v_R20260323T163000`. Routes to `recurring.Handle`.
+2. `recurring.resolveMirrorParent: inventory miss -> repair` - the recurring handler asks the sync layer to insert the mirror parent for the parent tuple.
+3. `sync.reconcileNormal: inventory miss -> insert: source=22si2itigr2gho9abp8dk4kh8v_R20260323T163000`. The parent tuple goes through `doInsert` and lands in the inventory keyed by `(tsaleh@coreweave.com, 22si2itigr2gho9abp8dk4kh8v_R20260323T163000)` with the broken-extended-properties body Cause A produces.
+4. Recurring handler emits `instance unmaterializable -> skip` for the original instance.
+5. **Later** in the same classify pass, the parent itself is processed as a top-level event: `source=22si2itigr2gho9abp8dk4kh8v_R20260323T163000`, `recurring_event_id=` (empty). Routes to `reconcileNormal`.
+6. `sync.reconcileNormal: inventory hit: source=22si2itigr2gho9abp8dk4kh8v_R20260323T163000 mirror_event=cs284... source_changed=true mirror_drifted=true needs_migration=true` - the just-inserted mirror parent is found, and Cause A's missing version makes signal say v1-needs-migration.
+7. `routing to reconcileMigration` → `migration_source_won` outcome emitted.
+
+So both Causes are confirmed: the same source-tuple is processed twice in one pass (Cause B - via parent-and-its-instances both being delivered by `events.list`), and the dryRunAPI's lossy Patch turns the cached parent into a fake "v1 mirror" by the time the second pass looks it up (Cause A).
 
 ### Trace (what happens on the second pass)
 
@@ -179,13 +193,11 @@ Code bug. SPEC line 384 documents the `cause` field; the implementation never po
 
 ### Fix
 
-Landed in commit `5a412e6` on this branch. `handleErr` now calls `errors.Unwrap(err)` and attaches the result as `ErrorEnvelope.Cause`. cmdError's Unwrap returns the cause field directly, so the partial_failure path now includes the underlying gws/sync error in stderr.
+Initial fix landed in `5a412e6 fix: surface underlying error in partial_failure stderr envelope`. `handleErr` started attaching `errors.Unwrap(err).Error()` as `ErrorEnvelope.Cause`, with a unit test (`TestUnwrapCause`) and an end-to-end test (`TestRunCmd_PartialFailureSurfacesUnderlyingErrorViaHandleErr`).
 
-Test pin: `cmd/errors_test.go:TestUnwrapCause` (unit), `cmd/run_test.go:TestRunCmd_PartialFailureSurfacesUnderlyingErrorViaHandleErr` (end-to-end).
+The first instrumented dry-run against the live calendar showed the envelope STILL had no cause. Root cause: `Reconciler.runClassifyLoop` aggregates per-event classify errors via `errors.Join`, and `errors.Unwrap` returns nil on a joinError (it implements `Unwrap() []error`, not `Unwrap() error`). The unit test only covered single-error chains; the production shape (~200 `gws subprocess: context deadline exceeded` errors joined) hit the nil-Unwrap path and the cause silently dropped via omitempty.
 
-The unwrap is a single-step (`errors.Unwrap` once, not loop). `errors.Unwrap` returns the immediate parent; for a `cmdError` wrapping a classify error wrapping a gws error, `Unwrap()` returns the classify error. That's what we want - the classify error's `Error()` reads `"classify <calendar>/<eventID>: <gws-error>"` which is exactly the bottom-line context.
-
-For non-cmdError fall-throughs, `errors.Unwrap` may return a `fmt.Errorf` chain element. If that's noisy, the omitempty rule on the field still keeps the JSON envelope tidy. No additional handling is necessary.
+Followup fix landed in `803317c fix: surface joinError cause in partial_failure stderr envelope`. `unwrapCause` now reads `cmdError.cause.Error()` directly via type assertion when err is a *cmdError, falling back to `errors.Unwrap` for non-cmdError types. `cause.Error()` works regardless of shape (single error, fmt.Errorf chain, or joinError). New test case `TestUnwrapCause/cmdError_wrapping_errors.Join_surfaces_the_joined_text` pins the joinError behavior.
 
 ## Where the new instrumentation lights up
 

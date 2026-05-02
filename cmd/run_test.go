@@ -306,50 +306,146 @@ func TestDryRunAPI_EventsInsertSuppressesWrite(t *testing.T) {
 	}
 }
 
-// TestDryRunAPI_PatchReturnsBodyWithoutOriginalExtProps documents the
-// dry-run wrapper's body-echo behavior that drives Anomaly #1 in
-// doc/dry-run-anomaly-analysis.md.
+// TestDryRunAPI_PatchMergesIntoCachedInsertResource pins B2 cause A
+// (doc/dry-run-anomaly-analysis.md anomaly #1). The dryRunAPI must
+// remember what each EventsInsert echoed back so a subsequent
+// EventsPatch returns the merged result, matching production's
+// JSON Merge Patch semantics.
 //
-// The follow-up checksum patch sends body={extendedProperties.private:
-// {checksum: ...}} only. The dry-run wrapper returns this body as the
-// post-write resource, so the caller (sync.completeInsert) caches an
-// "inserted" mirror in inventory whose extended properties contain ONLY
-// the checksum - no calendar-sync:version, no calendar-sync:source. On the
-// NEXT Classify pass for the same source event, ComputeDriftSignal sees
-// a missing version and reports NeedsMigration=true even though the mirror
-// was just minted with version=2 in the same dry-run pass.
+// Before the fix, EventsPatch returned only the request body. The
+// follow-up checksum patch sends `{extendedProperties.private:
+// {checksum: ...}}` ONLY, so the cached inventory entry lost
+// calendar-sync:version + calendar-sync:source from the prior insert.
+// On the next Classify pass for the same source-tuple,
+// ComputeDriftSignal saw a missing version and reported
+// NeedsMigration=true - bogus migration_source_won outcomes.
 //
-// This test pins the wire shape so a future fix to dryRunAPI.EventsPatch
-// (e.g. merging body into a remembered prior snapshot) breaks an explicit
-// assertion rather than silently changing behavior.
-func TestDryRunAPI_PatchReturnsBodyOnlyAndDropsOriginalExtProps(t *testing.T) {
+// After the fix:
+//   - EventsInsert caches a copy of the echoed body keyed by
+//     (calendarID, body.ID).
+//   - EventsPatch merges patch body into the cached snapshot per
+//     Calendar API JSON Merge Patch:
+//   - top-level fields in body REPLACE the cached value
+//   - ExtendedProperties.Private is merged at the KEY level
+//     (existing keys preserved unless body provides a new value)
+//   - The merged result is cached AND returned, so subsequent patches
+//     see the post-merge state.
+func TestDryRunAPI_PatchMergesIntoCachedInsertResource(t *testing.T) {
 	api := newDryRunAPI(&stubGws{})
-	body := &gws.Event{
+	ctx := context.Background()
+
+	// First Insert: typical mirror payload with version + source.
+	insertBody := &gws.Event{
+		ID:      "evt",
+		Summary: "Standup",
 		ExtendedProperties: &gws.ExtendedProperties{
-			Private: map[string]string{"calendar-sync:checksum": "abc123"},
+			Private: map[string]string{
+				"calendar-sync:source":         "alice@example.com:src-evt",
+				"calendar-sync:source_updated": "2026-04-29T20:00:00Z",
+				"calendar-sync:version":        "2",
+			},
 		},
 	}
-	got, err := api.EventsPatch(context.Background(), "cal", "evt", body)
+	if _, err := api.EventsInsert(ctx, "cal", insertBody); err != nil {
+		t.Fatalf("EventsInsert: %v", err)
+	}
+
+	// Follow-up checksum patch: body carries ONLY {checksum}, the
+	// production shape (internal/sync/helpers.go:followUpChecksum).
+	patchBody := &gws.Event{
+		ExtendedProperties: &gws.ExtendedProperties{
+			Private: map[string]string{
+				"calendar-sync:checksum": "deadbeef",
+			},
+		},
+	}
+	got, err := api.EventsPatch(ctx, "cal", "evt", patchBody)
 	if err != nil {
 		t.Fatalf("EventsPatch: %v", err)
 	}
+
 	if got.ID != "evt" {
 		t.Errorf("ID = %q, want evt", got.ID)
 	}
-	// The returned body has ONLY {checksum}. There is no calendar-sync:source
-	// or calendar-sync:version - because the wrapper has no memory of the
-	// prior insert. Downstream `mirror.ComputeDriftSignal` will read these
-	// missing keys and return NeedsMigration=true.
+	if got.Summary != "Standup" {
+		t.Errorf("Summary = %q, want %q (cached from Insert)", got.Summary, "Standup")
+	}
 	if got.ExtendedProperties == nil || got.ExtendedProperties.Private == nil {
 		t.Fatalf("ExtendedProperties/Private nil; got %+v", got)
 	}
-	if _, has := got.ExtendedProperties.Private["calendar-sync:version"]; has {
-		t.Errorf("post-checksum-patch body must NOT carry calendar-sync:version - "+
-			"the wrapper echoes body verbatim. got=%+v", got.ExtendedProperties.Private)
+	priv := got.ExtendedProperties.Private
+	wantPrivate := map[string]string{
+		"calendar-sync:source":         "alice@example.com:src-evt",
+		"calendar-sync:source_updated": "2026-04-29T20:00:00Z",
+		"calendar-sync:version":        "2",
+		"calendar-sync:checksum":       "deadbeef",
 	}
-	if _, has := got.ExtendedProperties.Private["calendar-sync:source"]; has {
-		t.Errorf("post-checksum-patch body must NOT carry calendar-sync:source. "+
-			"got=%+v", got.ExtendedProperties.Private)
+	for k, want := range wantPrivate {
+		if got := priv[k]; got != want {
+			t.Errorf("Private[%q] = %q, want %q (full map: %v)", k, got, want, priv)
+		}
+	}
+}
+
+// TestDryRunAPI_PatchOverwritesExistingPrivateKey verifies merge
+// semantics for the case where a patch body re-writes a key already
+// present in the cached snapshot. JSON Merge Patch semantics: the
+// patch wins on key-level collision (the key's value is replaced).
+func TestDryRunAPI_PatchOverwritesExistingPrivateKey(t *testing.T) {
+	api := newDryRunAPI(&stubGws{})
+	ctx := context.Background()
+
+	insertBody := &gws.Event{
+		ID:      "evt",
+		Summary: "v1",
+		ExtendedProperties: &gws.ExtendedProperties{
+			Private: map[string]string{"k": "old"},
+		},
+	}
+	if _, err := api.EventsInsert(ctx, "cal", insertBody); err != nil {
+		t.Fatalf("EventsInsert: %v", err)
+	}
+	patchBody := &gws.Event{
+		ExtendedProperties: &gws.ExtendedProperties{
+			Private: map[string]string{"k": "new"},
+		},
+	}
+	got, err := api.EventsPatch(ctx, "cal", "evt", patchBody)
+	if err != nil {
+		t.Fatalf("EventsPatch: %v", err)
+	}
+	if got.ExtendedProperties.Private["k"] != "new" {
+		t.Errorf("Private[k] = %q, want %q (patch should overwrite)",
+			got.ExtendedProperties.Private["k"], "new")
+	}
+}
+
+// TestDryRunAPI_PatchWithoutPriorInsertReturnsBody covers the edge
+// case where EventsPatch is called for an ID that was never inserted
+// (e.g. tests that don't drive doInsert first). With no cached
+// snapshot, the wrapper falls back to the body-echo behavior: the
+// request body is returned with ID populated. This preserves the
+// prior contract for callers that don't go through Insert.
+func TestDryRunAPI_PatchWithoutPriorInsertReturnsBody(t *testing.T) {
+	api := newDryRunAPI(&stubGws{})
+	body := &gws.Event{
+		Summary: "patched",
+		ExtendedProperties: &gws.ExtendedProperties{
+			Private: map[string]string{"k": "v"},
+		},
+	}
+	got, err := api.EventsPatch(context.Background(), "cal", "no-insert", body)
+	if err != nil {
+		t.Fatalf("EventsPatch: %v", err)
+	}
+	if got.ID != "no-insert" {
+		t.Errorf("ID = %q, want no-insert", got.ID)
+	}
+	if got.Summary != "patched" {
+		t.Errorf("Summary = %q, want patched", got.Summary)
+	}
+	if got.ExtendedProperties.Private["k"] != "v" {
+		t.Errorf("Private[k] = %q, want v", got.ExtendedProperties.Private["k"])
 	}
 }
 

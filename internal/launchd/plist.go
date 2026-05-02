@@ -26,14 +26,14 @@ const (
 )
 
 // plistInputs is the data the plist XML template substitutes into
-// SPEC.md's template (lines 766-787). All fields are required; renderPlist
-// returns an error if any are empty.
+// SPEC.md's template (lines 766-787) plus the WatchPaths directive
+// (B7) that drives launchd-based config reload. All fields are
+// required; renderPlist returns an error if any are empty.
 //
-// ConfigPath is added for B7 (config.toml auto-reload). The field
-// declaration lands ahead of the template + validator wiring so the
-// regression test for the WatchPaths directive can compile against the
-// final shape; the green-pass commit lights up the rendering and the
-// require-non-empty check.
+// ConfigPath is the absolute path to config.toml as resolved at
+// install time. launchd watches it via kqueue and restarts the daemon
+// on modification - because the daemon's startup re-reads config from
+// disk, a launchd-driven restart IS the config reload.
 type plistInputs struct {
 	Label      string
 	BinaryPath string
@@ -43,9 +43,11 @@ type plistInputs struct {
 	ConfigPath string
 }
 
-// plistTemplate is SPEC's plist XML verbatim, with `{{.Field}}` placeholders
-// for the per-install substitutions. Whitespace (4-space indent inside
-// <dict>) matches SPEC's example so a `diff` against the SPEC stays empty.
+// plistTemplate is SPEC's plist XML with `{{.Field}}` placeholders for
+// the per-install substitutions, plus the WatchPaths directive (B7)
+// for config-edit auto-reload. Whitespace (4-space indent inside
+// <dict>) matches SPEC's example so a `diff` against the SPEC stays
+// minimal except for the appended WatchPaths block.
 const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -65,6 +67,10 @@ const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
     <dict>
         <key>PATH</key><string>{{.PATH}}</string>
     </dict>
+    <key>WatchPaths</key>
+    <array>
+        <string>{{.ConfigPath}}</string>
+    </array>
 </dict>
 </plist>
 `
@@ -93,6 +99,9 @@ func renderPlist(p plistInputs) ([]byte, error) {
 	}
 	if p.PATH == "" {
 		return nil, fmt.Errorf("plist: PATH is empty")
+	}
+	if p.ConfigPath == "" {
+		return nil, fmt.Errorf("plist: ConfigPath is empty")
 	}
 	var buf bytes.Buffer
 	if err := compiledPlistTemplate.Execute(&buf, p); err != nil {

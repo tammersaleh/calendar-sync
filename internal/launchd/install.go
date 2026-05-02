@@ -54,6 +54,20 @@ type Config struct {
 	// ProgramArguments. Empty resolves via os.Executable. Tests pass an
 	// explicit value to avoid depending on os.Executable's behavior.
 	BinaryPath string
+
+	// ConfigPath is the absolute path to config.toml as resolved at
+	// install time. It is written into the plist's `WatchPaths` array
+	// so launchd restarts the daemon whenever the file is modified
+	// (the daemon's startup re-reads config from disk, so a launchd
+	// restart IS the config reload). Required - empty values are
+	// rejected by the renderer because an empty <string></string>
+	// inside WatchPaths would either be ignored by launchd or, on
+	// some macOS versions, prevent the plist from loading.
+	//
+	// cmd/install.go resolves this via config.FindPath(rt.Globals.Config),
+	// which honors the same precedence the rest of the binary uses
+	// (--config flag > $CALENDAR_SYNC_CONFIG > $XDG_CONFIG_HOME default).
+	ConfigPath string
 }
 
 // InstallResult is the data Install hands back to the cmd layer for the
@@ -144,6 +158,7 @@ func Install(ctx context.Context, cfg Config, runner Runner) (InstallResult, err
 		StdoutPath: filepath.Join(logDir, stdoutLogName),
 		StderrPath: filepath.Join(logDir, stderrLogName),
 		PATH:       cfg.PATH,
+		ConfigPath: cfg.ConfigPath,
 	})
 	if err != nil {
 		return InstallResult{}, err

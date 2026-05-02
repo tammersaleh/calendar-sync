@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"github.com/tammersaleh/calendar-sync/internal/config"
 	"github.com/tammersaleh/calendar-sync/internal/launchd"
 )
 
@@ -15,12 +16,22 @@ type InstallCmd struct {
 }
 
 // Run wraps launchd.Install.
+//
+// The resolved config path goes into the plist's WatchPaths directive
+// (B7) so launchd restarts the daemon when config.toml is edited. We
+// resolve it here using the same precedence-rules helper the rest of
+// the binary uses (--config flag > $CALENDAR_SYNC_CONFIG > XDG default)
+// so an operator who used --config at install time gets that exact
+// path watched. If the file doesn't yet exist, FindPath still returns
+// the default path; launchd accepts a watched path that's missing on
+// install and fires events when it's later created.
 func (c *InstallCmd) Run(rt *Runtime) error {
 	cfg := launchd.Config{
-		Label:  c.Label,
-		LogDir: c.LogDir,
-		Force:  c.Force,
-		NoLoad: c.NoLoad,
+		Label:      c.Label,
+		LogDir:     c.LogDir,
+		Force:      c.Force,
+		NoLoad:     c.NoLoad,
+		ConfigPath: config.FindPath(rt.Globals.Config),
 	}
 	res, err := launchd.Install(rt.Ctx, cfg, launchd.ExecRunner{})
 	if err != nil {

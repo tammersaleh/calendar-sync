@@ -8,7 +8,7 @@ import (
 
 // TestRenderPlist_HappyPath renders the SPEC template with sample inputs
 // and asserts the resulting bytes match SPEC §"calendar-sync install"
-// example (lines 766-787) once the substitutions are applied.
+// example (lines 766-787) plus the WatchPaths directive (B7).
 func TestRenderPlist_HappyPath(t *testing.T) {
 	got, err := renderPlist(plistInputs{
 		Label:      "org.calendar-sync.agent",
@@ -16,6 +16,7 @@ func TestRenderPlist_HappyPath(t *testing.T) {
 		StdoutPath: "/Users/alice/Library/Logs/calendar-sync/calendar-sync.out.log",
 		StderrPath: "/Users/alice/Library/Logs/calendar-sync/calendar-sync.err.log",
 		PATH:       DefaultPATH,
+		ConfigPath: "/Users/alice/.config/calendar-sync/config.toml",
 	})
 	if err != nil {
 		t.Fatalf("renderPlist: %v", err)
@@ -40,6 +41,10 @@ func TestRenderPlist_HappyPath(t *testing.T) {
     <dict>
         <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
+    <key>WatchPaths</key>
+    <array>
+        <string>/Users/alice/.config/calendar-sync/config.toml</string>
+    </array>
 </dict>
 </plist>
 `
@@ -59,6 +64,7 @@ func TestRenderPlist_ParsesAsValidXML(t *testing.T) {
 		StdoutPath: "/tmp/out.log",
 		StderrPath: "/tmp/err.log",
 		PATH:       "/usr/bin",
+		ConfigPath: "/tmp/config.toml",
 	})
 	if err != nil {
 		t.Fatalf("renderPlist: %v", err)
@@ -87,6 +93,7 @@ func TestRenderPlist_RejectsEmptyFields(t *testing.T) {
 		StdoutPath: "O",
 		StderrPath: "E",
 		PATH:       "P",
+		ConfigPath: "C",
 	}
 	cases := []struct {
 		name string
@@ -97,6 +104,7 @@ func TestRenderPlist_RejectsEmptyFields(t *testing.T) {
 		{"stdout empty", func(p *plistInputs) { p.StdoutPath = "" }},
 		{"stderr empty", func(p *plistInputs) { p.StderrPath = "" }},
 		{"path empty", func(p *plistInputs) { p.PATH = "" }},
+		{"config empty", func(p *plistInputs) { p.ConfigPath = "" }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -119,6 +127,7 @@ func TestRenderPlist_SubstitutesAllFields(t *testing.T) {
 		StdoutPath: "OUT_SENTINEL",
 		StderrPath: "ERR_SENTINEL",
 		PATH:       "PATH_SENTINEL",
+		ConfigPath: "CONFIG_SENTINEL",
 	})
 	if err != nil {
 		t.Fatalf("renderPlist: %v", err)
@@ -129,6 +138,7 @@ func TestRenderPlist_SubstitutesAllFields(t *testing.T) {
 		"OUT_SENTINEL",
 		"ERR_SENTINEL",
 		"PATH_SENTINEL",
+		"CONFIG_SENTINEL",
 	} {
 		if !strings.Contains(string(got), want) {
 			t.Errorf("output missing %q", want)

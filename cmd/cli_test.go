@@ -113,7 +113,12 @@ func TestRun_HelpFlagDoesNotDispatchSubcommand(t *testing.T) {
 		{"mirror list --help", []string{"mirror", "list", "--help"}, wantParseError},
 		{"pair test --help", []string{"pair", "test", "--help"}, wantParseError},
 		{"config show --help", []string{"config", "show", "--help"}, wantHelp},
+		{"config validate --help", []string{"config", "validate", "--help"}, wantHelp},
+		{"pair list --help", []string{"pair", "list", "--help"}, wantHelp},
 		{"init --help", []string{"init", "--help"}, wantHelp},
+		{"status --help", []string{"status", "--help"}, wantHelp},
+		{"version --help", []string{"version", "--help"}, wantHelp},
+		{"skill --help", []string{"skill", "--help"}, wantHelp},
 		{"top-level --help", []string{"--help"}, wantParseError},
 		// Quiet + help: --quiet redirects stdout to nil; --help writes via
 		// kong's writer (the original stdout we passed to kong.New).

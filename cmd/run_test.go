@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"testing"
 
@@ -348,17 +350,78 @@ func TestDryRunAPI_PatchReturnsBodyOnlyAndDropsOriginalExtProps(t *testing.T) {
 	}
 }
 
-// countingGws extends stubGws with insert counter so the dryRunAPI test
-// can assert no underlying write occurred.
+// countingGws extends stubGws with per-method counters so dryRunAPI tests
+// can assert no underlying write occurred. Each Counter is a *int so the
+// test owns the storage and can assert directly without exposing extra
+// accessors.
 type countingGws struct {
 	stubGws
 	insertCount *int
+	patchCount  *int
+	deleteCount *int
 }
 
 func (c *countingGws) EventsInsert(ctx context.Context, cal string, body *gws.Event) (*gws.Event, error) {
-	*c.insertCount++
+	if c.insertCount != nil {
+		*c.insertCount++
+	}
 	return c.stubGws.EventsInsert(ctx, cal, body)
 }
+
+func (c *countingGws) EventsPatch(ctx context.Context, cal, id string, body *gws.Event) (*gws.Event, error) {
+	if c.patchCount != nil {
+		*c.patchCount++
+	}
+	return c.stubGws.EventsPatch(ctx, cal, id, body)
+}
+
+func (c *countingGws) EventsDelete(ctx context.Context, cal, id string) error {
+	if c.deleteCount != nil {
+		*c.deleteCount++
+	}
+	return c.stubGws.EventsDelete(ctx, cal, id)
+}
+
+// TestDryRunAPI_EventsPatchSuppressesWrite is the patch-side counterpart to
+// TestDryRunAPI_EventsInsertSuppressesWrite: every patch call through the
+// wrapper must NOT reach the inner client. Pinned per-method because the
+// production path emits more patches than inserts (every drift
+// reconciliation, every checksum follow-up, every recurring instance
+// materialization), so a regression that re-enables the inner call here is
+// the most likely source of accidental writes.
+func TestDryRunAPI_EventsPatchSuppressesWrite(t *testing.T) {
+	patches := 0
+	inner := &countingGws{stubGws: stubGws{}, patchCount: &patches}
+	api := newDryRunAPI(inner)
+	body := &gws.Event{Summary: "patched"}
+	got, err := api.EventsPatch(context.Background(), "cal", "evt-1", body)
+	if err != nil {
+		t.Fatalf("EventsPatch: %v", err)
+	}
+	if patches != 0 {
+		t.Errorf("inner.EventsPatch was called %d times, want 0", patches)
+	}
+	if got == nil || got.ID != "evt-1" {
+		t.Errorf("got = %+v, want event with ID evt-1", got)
+	}
+}
+
+// TestDryRunAPI_EventsDeleteSuppressesWrite verifies the orphan-walk delete
+// path is gated. SPEC's "orphan cleanup" is the single largest write
+// volume in a steady-state run; if delete bypasses the wrapper the user
+// loses real mirror events on every dry-run.
+func TestDryRunAPI_EventsDeleteSuppressesWrite(t *testing.T) {
+	deletes := 0
+	inner := &countingGws{stubGws: stubGws{}, deleteCount: &deletes}
+	api := newDryRunAPI(inner)
+	if err := api.EventsDelete(context.Background(), "cal", "evt-1"); err != nil {
+		t.Fatalf("EventsDelete: %v", err)
+	}
+	if deletes != 0 {
+		t.Errorf("inner.EventsDelete was called %d times, want 0", deletes)
+	}
+}
+
 
 // TestRunCmd_DryRun_DuplicateSourceEventTriggersBogusMigrationSourceWon is
 // scaffolding for the eventual regression test of
@@ -419,4 +482,168 @@ func (d *dupSourceListGws) EventsList(_ context.Context, params gws.EventsListPa
 	}
 	// Source-list call: return the duplicated events.
 	return d.events, "next-token", nil
+}
+
+// panicWriteGws is a stress-test stub: every read returns a canned response,
+// every WRITE method panics. Tests wrap this in newDryRunAPI to assert that
+// the dry-run wrapper short-circuits 100% of writes regardless of what the
+// sync layer attempts (insert, patch, delete, recurring-handler patch, drift
+// patch, orphan delete, etc.). A panic surfaces as a test failure with a
+// clear "B1-class regression" message.
+//
+// Naming: Gws here means "gws subprocess wrapper" (the GwsClient interface),
+// not literally the binary. The stub intercepts the wrapper layer.
+//
+// The stub's EventsGet / EventsInstances return synthetic events when the
+// recurring path needs a parent or instances - they're read-only so the
+// content matters less than the shape; the goal is only to keep the sync
+// layer running long enough to attempt a write that would then panic.
+type panicWriteGws struct {
+	stubGws
+	events []gws.Event
+
+	// parentEvents is the canned response for EventsGet calls (typically
+	// the recurring-instance handler fetching the source parent). Keyed by
+	// event ID; missing key returns gws.ErrAPINotFound so the recurring
+	// path bails out cleanly rather than nil-derefing the response.
+	parentEvents map[string]gws.Event
+}
+
+func (p *panicWriteGws) EventsList(_ context.Context, params gws.EventsListParams) ([]gws.Event, string, error) {
+	if len(params.PrivateExtendedProperty) > 0 {
+		return nil, "", nil
+	}
+	return p.events, "next-token", nil
+}
+
+func (p *panicWriteGws) EventsGet(_ context.Context, _, eventID string) (*gws.Event, error) {
+	if e, ok := p.parentEvents[eventID]; ok {
+		return &e, nil
+	}
+	return nil, gws.ErrAPINotFound
+}
+
+func (p *panicWriteGws) EventsInstances(_ context.Context, _ gws.EventsInstancesParams) ([]gws.Event, error) {
+	// Empty result keeps the recurring "instance lookup" path well-defined;
+	// it'll trigger the repair branch which fetches the source parent via
+	// EventsGet, and our parent fixture lives there.
+	return nil, nil
+}
+
+func (p *panicWriteGws) EventsInsert(_ context.Context, calendarID string, body *gws.Event) (*gws.Event, error) {
+	panic(fmt.Sprintf("panicWriteGws.EventsInsert called - dry-run wrapper failed to suppress write to %s/%s", calendarID, body.ID))
+}
+
+func (p *panicWriteGws) EventsPatch(_ context.Context, calendarID, eventID string, _ *gws.Event) (*gws.Event, error) {
+	panic(fmt.Sprintf("panicWriteGws.EventsPatch called - dry-run wrapper failed to suppress patch to %s/%s", calendarID, eventID))
+}
+
+func (p *panicWriteGws) EventsDelete(_ context.Context, calendarID, eventID string) error {
+	panic(fmt.Sprintf("panicWriteGws.EventsDelete called - dry-run wrapper failed to suppress delete of %s/%s", calendarID, eventID))
+}
+
+// TestDryRunAPI_ZeroWritesAcrossEventShapes is the load-bearing safety
+// guarantee for the `--dry-run` flag: under any source-event mix the user
+// throws at us, the dry-run wrapper short-circuits 100% of writes. This
+// test wraps a panicWriteGws in newDryRunAPI; the panic stub fires on any
+// EventsInsert/Patch/Delete the wrapper failed to intercept.
+//
+// We feed a deliberately-pathological source list - confirmed events, a
+// recurring instance, a cancelled event, a duplicate (same-tuple appearing
+// twice in source-list, the B2 production shape). Each shape exercises a
+// different sync-layer write path:
+//
+//   - confirmed event with no mirror → doInsert → EventsInsert + checksum
+//     EventsPatch
+//   - cancelled event with no mirror → SPEC's "skip" cell, no writes
+//   - recurring instance → recurring.Handler.handleConfirmed →
+//     EventsPatch (instance materialization) + EventsPatch (checksum)
+//   - duplicated event → second pass triggers either patch or
+//     migration_source_won (B2); either way no underlying write should fire.
+//
+// If ANY of these reach the inner client, the test panics with a
+// descriptive message identifying the leaking method + calendar + event ID.
+func TestDryRunAPI_ZeroWritesAcrossEventShapes(t *testing.T) {
+	tmp := shortTempDir(t)
+	t.Setenv("TMPDIR", tmp)
+	path := writeConfigFixture(t, validConfigTOML)
+
+	// Mix the four shapes. Calendar API treats event IDs as opaque so the
+	// names don't matter; the wire-shape fields (Status, Recurring*, etc.)
+	// drive sync-layer dispatch.
+	events := []gws.Event{
+		{
+			ID:           "evt-confirmed-1",
+			Status:       gws.EventStatusConfirmed,
+			Summary:      "Confirmed event",
+			Updated:      "2026-04-29T20:00:00Z",
+			Transparency: gws.TransparencyOpaque,
+			Start:        &gws.EventDateTime{DateTime: "2026-05-01T16:00:00Z"},
+			End:          &gws.EventDateTime{DateTime: "2026-05-01T17:00:00Z"},
+		},
+		{
+			ID:      "evt-cancelled-1",
+			Status:  gws.EventStatusCancelled,
+			Summary: "Cancelled event",
+			Updated: "2026-04-29T20:00:00Z",
+		},
+		{
+			ID:                "evt-recurring-instance-1",
+			Status:            gws.EventStatusConfirmed,
+			Summary:           "Recurring instance exception",
+			RecurringEventID:  "evt-parent-1",
+			OriginalStartTime: &gws.EventDateTime{DateTime: "2026-05-15T16:00:00Z"},
+			Updated:           "2026-04-29T20:00:00Z",
+			Transparency:      gws.TransparencyOpaque,
+			Start:             &gws.EventDateTime{DateTime: "2026-05-15T17:00:00Z"},
+			End:               &gws.EventDateTime{DateTime: "2026-05-15T18:00:00Z"},
+		},
+		{
+			ID:           "evt-confirmed-1", // deliberate duplicate of [0]
+			Status:       gws.EventStatusConfirmed,
+			Summary:      "Confirmed event (duplicate)",
+			Updated:      "2026-04-29T20:00:00Z",
+			Transparency: gws.TransparencyOpaque,
+			Start:        &gws.EventDateTime{DateTime: "2026-05-01T16:00:00Z"},
+			End:          &gws.EventDateTime{DateTime: "2026-05-01T17:00:00Z"},
+		},
+	}
+	parents := map[string]gws.Event{
+		"evt-parent-1": {
+			ID:           "evt-parent-1",
+			Status:       gws.EventStatusConfirmed,
+			Summary:      "Recurring parent",
+			Updated:      "2026-04-29T20:00:00Z",
+			Transparency: gws.TransparencyOpaque,
+			Start:        &gws.EventDateTime{DateTime: "2026-05-01T16:00:00Z"},
+			End:          &gws.EventDateTime{DateTime: "2026-05-01T17:00:00Z"},
+			Recurrence:   []string{"RRULE:FREQ=WEEKLY;BYDAY=MO"},
+		},
+	}
+	stub := &panicWriteGws{events: events, parentEvents: parents}
+
+	rt := &Runtime{
+		Stdout:  &bytes.Buffer{},
+		Stderr:  &bytes.Buffer{},
+		Globals: Globals{Config: path},
+		Ctx:     context.Background(),
+		Gws:     stub,
+	}
+
+	// We don't assert on the error - some paths legitimately fail (e.g. the
+	// recurring-instance path needs an EventsGet of the parent which our
+	// stub returns nil for). The point is: ANY underlying write would
+	// panic. As long as we return without panic, the dry-run wrapper held.
+	//
+	// Use `defer recover` so a panic is converted to a clear test failure
+	// rather than tearing down the test binary. We print the stack so a
+	// nil-deref panic from a malformed test event isn't misread as a
+	// dry-run leak.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("panic during dry-run: %v\nstack:\n%s", r, debug.Stack())
+		}
+	}()
+
+	_ = (&RunCmd{DryRun: true}).Run(rt)
 }

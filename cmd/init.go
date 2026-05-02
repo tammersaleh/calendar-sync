@@ -12,8 +12,9 @@ import (
 
 // starterConfigTemplate is the content `calendar-sync init` writes when no
 // destination file exists. It serves as a worked example: a single
-// disabled bidirectional pair plus comments pointing at SPEC for the
-// fields that aren't shown.
+// disabled pair plus comments pointing at SPEC for the fields that aren't
+// shown. Post-v2.0.0 every pair is implicitly source-to-target; a
+// bidirectional setup declares two pairs with swapped source/target.
 //
 // Literal `\n` newlines (not raw strings with embedded tabs) keep the file
 // portable across editors and avoid TOML's whitespace quirks.
@@ -43,7 +44,6 @@ dry_run            = false
 
 [[pairs]]
 name      = "work-personal"
-direction = "bidirectional"
 source    = "you@work.example"
 target    = "primary"
 enabled   = false  # set to true after editing the source/target above.

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/tammersaleh/calendar-sync/internal/config"
 )
 
 func TestInitCmd_WritesStarterConfig(t *testing.T) {
@@ -80,5 +82,29 @@ func TestInitCmd_ForceOverwrites(t *testing.T) {
 	got, _ := os.ReadFile(dest)
 	if !strings.Contains(string(got), "[[pairs]]") {
 		t.Errorf("expected fresh content with --force, got %q", got)
+	}
+}
+
+// TestInitCmd_StarterConfigPassesValidation pins the starter template
+// against the validation rules: a freshly-installed `calendar-sync init`
+// config must `config.Load` cleanly and pass `Validate()` without
+// modification. Post-v2.0.0 the `direction` field is explicitly rejected
+// at validation time, so a template that still emits `direction = "..."`
+// would ship a broken default.
+func TestInitCmd_StarterConfigPassesValidation(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "config.toml")
+
+	rt := &Runtime{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}}
+	if err := (&InitCmd{Output: dest}).Run(rt); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	cfg, err := config.Load(dest)
+	if err != nil {
+		t.Fatalf("config.Load on starter template: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate on starter template: %v", err)
 	}
 }

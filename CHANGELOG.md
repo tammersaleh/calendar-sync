@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.0.0](https://github.com/tammersaleh/calendar-sync/compare/v1.1.3...v2.0.0) (2026-05-02)
+
+
+### ⚠ BREAKING CHANGES
+
+* configs containing `direction = "..."` on any [[pairs]] entry now fail validation. Remove the field for the new default (source-to-target); for prior bidirectional pairs, declare a second [[pairs]] entry with source and target swapped.
+
+### Features
+
+* add per-pair horizon override ([fcf1bf3](https://github.com/tammersaleh/calendar-sync/commit/fcf1bf33783db79564456dd65ae64b21f7db716d))
+* add per-pair propagate_target_edits override ([81d0a9d](https://github.com/tammersaleh/calendar-sync/commit/81d0a9db72934f5e98da58eb7769911384fbc7c1))
+* drop direction field from pair config ([88d77d0](https://github.com/tammersaleh/calendar-sync/commit/88d77d040d985664907e1f1225af03120fc71425))
+
+
+### Bug Fixes
+
+* starter config no longer includes removed direction field ([4149180](https://github.com/tammersaleh/calendar-sync/commit/414918015782b82a6c5e4a8a8fd17a72dd8cd25a))
+
 ## [1.1.3](https://github.com/tammersaleh/calendar-sync/compare/v1.1.2...v1.1.3) (2026-05-02)
 
 

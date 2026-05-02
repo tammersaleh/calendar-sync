@@ -40,6 +40,12 @@ Fix sketch: switch to `html/template` (handles XML-class escaping for content), 
 
 ## Fixed
 
+### B10 - `mirror prune` errors on already-cancelled events
+
+`listMirrors` queries `ShowDeleted:true` so it returns tombstones (events previously deleted via `events.delete`, which Calendar API stores with `status=cancelled` rather than physically removing). The candidate loop didn't filter these out, so prune would call `events.delete` on a tombstone, which returns `api_invalid_request: Resource has been deleted` - NOT the `NotFound` the existing carry-on branch catches. The function then returned the error early, skipping any remaining live mirrors and emitting no `_meta` trailer. Discovered during phased cleanup of the B1 leak: Phase 3 silently truncated after deleting 4 of 19 candidates because the 5th was a tombstone from Phase 2.
+
+Fixed by skipping `status=cancelled` events at the top of the candidate loop. They're already deleted; nothing to do. Test pin: `TestMirrorPruneCmd_SkipsAlreadyCancelledEvents` (`cmd/mirror_test.go`) constructs a mix of confirmed and cancelled mirrors and asserts only the confirmed ones reach `EventsDelete`.
+
 ### F1 - `partial_failure` envelope dropped underlying error
 
 Initially fixed in `5a412e6 fix: surface underlying error in partial_failure stderr envelope` but that pass missed the joinError case. Followup `803317c fix: surface joinError cause in partial_failure stderr envelope` reads `cmdError.cause` directly via type assertion. Verified empirically against the live calendar - the envelope's `cause` field now carries the joined classify errors (~32KB).

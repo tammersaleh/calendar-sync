@@ -144,6 +144,15 @@ func (c *MirrorPruneCmd) Run(rt *Runtime) error {
 		horizonEnd = horizonNow.Add(c.PruneHorizon)
 	}
 	for _, m := range mirrors {
+		// listMirrors uses ShowDeleted:true so it returns tombstones (events
+		// previously deleted via events.delete; status=cancelled). Calling
+		// events.delete on those returns api_invalid_request "Resource has
+		// been deleted" - not a NotFound the existing carry-on branch
+		// catches. Skip them entirely; there's nothing to do for an
+		// already-deleted event.
+		if m.Status == gws.EventStatusCancelled {
+			continue
+		}
 		row, ok := buildMirrorRow(m, pdLookup, c.Pair, c.Direction)
 		if !ok {
 			continue

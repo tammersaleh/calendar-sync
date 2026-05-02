@@ -237,6 +237,65 @@ func TestMirrorPruneCmd_PruneHorizonFiltersByStart(t *testing.T) {
 	}
 }
 
+// TestMirrorPruneCmd_SkipsAlreadyCancelledEvents pins B10: prune must not
+// attempt to delete events that already have status=cancelled (the
+// tombstone state of a previously-deleted event). Calendar API responds
+// to such deletes with `api_invalid_request: Resource has been deleted`,
+// which the prune handler doesn't treat as "already gone" and would
+// abort the function early - leaving the remaining live mirrors
+// undeleted.
+//
+// The fix filters status=cancelled events out of the candidate list
+// entirely. They're already deleted; nothing to do.
+func TestMirrorPruneCmd_SkipsAlreadyCancelledEvents(t *testing.T) {
+	path := writeConfigFixture(t, validConfigTOML)
+
+	mkConfirmed := func(id, srcID string) gws.Event {
+		ev := makeMirrorEvent(id, "work@example.com", srcID, id)
+		ev.Status = gws.EventStatusConfirmed
+		return ev
+	}
+	mkCancelled := func(id, srcID string) gws.Event {
+		ev := makeMirrorEvent(id, "work@example.com", srcID, id)
+		ev.Status = gws.EventStatusCancelled
+		return ev
+	}
+
+	gwsClient := &inventoryGws{
+		v2events: []gws.Event{
+			mkConfirmed("live1", "src1"),
+			mkCancelled("tomb1", "src2"),
+			mkConfirmed("live2", "src3"),
+			mkCancelled("tomb2", "src4"),
+		},
+	}
+	cmd := &MirrorPruneCmd{
+		Calendar: "personal@example.com",
+		All:      true,
+		Yes:      true,
+	}
+	rt := &Runtime{
+		Stdout:  &bytes.Buffer{},
+		Stderr:  &bytes.Buffer{},
+		Globals: Globals{Config: path},
+		Ctx:     context.Background(),
+		Gws:     gwsClient,
+	}
+	if err := cmd.Run(rt); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	got := make([]string, 0, len(gwsClient.deletes))
+	for _, d := range gwsClient.deletes {
+		got = append(got, d.eventID)
+	}
+	sort.Strings(got)
+	want := []string{"live1", "live2"}
+	if !equalStringSlices(got, want) {
+		t.Errorf("deleted = %v, want %v (cancelled events must be skipped)", got, want)
+	}
+}
+
 func equalStringSlices(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

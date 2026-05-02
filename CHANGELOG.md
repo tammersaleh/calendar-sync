@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.3](https://github.com/tammersaleh/calendar-sync/compare/v1.1.2...v1.1.3) (2026-05-02)
+
+
+### Bug Fixes
+
+* orphan walker swallows ErrAPIGone like ErrAPINotFound (B14) ([fa52923](https://github.com/tammersaleh/calendar-sync/commit/fa52923cc457986bae4ec9d7b8a7f30fd15b47eb))
+
 ## [1.1.2](https://github.com/tammersaleh/calendar-sync/compare/v1.1.1...v1.1.2) (2026-05-02)
 
 

@@ -53,14 +53,39 @@ func DriftedFieldNames(live, desired *gws.Event) []string {
 	if liveFields.End != desiredFields.End {
 		fields = append(fields, "end")
 	}
-	if liveFields.Transparency != desiredFields.Transparency {
+	if normalizeTransparency(liveFields.Transparency) != normalizeTransparency(desiredFields.Transparency) {
 		fields = append(fields, "transparency")
 	}
-	if liveFields.Visibility != desiredFields.Visibility {
+	if normalizeVisibility(liveFields.Visibility) != normalizeVisibility(desiredFields.Visibility) {
 		fields = append(fields, "visibility")
 	}
 	sort.Strings(fields)
 	return fields
+}
+
+// normalizeTransparency treats Google's omission of the default ("opaque")
+// the same as an explicit "opaque" so a managed-field comparison doesn't
+// report drift on a mirror whose value just round-tripped through the API.
+// events.list responses omit transparency when the value equals the default;
+// BuildPayload writes the explicit form, so a freshly round-tripped mirror
+// would otherwise false-positive on every drift check.
+func normalizeTransparency(t string) string {
+	if t == "" {
+		return gws.TransparencyOpaque
+	}
+	return t
+}
+
+// normalizeVisibility treats Google's omission of the default ("default")
+// the same as an explicit "default". Calendar-sync mirrors force
+// visibility="private" which Google preserves, so this normalization rarely
+// matters in practice; included for symmetry and to handle the case where
+// a source event's visibility comes back omitted on the propagate path.
+func normalizeVisibility(v string) string {
+	if v == "" {
+		return gws.VisibilityDefault
+	}
+	return v
 }
 
 // BuildPropagatePatchBody constructs the events.patch body sent to the source

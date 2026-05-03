@@ -189,3 +189,99 @@ func TestBuildPropagatePatchBody_EmptyDriftedFieldsYieldsEmptyBody(t *testing.T)
 		t.Errorf("body should be empty; got %+v", body)
 	}
 }
+
+func TestDriftedFieldNames_EmptyTransparencyTreatedAsOpaque(t *testing.T) {
+	// Google omits transparency from events.list responses when its value
+	// equals the default ("opaque"). The drift comparison must treat an empty
+	// live transparency as equivalent to the explicit "opaque" that
+	// BuildPayload writes; otherwise every round-tripped mirror would
+	// false-positive on transparency.
+	desired := &gws.Event{
+		Summary:      "Standup",
+		Start:        &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"},
+		End:          &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z"},
+		Transparency: gws.TransparencyOpaque,
+		Visibility:   gws.VisibilityPrivate,
+	}
+	live := *desired
+	live.Transparency = "" // Google omitted the default
+
+	got := DriftedFieldNames(&live, desired)
+	for _, f := range got {
+		if f == "transparency" {
+			t.Errorf("expected no transparency drift when live is empty (Google's default); got %v", got)
+		}
+	}
+}
+
+func TestDriftedFieldNames_RealTransparencyChangeStillDrifts(t *testing.T) {
+	// A genuine non-default value (transparent) must still be detected.
+	desired := &gws.Event{
+		Summary:      "Standup",
+		Start:        &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"},
+		End:          &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z"},
+		Transparency: gws.TransparencyOpaque,
+		Visibility:   gws.VisibilityPrivate,
+	}
+	live := *desired
+	live.Transparency = gws.TransparencyTransparent
+
+	got := DriftedFieldNames(&live, desired)
+	found := false
+	for _, f := range got {
+		if f == "transparency" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected transparency drift for opaque vs transparent; got %v", got)
+	}
+}
+
+func TestDriftedFieldNames_EmptyVisibilityTreatedAsDefault(t *testing.T) {
+	// Mirror visibility="default" against live visibility="" (Google's
+	// omitted-default form); the comparison must normalize and produce no
+	// drift. Symmetric to the transparency case above.
+	desired := &gws.Event{
+		Summary:      "Standup",
+		Start:        &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"},
+		End:          &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z"},
+		Transparency: gws.TransparencyOpaque,
+		Visibility:   gws.VisibilityDefault,
+	}
+	live := *desired
+	live.Visibility = "" // Google omitted the default
+
+	got := DriftedFieldNames(&live, desired)
+	for _, f := range got {
+		if f == "visibility" {
+			t.Errorf("expected no visibility drift when live is empty (Google's default); got %v", got)
+		}
+	}
+}
+
+func TestDriftedFieldNames_RealVisibilityChangeStillDrifts(t *testing.T) {
+	// A genuine value mismatch (public vs private) must still be detected.
+	desired := &gws.Event{
+		Summary:      "Standup",
+		Start:        &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"},
+		End:          &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z"},
+		Transparency: gws.TransparencyOpaque,
+		Visibility:   gws.VisibilityPrivate,
+	}
+	live := *desired
+	live.Visibility = gws.VisibilityPublic
+
+	got := DriftedFieldNames(&live, desired)
+	found := false
+	for _, f := range got {
+		if f == "visibility" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected visibility drift for private vs public; got %v", got)
+	}
+}

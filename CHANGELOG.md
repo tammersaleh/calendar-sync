@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.3](https://github.com/tammersaleh/calendar-sync/compare/v2.1.2...v2.1.3) (2026-05-03)
+
+
+### Bug Fixes
+
+* route inherited recurring-instance mirrors through bootstrap source-wins ([93a68b6](https://github.com/tammersaleh/calendar-sync/commit/93a68b6df3c8c83ad4f9cc88bf4fb55f72e5a94c))
+
 ## [2.1.2](https://github.com/tammersaleh/calendar-sync/compare/v2.1.1...v2.1.2) (2026-05-03)
 
 

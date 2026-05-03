@@ -3,6 +3,8 @@ package mirror
 import (
 	"strings"
 	"testing"
+
+	"github.com/tammersaleh/calendar-sync/internal/gws"
 )
 
 func TestChecksum(t *testing.T) {
@@ -207,6 +209,32 @@ func TestChecksum(t *testing.T) {
 		empty := Checksum(ManagedFields{Location: ""})
 		if base != empty {
 			t.Fatalf("zero vs empty-string location produced different hashes: %q != %q", base, empty)
+		}
+	})
+}
+
+func TestChecksum_StableAcrossEmptyAndDefaultTransparency(t *testing.T) {
+	// Whether the Event came from a patch response (explicit "opaque") or a
+	// list response (omitted -> ""), ManagedFieldsFromEvent must produce the
+	// same ManagedFields, and Checksum must therefore produce the same hash.
+	// Without this guarantee the stored post-write checksum disagrees with
+	// the next read's live recompute and fires MirrorDrifted forever.
+	t.Run("transparency", func(t *testing.T) {
+		listResp := &gws.Event{Summary: "Standup", Transparency: ""}
+		patchResp := &gws.Event{Summary: "Standup", Transparency: gws.TransparencyOpaque}
+		fromList := Checksum(ManagedFieldsFromEvent(listResp))
+		fromPatch := Checksum(ManagedFieldsFromEvent(patchResp))
+		if fromList != fromPatch {
+			t.Errorf("checksum drift between empty and default transparency:\n  fromList  = %s\n  fromPatch = %s", fromList, fromPatch)
+		}
+	})
+	t.Run("visibility", func(t *testing.T) {
+		listResp := &gws.Event{Summary: "Standup", Visibility: ""}
+		patchResp := &gws.Event{Summary: "Standup", Visibility: gws.VisibilityDefault}
+		fromList := Checksum(ManagedFieldsFromEvent(listResp))
+		fromPatch := Checksum(ManagedFieldsFromEvent(patchResp))
+		if fromList != fromPatch {
+			t.Errorf("checksum drift between empty and default visibility:\n  fromList  = %s\n  fromPatch = %s", fromList, fromPatch)
 		}
 	})
 }

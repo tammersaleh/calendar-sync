@@ -15,11 +15,13 @@ import (
 // only in the trailer (calendar-sync's own append) would produce a
 // false-positive description-drift signal.
 //
-// Recurrence is compared with order-insensitive equality (matching
-// Checksum's sort-before-hash behavior) so the field-level diff agrees
-// with the mirror_drifted signal. For instance overrides both sides are
-// nil per BuildInstancePayload, so the comparison is naturally equal and
-// no drift is reported.
+// Transparency and visibility are normalized at extraction time by
+// ManagedFieldsFromEvent (see convert.go), so the comparison here is a
+// straight equality check. Recurrence is compared with order-insensitive
+// equality (matching Checksum's sort-before-hash behavior) so the
+// field-level diff agrees with the mirror_drifted signal. For instance
+// overrides both sides are nil per BuildInstancePayload, so the
+// comparison is naturally equal and no drift is reported.
 //
 // Field name strings match SPEC.md's "fields" array ordering convention:
 // they are returned alphabetically sorted so callers (tests, log emitters)
@@ -55,10 +57,10 @@ func DriftedFieldNames(live, desired *gws.Event) []string {
 	if liveFields.End != desiredFields.End {
 		fields = append(fields, "end")
 	}
-	if normalizeTransparency(liveFields.Transparency) != normalizeTransparency(desiredFields.Transparency) {
+	if liveFields.Transparency != desiredFields.Transparency {
 		fields = append(fields, "transparency")
 	}
-	if normalizeVisibility(liveFields.Visibility) != normalizeVisibility(desiredFields.Visibility) {
+	if liveFields.Visibility != desiredFields.Visibility {
 		fields = append(fields, "visibility")
 	}
 	if !recurrenceEqual(liveFields.Recurrence, desiredFields.Recurrence) {
@@ -92,31 +94,6 @@ func recurrenceEqual(a, b []string) bool {
 		}
 	}
 	return true
-}
-
-// normalizeTransparency treats Google's omission of the default ("opaque")
-// the same as an explicit "opaque" so a managed-field comparison doesn't
-// report drift on a mirror whose value just round-tripped through the API.
-// events.list responses omit transparency when the value equals the default;
-// BuildPayload writes the explicit form, so a freshly round-tripped mirror
-// would otherwise false-positive on every drift check.
-func normalizeTransparency(t string) string {
-	if t == "" {
-		return gws.TransparencyOpaque
-	}
-	return t
-}
-
-// normalizeVisibility treats Google's omission of the default ("default")
-// the same as an explicit "default". Calendar-sync mirrors force
-// visibility="private" which Google preserves, so this normalization rarely
-// matters in practice; included for symmetry and to handle the case where
-// a source event's visibility comes back omitted on the propagate path.
-func normalizeVisibility(v string) string {
-	if v == "" {
-		return gws.VisibilityDefault
-	}
-	return v
 }
 
 // BuildPropagatePatchBody constructs the events.patch body sent to the source

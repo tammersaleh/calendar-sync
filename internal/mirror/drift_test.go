@@ -37,7 +37,11 @@ func managedStartToGWS(d EventDateTime) *gws.EventDateTime {
 
 func TestComputeDriftSignal_NoChange(t *testing.T) {
 	m := ManagedFields{Summary: "Lunch"}
-	mirror := makeMirror("2026-04-29T23:00:00.000Z", Checksum(m), m)
+	mirror := makeMirror("2026-04-29T23:00:00.000Z", "", m)
+	// Stored checksum must match what the production path produces:
+	// Checksum(ManagedFieldsFromEvent(postWriteEvent)). Pinning the stored
+	// value to that path keeps the test honest about the round trip.
+	mirror.ExtendedProperties.Private[ExtKeyChecksum] = Checksum(ManagedFieldsFromEvent(mirror))
 	source := &gws.Event{
 		Summary: "Lunch", // same body
 		Updated: "2026-04-29T23:00:00.000Z",
@@ -50,7 +54,8 @@ func TestComputeDriftSignal_NoChange(t *testing.T) {
 
 func TestComputeDriftSignal_SourceUpdatedOnly(t *testing.T) {
 	m := ManagedFields{Summary: "Lunch"}
-	mirror := makeMirror("2026-04-29T23:00:00.000Z", Checksum(m), m)
+	mirror := makeMirror("2026-04-29T23:00:00.000Z", "", m)
+	mirror.ExtendedProperties.Private[ExtKeyChecksum] = Checksum(ManagedFieldsFromEvent(mirror))
 	source := &gws.Event{
 		Summary: "Lunch",
 		Updated: "2026-04-30T10:00:00.000Z", // newer

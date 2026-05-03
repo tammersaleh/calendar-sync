@@ -51,6 +51,53 @@ func TestManagedFieldsFromEvent_NilStartEndProducesZero(t *testing.T) {
 	}
 }
 
+func TestManagedFieldsFromEvent_NormalizesTransparencyAndVisibility(t *testing.T) {
+	// Google echoes back explicit transparency/visibility on patch responses
+	// (BuildPayload sets them) but omits both on events.list responses when
+	// they equal the default. Normalizing at the extraction boundary means
+	// Checksum and DriftedFieldNames see the same values regardless of which
+	// API path the Event came from. Without it, a stored checksum computed
+	// from a patch response (Transparency="opaque") disagrees with a live
+	// recompute from a list response (Transparency="") and fires
+	// MirrorDrifted forever - the bug this normalization fixes.
+	t.Run("transparency: empty becomes opaque", func(t *testing.T) {
+		got := ManagedFieldsFromEvent(&gws.Event{Transparency: ""})
+		if got.Transparency != gws.TransparencyOpaque {
+			t.Errorf("Transparency = %q, want %q", got.Transparency, gws.TransparencyOpaque)
+		}
+	})
+	t.Run("transparency: explicit opaque preserved", func(t *testing.T) {
+		got := ManagedFieldsFromEvent(&gws.Event{Transparency: gws.TransparencyOpaque})
+		if got.Transparency != gws.TransparencyOpaque {
+			t.Errorf("Transparency = %q, want %q", got.Transparency, gws.TransparencyOpaque)
+		}
+	})
+	t.Run("transparency: non-default preserved", func(t *testing.T) {
+		got := ManagedFieldsFromEvent(&gws.Event{Transparency: gws.TransparencyTransparent})
+		if got.Transparency != gws.TransparencyTransparent {
+			t.Errorf("Transparency = %q, want %q", got.Transparency, gws.TransparencyTransparent)
+		}
+	})
+	t.Run("visibility: empty becomes default", func(t *testing.T) {
+		got := ManagedFieldsFromEvent(&gws.Event{Visibility: ""})
+		if got.Visibility != gws.VisibilityDefault {
+			t.Errorf("Visibility = %q, want %q", got.Visibility, gws.VisibilityDefault)
+		}
+	})
+	t.Run("visibility: explicit default preserved", func(t *testing.T) {
+		got := ManagedFieldsFromEvent(&gws.Event{Visibility: gws.VisibilityDefault})
+		if got.Visibility != gws.VisibilityDefault {
+			t.Errorf("Visibility = %q, want %q", got.Visibility, gws.VisibilityDefault)
+		}
+	})
+	t.Run("visibility: non-default preserved", func(t *testing.T) {
+		got := ManagedFieldsFromEvent(&gws.Event{Visibility: gws.VisibilityPrivate})
+		if got.Visibility != gws.VisibilityPrivate {
+			t.Errorf("Visibility = %q, want %q", got.Visibility, gws.VisibilityPrivate)
+		}
+	})
+}
+
 func TestManagedFieldsFromEvent_ChecksumStableAcrossRoundTrip(t *testing.T) {
 	// The whole point of this conversion: extracting from a gws.Event
 	// produces a hash equal to constructing the equivalent ManagedFields

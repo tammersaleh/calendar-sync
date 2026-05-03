@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.4](https://github.com/tammersaleh/calendar-sync/compare/v2.1.3...v2.1.4) (2026-05-03)
+
+
+### Bug Fixes
+
+* skip inherited recurring-instance mirrors in BuildInventory ([9be10d7](https://github.com/tammersaleh/calendar-sync/commit/9be10d74a34eaafde1d8dfb9480c5b581ab40748))
+
 ## [2.1.3](https://github.com/tammersaleh/calendar-sync/compare/v2.1.2...v2.1.3) (2026-05-03)
 
 

@@ -177,6 +177,41 @@ func driftMirror(e *gws.Event, mutate func(*gws.Event)) *gws.Event {
 	return e
 }
 
+// makeInheritedMirrorInstance builds a recurring-instance mirror that has
+// not been explicitly written by calendar-sync. Its extended properties are
+// inherited from the parent: calendar-sync:source points at the source
+// PARENT's tuple (no instance suffix), checksum matches parent's, version
+// is the current SchemaVersion. Live fields are the auto-materialized
+// values supplied via `fields` - typically the source override's values, or
+// (for the rescheduled-source case) the RRULE-projected values that differ
+// from the source override.
+//
+// `parentSourceTuple` should be "<src-cal>:<source-parent-id>" - the same
+// value the parent mirror's calendar-sync:source carries. Detection in
+// IsInheritedRecurringInstance keys off the EventID portion matching the
+// source.RecurringEventID seen by the recurring handler.
+func makeInheritedMirrorInstance(id, parentSourceTuple, parentChecksum, storedSourceUpdated, liveUpdated string, fields managedFieldHints) *gws.Event {
+	return &gws.Event{
+		ID:           id,
+		Status:       gws.EventStatusConfirmed,
+		Summary:      fields.summary,
+		Description:  fields.description,
+		Start:        fields.start,
+		End:          fields.end,
+		Transparency: gws.TransparencyOpaque,
+		Visibility:   gws.VisibilityPrivate,
+		Updated:      liveUpdated,
+		ExtendedProperties: &gws.ExtendedProperties{
+			Private: map[string]string{
+				mirror.ExtKeySource:        parentSourceTuple,
+				mirror.ExtKeySourceUpdated: storedSourceUpdated,
+				mirror.ExtKeyChecksum:      parentChecksum,
+				mirror.ExtKeyVersion:       mirror.SchemaVersion,
+			},
+		},
+	}
+}
+
 // makeV1Mirror builds a v1 mirror (no checksum, version="1"). Used to test
 // the schema-version-migration drift recomputation branch.
 func makeV1Mirror(id, storedSourceUpdated, liveUpdated string, fields managedFieldHints) *gws.Event {
@@ -1617,6 +1652,357 @@ func TestHandle_V2MirrorInstanceLocationDriftRoutesToMigrationSourceWon(t *testi
 	}
 	if body.Location != source.Location {
 		t.Errorf("main patch body Location = %q, want %q (source's location)", body.Location, source.Location)
+	}
+}
+
+// ---------- inherited recurring-instance handling ----------
+
+// TestHandle_InheritedInstance_NoActualDrift_PatchesAsInheritedUpgrade pins
+// the !source_changed && !mirror_drifted cell of the inherited-instance
+// branch. An auto-materialized mirror instance whose live managed fields
+// already match desired-from-source must still be rewritten so the instance
+// carries its own per-instance calendar-sync:source / :checksum (no longer
+// inherited from the parent). Reason: inherited_upgrade, no conflict.
+func TestHandle_InheritedInstance_NoActualDrift_PatchesAsInheritedUpgrade(t *testing.T) {
+	api := newStubAPI()
+	mirrorParent := makeMirrorParent("mp-1")
+	source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
+
+	// Auto-materialized instance: inherits the parent's calendar-sync:source
+	// ("src-cal:src-parent" - parent ID, NOT the source.ID "src-evt"). Live
+	// managed fields equal desired-from-source so DriftedFieldNames returns
+	// empty; the recompute lands on !source_changed && !mirror_drifted.
+	desired := mirror.BuildInstancePayload("src-cal", source)
+	mi := makeInheritedMirrorInstance("mi-1",
+		"src-cal:src-parent",
+		"sha256:parent-checksum-not-instance",
+		source.Updated,
+		source.Updated,
+		managedFieldHints{
+			summary:     desired.Summary,
+			description: desired.Description,
+			start:       desired.Start,
+			end:         desired.End,
+		},
+	)
+	api.queueInstances([]gws.Event{*mi})
+
+	postMain := *mi
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+
+	h := &Handler{
+		API:              api,
+		SourceCalendarID: "src-cal",
+		TargetCalendarID: "tgt-cal",
+		SourceWritable:   true,
+		LookupMirrorParent: func(_ mirror.SourceTuple) (*gws.Event, bool) {
+			return mirrorParent, true
+		},
+	}
+	got, err := h.Handle(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if got.Action != mirror.ActionPatch || got.Reason != ReasonInheritedUpgrade {
+		t.Errorf("expected patch(inherited_upgrade) for inherited instance with no actual drift; got %+v", got)
+	}
+	if got.Conflict != mirror.ConflictNone {
+		t.Errorf("inherited_upgrade should not carry a conflict; got %q", got.Conflict)
+	}
+	patches := api.callsByOp("EventsPatch")
+	if len(patches) != 2 {
+		t.Fatalf("expected 2 EventsPatch (main + checksum followup); got %d", len(patches))
+	}
+	for i, p := range patches {
+		if p.CalendarID != "tgt-cal" || p.EventID != "mi-1" {
+			t.Errorf("patches[%d] should target the mirror instance; got %s/%s", i, p.CalendarID, p.EventID)
+		}
+	}
+	// Source must NOT be patched: inherited_upgrade is a mirror-side rewrite,
+	// never a propagate.
+	for _, c := range api.calls {
+		if c.Op == "EventsPatch" && c.CalendarID == "src-cal" {
+			t.Errorf("inherited_upgrade must not patch source; got call %+v", c)
+		}
+	}
+	// Main patch body's calendar-sync:source must be the per-INSTANCE tuple
+	// (not the parent's). After this write, IsInheritedRecurringInstance
+	// would return false and future runs use the standard drift matrix.
+	body := patches[0].Body
+	if body == nil || body.ExtendedProperties == nil {
+		t.Fatal("main patch body missing ExtendedProperties")
+	}
+	got_source_tuple := body.ExtendedProperties.Private[mirror.ExtKeySource]
+	want_source_tuple := "src-cal:" + source.ID
+	if got_source_tuple != want_source_tuple {
+		t.Errorf("main patch body %s = %q, want %q (per-instance tuple)",
+			mirror.ExtKeySource, got_source_tuple, want_source_tuple)
+	}
+}
+
+// TestHandle_InheritedInstance_DriftOnly_InheritedSourceWon pins the
+// `!source_changed && mirror_drifted` cell of the inherited-instance
+// branch. The source override has not been edited since the parent was
+// mirrored (storedSourceUpdated == source.Updated), but the auto-
+// materialized mirror's live start differs from the source's start - the
+// user rescheduled the occurrence on the source BEFORE we ever wrote the
+// parent. Source-wins regardless: the mirror's RRULE-projected start is
+// bootstrap state, not a user edit, and propagating it back would clobber
+// the user's reschedule.
+func TestHandle_InheritedInstance_DriftOnly_InheritedSourceWon(t *testing.T) {
+	api := newStubAPI()
+	mirrorParent := makeMirrorParent("mp-1")
+	source := makeSourceException("2026-04-30T11:00:00Z", "2026-05-01T12:00:00Z", "Standup")
+	// Source override at a rescheduled time. originalStartTime is set by
+	// makeSourceException (12:00:00Z); start is the user's reschedule.
+	source.Start = &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z", TimeZone: "UTC"}
+	source.End = &gws.EventDateTime{DateTime: "2026-05-01T14:00:00Z", TimeZone: "UTC"}
+
+	desired := mirror.BuildInstancePayload("src-cal", source)
+	// storedSourceUpdated == source.Updated -> SourceChanged=false. The
+	// inherited mirror still has the RRULE-projected start (12:00) versus
+	// the source's reschedule (13:00), so the recomputed MirrorDrifted=true.
+	mi := makeInheritedMirrorInstance("mi-1",
+		"src-cal:src-parent",
+		"sha256:parent-checksum-not-instance",
+		source.Updated, // == source.Updated -> SourceChanged=false after recompute
+		"2026-04-30T11:00:00Z",
+		managedFieldHints{
+			summary:     desired.Summary,
+			description: desired.Description,
+			start:       &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z", TimeZone: "UTC"}, // RRULE projection
+			end:         &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z", TimeZone: "UTC"},
+		},
+	)
+	api.queueInstances([]gws.Event{*mi})
+
+	postMain := *mi
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+
+	h := &Handler{
+		API:              api,
+		SourceCalendarID: "src-cal",
+		TargetCalendarID: "tgt-cal",
+		SourceWritable:   true,
+		LookupMirrorParent: func(_ mirror.SourceTuple) (*gws.Event, bool) {
+			return mirrorParent, true
+		},
+	}
+	got, err := h.Handle(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if got.Action != mirror.ActionPatch || got.Reason != mirror.ReasonSourceUpdated {
+		t.Errorf("expected patch(source_updated) for inherited instance with real drift; got %+v", got)
+	}
+	if got.Conflict != mirror.ConflictInheritedSourceWon {
+		t.Errorf("expected ConflictInheritedSourceWon; got %q", got.Conflict)
+	}
+	// Source must NOT be patched: the source's reschedule must be preserved.
+	for _, c := range api.calls {
+		if c.Op == "EventsPatch" && c.CalendarID == "src-cal" {
+			t.Errorf("inherited_source_won must not patch source (would clobber user reschedule); got call %+v", c)
+		}
+	}
+	patches := api.callsByOp("EventsPatch")
+	if len(patches) != 2 {
+		t.Fatalf("expected 2 EventsPatch (main + checksum); got %d", len(patches))
+	}
+	// Main patch body must carry source's reschedule (13:00, not the
+	// auto-materialized 12:00).
+	body := patches[0].Body
+	if body == nil || body.Start == nil {
+		t.Fatal("main patch body missing Start")
+	}
+	if body.Start.DateTime != "2026-05-01T13:00:00Z" {
+		t.Errorf("main patch body Start.DateTime = %q, want %q (source's reschedule)",
+			body.Start.DateTime, "2026-05-01T13:00:00Z")
+	}
+}
+
+// TestHandle_InheritedInstance_BothChanged_InheritedSourceWon pins the
+// inherited branch's behavior in the conflict cell (SourceChanged=true and
+// MirrorDrifted=true) when the live mirror is newer than the source.
+// Without the inherited branch, the standard newer-wins tiebreak would
+// route to propagate(target_won) and clobber the source override. With the
+// branch, source-wins regardless of timestamps. This is the exact
+// production scenario that surfaced the bug: parent freshly written, source
+// has a pre-existing rescheduled override, mirror.updated > source.updated
+// because the parent insert just stamped the auto-materialized instance.
+func TestHandle_InheritedInstance_BothChanged_InheritedSourceWon(t *testing.T) {
+	api := newStubAPI()
+	mirrorParent := makeMirrorParent("mp-1")
+	source := makeSourceException("2026-04-30T11:00:00Z", "2026-05-01T12:00:00Z", "Source new")
+	source.Start = &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z", TimeZone: "UTC"}
+	source.End = &gws.EventDateTime{DateTime: "2026-05-01T14:00:00Z", TimeZone: "UTC"}
+
+	desired := mirror.BuildInstancePayload("src-cal", source)
+	mi := makeInheritedMirrorInstance("mi-1",
+		"src-cal:src-parent",
+		"sha256:parent-checksum-not-instance",
+		"2026-04-29T20:00:00Z",
+		"2026-04-30T15:00:00Z", // mirror newer than source.Updated -> would lose under newer-wins
+		managedFieldHints{
+			summary:     desired.Summary,
+			description: desired.Description,
+			start:       &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z", TimeZone: "UTC"},
+			end:         &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z", TimeZone: "UTC"},
+		},
+	)
+	api.queueInstances([]gws.Event{*mi})
+
+	postMain := *mi
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+
+	h := &Handler{
+		API:              api,
+		SourceCalendarID: "src-cal",
+		TargetCalendarID: "tgt-cal",
+		SourceWritable:   true,
+		LookupMirrorParent: func(_ mirror.SourceTuple) (*gws.Event, bool) {
+			return mirrorParent, true
+		},
+	}
+	got, err := h.Handle(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if got.Action != mirror.ActionPatch || got.Reason != mirror.ReasonSourceUpdated {
+		t.Errorf("expected patch(source_updated) for both-changed inherited instance; got %+v", got)
+	}
+	if got.Conflict != mirror.ConflictInheritedSourceWon {
+		t.Errorf("expected ConflictInheritedSourceWon (not target_won); got %q", got.Conflict)
+	}
+	for _, c := range api.calls {
+		if c.Op == "EventsPatch" && c.CalendarID == "src-cal" {
+			t.Errorf("inherited_source_won must not patch source; got call %+v", c)
+		}
+	}
+}
+
+// TestHandle_InheritedInstance_SourceOnly_FallsThroughToPatch pins the
+// `source_changed && !mirror_drifted` cell of the inherited-instance
+// branch. When the source override has been edited (storedSourceUpdated <
+// source.Updated) but the inherited mirror's managed fields still match
+// desired-from-source, neither bootstrap-path arm fires and we fall through
+// to the standard Classify, which produces patch(source_updated). The
+// rewrite still upgrades the instance to per-instance metadata via
+// BuildInstancePayload, but no inherited_* label is emitted - the source-
+// only cell is a normal source update, not a conflict.
+func TestHandle_InheritedInstance_SourceOnly_FallsThroughToPatch(t *testing.T) {
+	api := newStubAPI()
+	mirrorParent := makeMirrorParent("mp-1")
+	source := makeSourceException("2026-04-30T11:00:00Z", "2026-05-01T12:00:00Z", "Standup")
+
+	desired := mirror.BuildInstancePayload("src-cal", source)
+	// storedSourceUpdated < source.Updated -> SourceChanged=true. Live
+	// managed fields equal desired-from-source -> recomputed MirrorDrifted=
+	// false. The branch's switch falls through; Classify routes the cell
+	// to ActionPatch / ReasonSourceUpdated (no conflict).
+	mi := makeInheritedMirrorInstance("mi-1",
+		"src-cal:src-parent",
+		"sha256:parent-checksum-not-instance",
+		"2026-04-29T20:00:00Z", // older than source.Updated
+		"2026-04-29T20:00:00Z",
+		managedFieldHints{
+			summary:     desired.Summary,
+			description: desired.Description,
+			start:       desired.Start,
+			end:         desired.End,
+		},
+	)
+	api.queueInstances([]gws.Event{*mi})
+
+	postMain := *mi
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+
+	h := &Handler{
+		API:              api,
+		SourceCalendarID: "src-cal",
+		TargetCalendarID: "tgt-cal",
+		SourceWritable:   true,
+		LookupMirrorParent: func(_ mirror.SourceTuple) (*gws.Event, bool) {
+			return mirrorParent, true
+		},
+	}
+	got, err := h.Handle(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if got.Action != mirror.ActionPatch || got.Reason != mirror.ReasonSourceUpdated {
+		t.Errorf("expected patch(source_updated) for source-only inherited cell; got %+v", got)
+	}
+	// Critical: the source-only cell falls through to Classify and must NOT
+	// carry an inherited_* label. inherited_upgrade is reserved for the
+	// no-drift cell; inherited_source_won is reserved for the drift cells.
+	if got.Conflict != mirror.ConflictNone {
+		t.Errorf("source-only inherited cell must not carry a conflict; got %q", got.Conflict)
+	}
+	if got.Reason == ReasonInheritedUpgrade {
+		t.Errorf("source-only inherited cell must not use inherited_upgrade reason; got %q", got.Reason)
+	}
+	for _, c := range api.calls {
+		if c.Op == "EventsPatch" && c.CalendarID == "src-cal" {
+			t.Errorf("source-only path must not patch source; got call %+v", c)
+		}
+	}
+}
+
+// TestHandle_ManagedInstance_PreservesPropagateBehavior is a regression
+// guard: the inherited-instance branch must not affect events whose mirror
+// has been explicitly written by calendar-sync (calendar-sync:source EventID
+// matches the source instance ID, not the parent ID). Such mirrors still
+// follow the standard four-way matrix, including target-edited propagate.
+func TestHandle_ManagedInstance_PreservesPropagateBehavior(t *testing.T) {
+	api := newStubAPI()
+	mirrorParent := makeMirrorParent("mp-1")
+	source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
+
+	// Managed instance: calendar-sync:source = "src-cal:src-evt" (matches
+	// source.ID, NOT source.RecurringEventID). User edited the mirror's
+	// summary; source unchanged.
+	mi := makeCleanCurrentMirror("mi-1", source.Updated, source.Updated, managedFieldHints{
+		summary:     source.Summary,
+		description: source.Description + "\n\n---\nSource: " + source.HTMLLink,
+		start:       source.Start,
+		end:         source.End,
+	})
+	driftMirror(mi, func(e *gws.Event) {
+		e.Summary = "User edit"
+	})
+	api.queueInstances([]gws.Event{*mi})
+
+	// Propagate path: events.patch source, then events.patch mirror twice
+	// (main + checksum followup).
+	patchedSource := *source
+	patchedSource.Summary = "User edit"
+	api.queuePatch(&patchedSource)
+	postMain := *mi
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+
+	h := &Handler{
+		API:              api,
+		SourceCalendarID: "src-cal",
+		TargetCalendarID: "tgt-cal",
+		SourceWritable:   true,
+		LookupMirrorParent: func(_ mirror.SourceTuple) (*gws.Event, bool) {
+			return mirrorParent, true
+		},
+	}
+	got, err := h.Handle(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if got.Action != mirror.ActionPropagate || got.Reason != mirror.ReasonTargetEdited {
+		t.Errorf("expected propagate(target_edited) for managed instance with mirror drift; got %+v", got)
+	}
+	if got.Conflict != mirror.ConflictNone {
+		t.Errorf("propagate without source change should not carry a conflict; got %q", got.Conflict)
 	}
 }
 

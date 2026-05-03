@@ -206,6 +206,26 @@ Then the four-way matrix runs as usual:
 
 After this single migration write, the mirror is at the current `version` and subsequent reconciliations use the standard drift detection model.
 
+#### Inherited recurring-instance handling
+
+When calendar-sync writes a recurring parent mirror, Google Calendar materializes the parent's instances using the parent's RRULE and copies the parent's `extendedProperties.private` to each materialized instance verbatim. So an auto-materialized instance inherits the parent's `calendar-sync:source`, `calendar-sync:checksum`, `calendar-sync:source_updated`, and `calendar-sync:version` until calendar-sync explicitly writes that instance.
+
+Two consequences:
+
+- The inherited `calendar-sync:source` value is the parent's tuple (`<S>:<parent_id>`), not the per-instance form (`<S>:<parent_id>_<UTC>`). String compare against the source's `RecurringEventID` is sufficient detection.
+- The stored `calendar-sync:checksum` was computed over the parent's managed fields, not the instance's. Recomputing the live instance's checksum will almost always disagree, so the standard `mirror_drifted` signal fires even on a clean instance.
+
+The recurring-instance handler therefore routes inherited instances through the same bootstrap source-wins path used for schema migration. After running the same `DriftedFieldNames`-based recompute as the migration path:
+
+- `!source_changed && !mirror_drifted`: rewrite explicitly so the instance carries per-instance metadata. Action `patch`, reason `inherited_upgrade`.
+- `mirror_drifted` (with or without source change): the instance's drift may be a real source-side override (a rescheduled occurrence) that the parent's RRULE projection didn't carry. The mirror's value is bootstrap state, not a user edit, and propagating it back would clobber the source's override. Source-wins unconditionally with `inherited_source_won` conflict logged. The source is never patched on this path.
+
+The standard newer-wins tiebreak does not apply: the mirror's `updated` timestamp is fresh by construction (just materialized at parent-insert time) and would always defeat a pre-existing source override. Source-wins regardless of timestamps.
+
+After this write the instance is explicitly managed (its `calendar-sync:source` matches the source instance ID) and subsequent reconciliations use the standard drift matrix, including target-edited propagation when the source is writable.
+
+When `calendar-sync:version` is missing or behind the current value, the schema-migration path takes precedence over the inherited-instance path - the schema bump is the more specific story.
+
 ## Configuration
 
 ### Location
@@ -498,6 +518,7 @@ A given `reason` is paired with one of six `action` values: `insert`, `patch`, `
 | `source_updated`           | `insert` or `patch`         | `source_changed=true && mirror_drifted=false`, or no mirror exists yet (then `insert`). Also covers `source_changed && mirror_drifted` resolved to source-wins (see `conflict_source_won` below). |
 | `target_edited`            | `propagate` or `revert`     | `mirror_drifted=true && source_changed=false`, or `source_changed && mirror_drifted` resolved to mirror-wins. `propagate` if `pdir.source_writable`, else `revert`. |
 | `migration_upgrade`        | `patch`                     | A legacy mirror (v1 or v2) with no source change and no drift, re-written at the current `version` with a fresh `calendar-sync:checksum`. One-time per pre-existing mirror. |
+| `inherited_upgrade`        | `patch`                     | A recurring-instance mirror auto-materialized by Google from a parent we wrote, with no actual drift, re-written so the instance carries per-instance `calendar-sync:source` and `:checksum`. One-time per inherited instance. See "Inherited recurring-instance handling". |
 | `orphaned`                 | `delete`                    | Prune pass found a mirror whose source no longer exists.                                                                                 |
 
 Server-side `eventTypes` filtering means events of excluded types (`birthday`, `fromGmail`, `workingLocation`) never appear on the wire and so don't produce a `skip` event.
@@ -517,8 +538,9 @@ Possible `msg` values:
 - `conflict_source_won` - both signals true, source's `updated` won (or tied) and the mirror was patched from source. The accompanying stdout action carries `reason=source_updated`.
 - `conflict_target_won` - both signals true, mirror's `updated` won and drift handling fired. The accompanying stdout action carries `reason=target_edited`.
 - `migration_source_won` - same as `conflict_source_won` but during a legacy schema migration (v1 or v2 → current). v1 mirrors have no reliable user-edit timestamp; v2 mirrors keep the same simpler rule for consistency. Source wins by default. The action carries `reason=source_updated`.
+- `inherited_source_won` - drift on a recurring-instance mirror that has not been explicitly written by calendar-sync (auto-materialized from the parent we wrote, identified by `calendar-sync:source` matching the parent tuple). The mirror's value is bootstrap state, not a user edit, so source-wins regardless of the timestamp tiebreak. The action carries `reason=source_updated`. See "Inherited recurring-instance handling" above.
 
-The `source_updated` and `mirror_updated` fields show the timestamps that drove the newer-wins decision (omitted on `migration_source_won` since the migration cell uses source-wins-by-default rather than a timestamp comparison), so the user can verify it was the call they wanted.
+The `source_updated` and `mirror_updated` fields show the timestamps that drove the newer-wins decision (omitted on `migration_source_won` and `inherited_source_won` since both bootstrap paths use source-wins-by-default rather than a timestamp comparison), so the user can verify it was the call they wanted.
 
 #### Daemon-running detection
 
@@ -1190,7 +1212,9 @@ Apply these rules in order to the source exception `E`. The "user-facing action"
    - `source_changed = E.updated > mirror_instance.calendar-sync:source_updated`
    - `mirror_drifted = sha256(canonical(mirror_instance.<managed fields>)) != mirror_instance.calendar-sync:checksum`. If `version < 2` on the mirror instance, derive `mirror_drifted` per the "Schema version migration" rules instead (compare live managed fields to desired-from-source).
 
-   Apply the four-way matrix:
+   Before the four-way matrix, branch on whether the mirror instance's `calendar-sync:source` matches the source PARENT's tuple (i.e. its EventID equals `E.recurringEventId`). If so, the instance was auto-materialized when calendar-sync wrote the parent and has not been explicitly written; route through the inherited-instance bootstrap path described in "Inherited recurring-instance handling" rather than the standard matrix below.
+
+   Apply the four-way matrix (only for explicitly-managed instances; inherited instances took the branch above):
    - `!source_changed && !mirror_drifted`: `skip(reason=unchanged)`.
    - `source_changed && !mirror_drifted`: `events.patch` the mirror instance with the full mirror-instance payload. Action `patch`, reason `source_updated`.
    - `!source_changed && mirror_drifted`: drift handling. The source instance always exists in this frame (we got here because the source-list call with `singleEvents=false` returned `E` as a source override). If `pdir.source_writable`, `events.patch` the **source instance** with the drifted fields. Action `propagate`, reason `target_edited`. Then re-write the mirror instance with the full payload, fresh checksum, and the source instance's new `updated`. Else `events.patch` the mirror instance to overwrite the user's edits. Action `revert`, reason `target_edited`.

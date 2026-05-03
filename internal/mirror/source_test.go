@@ -3,6 +3,8 @@ package mirror
 import (
 	"errors"
 	"testing"
+
+	"github.com/tammersaleh/calendar-sync/internal/gws"
 )
 
 func TestSourceTupleString(t *testing.T) {
@@ -74,4 +76,77 @@ func TestParseSourceTuple(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestIsInheritedRecurringInstance(t *testing.T) {
+	withSourceTuple := func(s string) *gws.Event {
+		return &gws.Event{
+			ExtendedProperties: &gws.ExtendedProperties{
+				Private: map[string]string{ExtKeySource: s},
+			},
+		}
+	}
+
+	tests := []struct {
+		name           string
+		event          *gws.Event
+		sourceParentID string
+		want           bool
+	}{
+		{
+			"inherited: source-tuple EventID equals parent ID",
+			withSourceTuple("src-cal:src-parent"),
+			"src-parent",
+			true,
+		},
+		{
+			"managed: source-tuple EventID is the instance ID with UTC suffix",
+			withSourceTuple("src-cal:src-parent_20260511T160000Z"),
+			"src-parent",
+			false,
+		},
+		{
+			"managed: source-tuple EventID is unrelated",
+			withSourceTuple("src-cal:src-evt"),
+			"src-parent",
+			false,
+		},
+		{
+			"nil event",
+			nil,
+			"src-parent",
+			false,
+		},
+		{
+			"empty parent ID",
+			withSourceTuple("src-cal:src-parent"),
+			"",
+			false,
+		},
+		{
+			"missing source extended property",
+			&gws.Event{ExtendedProperties: &gws.ExtendedProperties{Private: map[string]string{}}},
+			"src-parent",
+			false,
+		},
+		{
+			"nil ExtendedProperties",
+			&gws.Event{},
+			"src-parent",
+			false,
+		},
+		{
+			"malformed source value (no colon)",
+			withSourceTuple("not-a-tuple"),
+			"src-parent",
+			false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsInheritedRecurringInstance(tc.event, tc.sourceParentID); got != tc.want {
+				t.Errorf("IsInheritedRecurringInstance() = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }

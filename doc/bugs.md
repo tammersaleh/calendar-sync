@@ -40,6 +40,14 @@ Fix sketch: switch to `html/template` (handles XML-class escaping for content), 
 
 ## Fixed
 
+### B15 - recurring-instance handler clobbers source overrides on first encounter (CRITICAL)
+
+When calendar-sync writes a recurring parent mirror, Google auto-materializes the parent's instances using the parent's RRULE. The auto-materialized instances inherit the parent's `extendedProperties.private` (including `calendar-sync:checksum`) but their live managed fields differ from the parent's (each instance has its own start/end). The standard drift matrix saw `mirror_drifted=true` (live checksum != stored), and when source had a per-instance override (e.g. a user rescheduled one occurrence), `source_changed=true` as well. The newer-wins tiebreak picked the freshly-materialized mirror over the pre-existing source override and routed to `propagate(target_edited, conflict_target_won)`, sending the mirror's RRULE-projected start/end back to the source - reverting the user's reschedule.
+
+Surfaced during the personal→cw rollout dry-run at horizon=14d. A real source override (yoga 5/11 rescheduled from 9am to 10am) was about to be clobbered. Caught before the actual run.
+
+Fixed by adding an inherited-instance branch in `applyDriftMatrix`: detect via `mirror.IsInheritedRecurringInstance` (mirror's `calendar-sync:source` EventID equals `source.RecurringEventID`), then route through the same source-wins bootstrap path as the schema-version migration. New conflict label `inherited_source_won`, new reason `inherited_upgrade`. Source is never patched on this path. SPEC.md updated with the new branch and decision table. Tests pin all four cells (no-drift upgrade, real-drift source-wins, both-changed source-wins, managed-instance regression).
+
 ### B14 - orphan walker errors on HTTP 410 from events.delete
 
 After B13 the orphan walker started seeing legitimate 410 responses on `events.delete` ("Resource has been deleted") - typically a cancelled exception instance of a recurring event whose parent was just deleted in the same pass, triggering a server-side cascade. The walker only handled `ErrAPINotFound` (404), so the 410 bubbled up as `partial_failure`.

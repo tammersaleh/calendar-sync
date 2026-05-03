@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/tammersaleh/calendar-sync/internal/gws"
 )
 
 // ErrInvalidSourceTuple is returned by ParseSourceTuple when the input is not
@@ -35,4 +37,32 @@ func ParseSourceTuple(s string) (SourceTuple, error) {
 		return SourceTuple{}, fmt.Errorf("%w: %q", ErrInvalidSourceTuple, s)
 	}
 	return SourceTuple{CalendarID: cal, EventID: event}, nil
+}
+
+// IsInheritedRecurringInstance reports whether mirrorEvent is an
+// auto-materialized recurring-instance mirror that has not been explicitly
+// written by calendar-sync.
+//
+// When calendar-sync writes a recurring parent mirror, Google Calendar
+// materializes the parent's instances using its recurrence rule and copies
+// the parent's extendedProperties.private to each materialized instance. The
+// inherited copy carries a calendar-sync:source value pointing at the source
+// PARENT - the EventID portion equals sourceParentID. By contrast, when the
+// recurring handler explicitly writes an instance, BuildInstancePayload sets
+// calendar-sync:source to the source-instance tuple (EventID = the exception's
+// own ID with the "_<UTC>" suffix), so inherited and managed forms are
+// distinguishable by string compare.
+//
+// sourceParentID is the source event's RecurringEventID (its parent ID).
+// Returns false for nil events, missing/malformed source extended properties,
+// empty sourceParentID, or any mismatch with the parent ID.
+func IsInheritedRecurringInstance(mirrorEvent *gws.Event, sourceParentID string) bool {
+	if mirrorEvent == nil || sourceParentID == "" {
+		return false
+	}
+	tuple, err := ParseSourceTuple(extPropPrivate(mirrorEvent, ExtKeySource))
+	if err != nil {
+		return false
+	}
+	return tuple.EventID == sourceParentID
 }

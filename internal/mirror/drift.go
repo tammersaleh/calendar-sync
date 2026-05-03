@@ -46,6 +46,13 @@ const (
 	ConflictSourceWon          Conflict = "conflict_source_won"
 	ConflictTargetWon          Conflict = "conflict_target_won"
 	ConflictMigrationSourceWon Conflict = "migration_source_won"
+	// ConflictInheritedSourceWon is logged when a recurring-instance mirror
+	// that has not been explicitly written by calendar-sync (auto-materialized
+	// from the parent we wrote) gets overwritten with the source instance's
+	// state. The mirror's auto-materialized value is bootstrap state, not a
+	// user edit, so source-wins regardless of the timestamp tiebreak. See the
+	// inherited-recurring-instance handling in internal/recurring/handler.go.
+	ConflictInheritedSourceWon Conflict = "inherited_source_won"
 )
 
 // Outcome is what the drift-handling matrix decides for one (source, mirror)

@@ -61,6 +61,13 @@ const (
 	ReasonTentative                mirror.Reason = "tentative"
 	ReasonTransparencyTransparent  mirror.Reason = "transparency_transparent"
 	ReasonMigrationUpgrade         mirror.Reason = "migration_upgrade"
+	// ReasonInheritedUpgrade is the recurring-handler reason for an
+	// auto-materialized instance whose live managed fields already match
+	// desired-from-source: rewrite explicitly so the instance carries its
+	// own per-instance calendar-sync:source / :checksum / :source_updated
+	// (no longer shared with the parent). See the inherited-instance branch
+	// of applyDriftMatrix.
+	ReasonInheritedUpgrade mirror.Reason = "inherited_upgrade"
 )
 
 // Result is the outcome of one Handle call. The Action / Reason / Conflict
@@ -433,34 +440,51 @@ func (h *Handler) cancelMirrorInstance(ctx context.Context, mirrorInstance *gws.
 func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *gws.Event) (Result, error) {
 	signal := mirror.ComputeDriftSignal(source, mirrorInstance)
 	desired := mirror.BuildInstancePayload(h.SourceCalendarID, source)
+	// An auto-materialized recurring-instance mirror inherits the parent's
+	// extended properties, so its calendar-sync:source points at the source
+	// PARENT (no instance suffix). Detection lets us treat such instances as
+	// bootstrap state - never a peer for conflict resolution - even when the
+	// stored schema version equals SchemaVersion. Without this, the standard
+	// matrix's newer-wins tiebreak picks the freshly-materialized mirror over
+	// a pre-existing source override and propagates the mirror's stale fields
+	// back to the source, clobbering the user's reschedule.
+	isInherited := mirror.IsInheritedRecurringInstance(mirrorInstance, source.RecurringEventID)
 	h.debug("recurring.applyDriftMatrix",
 		"source_event", source.ID,
 		"mirror_instance", mirrorInstance.ID,
 		"source_changed", signal.SourceChanged,
 		"mirror_drifted", signal.MirrorDrifted,
 		"needs_migration", signal.NeedsMigration,
+		"is_inherited", isInherited,
 	)
-	if signal.NeedsMigration {
-		// Per SPEC.md "Schema version migration", recompute MirrorDrifted
-		// for legacy mirrors via mirror.DriftedFieldNames rather than the
-		// missing-checksum signal (which would always say true) or raw
-		// Checksum (which doesn't normalize transparency/visibility defaults
-		// or order-insensitive recurrence). DriftedFieldNames matches the
-		// propagate body's drift set so the two views can't disagree.
+	if signal.NeedsMigration || isInherited {
+		// Both the schema-version-migration path and the inherited-instance
+		// path treat the mirror as bootstrap state and source-win on any
+		// drift. They share the same recompute and write shape; only the
+		// reason / conflict labels differ. Migration takes precedence when
+		// both conditions hold (the schema bump is the more specific story).
 		signal.MirrorDrifted = len(mirror.DriftedFieldNames(mirrorInstance, desired)) > 0
 
-		h.debug("recurring.applyDriftMatrix: migration recompute",
+		upgradeReason := ReasonMigrationUpgrade
+		sourceWonConflict := mirror.ConflictMigrationSourceWon
+		if isInherited && !signal.NeedsMigration {
+			upgradeReason = ReasonInheritedUpgrade
+			sourceWonConflict = mirror.ConflictInheritedSourceWon
+		}
+
+		h.debug("recurring.applyDriftMatrix: bootstrap recompute",
 			"source_event", source.ID,
 			"source_changed", signal.SourceChanged,
 			"mirror_drifted_after_recompute", signal.MirrorDrifted,
+			"upgrade_reason", string(upgradeReason),
 		)
 
 		switch {
 		case !signal.SourceChanged && !signal.MirrorDrifted:
-			// SPEC migration_upgrade: rewrite the mirror at the current
-			// SchemaVersion with a fresh checksum. BuildInstancePayload
-			// writes the current version in extended properties, so a
-			// normal patch+checksum-followup is the right shape.
+			// Bootstrap upgrade: rewrite explicitly so the instance carries
+			// per-instance metadata (calendar-sync:source matches the
+			// instance ID, fresh checksum). Future drift detection compares
+			// instance-vs-instance instead of inheriting the parent's value.
 			desired.ID = ""
 			post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, desired)
 			if err != nil {
@@ -468,17 +492,17 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 			}
 			return Result{
 				Action:                  mirror.ActionPatch,
-				Reason:                  ReasonMigrationUpgrade,
+				Reason:                  upgradeReason,
 				PostWriteMirrorInstance: post,
 			}, nil
 		case signal.MirrorDrifted:
-			// ANY mirror drift during migration (with or without source
-			// change) is source-wins. Drift may be schema-induced (e.g. v2
-			// instances lack the Location field that v3 introduced); we
-			// cannot safely propagate the mirror's value to source because
-			// the diff might not be a user edit at all. The mirror's edits
-			// are overwritten unconditionally with conflict=
-			// migration_source_won.
+			// Any mirror drift while in bootstrap state is source-wins.
+			// During migration the drift may be schema-induced (e.g. v2
+			// instances lack v3's Location field); for inherited instances
+			// the drift may simply reflect the source's per-instance
+			// override that the parent's RRULE projection didn't carry.
+			// Either way the source is authoritative and we must not
+			// propagate the mirror's value back.
 			desired.ID = ""
 			post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, desired)
 			if err != nil {
@@ -487,7 +511,7 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 			return Result{
 				Action:                  mirror.ActionPatch,
 				Reason:                  mirror.ReasonSourceUpdated,
-				Conflict:                mirror.ConflictMigrationSourceWon,
+				Conflict:                sourceWonConflict,
 				PostWriteMirrorInstance: post,
 			}, nil
 		}

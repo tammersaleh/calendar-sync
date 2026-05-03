@@ -285,3 +285,113 @@ func TestDriftedFieldNames_RealVisibilityChangeStillDrifts(t *testing.T) {
 		t.Errorf("expected visibility drift for private vs public; got %v", got)
 	}
 }
+
+func TestDriftedFieldNames_RecurrenceChangeOnParentDrifts(t *testing.T) {
+	// A user editing a recurring mirror parent's RRULE must enter the drifted
+	// set; otherwise propagate runs with an empty body and the user's edit
+	// silently reverts when the mirror is re-written from BuildPayload(source).
+	desired := &gws.Event{
+		Summary:      "Standup",
+		Start:        &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"},
+		End:          &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z"},
+		Recurrence:   []string{"RRULE:FREQ=DAILY;COUNT=3"},
+		Transparency: gws.TransparencyOpaque,
+		Visibility:   gws.VisibilityPrivate,
+	}
+	live := *desired
+	live.Recurrence = []string{"RRULE:FREQ=WEEKLY;COUNT=4"}
+
+	got := DriftedFieldNames(&live, desired)
+	found := false
+	for _, f := range got {
+		if f == "recurrence" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected recurrence drift for parent edit; got %v", got)
+	}
+}
+
+func TestDriftedFieldNames_RecurrenceMatchesIgnoringOrder(t *testing.T) {
+	// Mirrors Checksum's sort-before-hash behavior: two recurrence arrays
+	// with the same content in different order must be treated as equal so
+	// the field-level diff agrees with the checksum signal.
+	desired := &gws.Event{
+		Summary:      "Standup",
+		Start:        &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"},
+		End:          &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z"},
+		Recurrence:   []string{"RRULE:FREQ=DAILY", "EXDATE;TZID=UTC:20260507T120000"},
+		Transparency: gws.TransparencyOpaque,
+		Visibility:   gws.VisibilityPrivate,
+	}
+	live := *desired
+	live.Recurrence = []string{"EXDATE;TZID=UTC:20260507T120000", "RRULE:FREQ=DAILY"}
+
+	got := DriftedFieldNames(&live, desired)
+	for _, f := range got {
+		if f == "recurrence" {
+			t.Errorf("expected no recurrence drift when contents match (order-insensitive); got %v", got)
+		}
+	}
+}
+
+func TestDriftedFieldNames_RecurrenceBothNilNoChange(t *testing.T) {
+	// Instance overrides have nil recurrence on both sides per
+	// BuildInstancePayload; the comparison must treat that as equal.
+	desired := &gws.Event{
+		Summary:      "Override",
+		Start:        &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"},
+		End:          &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z"},
+		Transparency: gws.TransparencyOpaque,
+		Visibility:   gws.VisibilityPrivate,
+	}
+	live := *desired
+
+	got := DriftedFieldNames(&live, desired)
+	for _, f := range got {
+		if f == "recurrence" {
+			t.Errorf("expected no recurrence drift when both nil; got %v", got)
+		}
+	}
+}
+
+func TestDriftedFieldNames_RecurrenceEmptySliceVsNil(t *testing.T) {
+	// An empty []string and a nil slice are both "no recurrence" on the wire
+	// (omitempty erases both); the field-level comparison must not flag
+	// drift between them.
+	desired := &gws.Event{
+		Summary:      "Override",
+		Start:        &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"},
+		End:          &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z"},
+		Recurrence:   []string{},
+		Transparency: gws.TransparencyOpaque,
+		Visibility:   gws.VisibilityPrivate,
+	}
+	live := *desired
+	live.Recurrence = nil
+
+	got := DriftedFieldNames(&live, desired)
+	for _, f := range got {
+		if f == "recurrence" {
+			t.Errorf("expected no recurrence drift when one side is empty and the other nil; got %v", got)
+		}
+	}
+}
+
+func TestBuildPropagatePatchBody_IncludesRecurrence(t *testing.T) {
+	// When recurrence is in the drifted set, the propagate body carries the
+	// LIVE mirror's recurrence verbatim so the user's edit reaches source.
+	live := &gws.Event{
+		Summary:    "Standup",
+		Recurrence: []string{"RRULE:FREQ=WEEKLY;COUNT=4"},
+	}
+	body := BuildPropagatePatchBody(live, []string{"recurrence"})
+	if len(body.Recurrence) != 1 || body.Recurrence[0] != "RRULE:FREQ=WEEKLY;COUNT=4" {
+		t.Errorf("Recurrence = %v, want [RRULE:FREQ=WEEKLY;COUNT=4]", body.Recurrence)
+	}
+	if body.Summary != "" {
+		t.Errorf("Summary should not be set (not in drifted list); got %q", body.Summary)
+	}
+}

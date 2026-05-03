@@ -15,9 +15,11 @@ import (
 // only in the trailer (calendar-sync's own append) would produce a
 // false-positive description-drift signal.
 //
-// Recurrence is intentionally not compared - mirror instances always have
-// nil recurrence per BuildInstancePayload, so a difference there would be a
-// programmer error, not user drift.
+// Recurrence is compared with order-insensitive equality (matching
+// Checksum's sort-before-hash behavior) so the field-level diff agrees
+// with the mirror_drifted signal. For instance overrides both sides are
+// nil per BuildInstancePayload, so the comparison is naturally equal and
+// no drift is reported.
 //
 // Field name strings match SPEC.md's "fields" array ordering convention:
 // they are returned alphabetically sorted so callers (tests, log emitters)
@@ -59,8 +61,37 @@ func DriftedFieldNames(live, desired *gws.Event) []string {
 	if normalizeVisibility(liveFields.Visibility) != normalizeVisibility(desiredFields.Visibility) {
 		fields = append(fields, "visibility")
 	}
+	if !recurrenceEqual(liveFields.Recurrence, desiredFields.Recurrence) {
+		fields = append(fields, "recurrence")
+	}
 	sort.Strings(fields)
 	return fields
+}
+
+// recurrenceEqual reports equality for recurrence arrays, ignoring order.
+// Matches Checksum's sort-before-hash behavior so a parent whose checksum
+// matches the stored value also has no recurrence drift in the field-level
+// diff. Treats nil and an empty slice as equivalent (both serialize the
+// same way thanks to omitempty).
+func recurrenceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		return true
+	}
+	aSorted := make([]string, len(a))
+	bSorted := make([]string, len(b))
+	copy(aSorted, a)
+	copy(bSorted, b)
+	sort.Strings(aSorted)
+	sort.Strings(bSorted)
+	for i := range aSorted {
+		if aSorted[i] != bSorted[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // normalizeTransparency treats Google's omission of the default ("opaque")
@@ -119,6 +150,8 @@ func BuildPropagatePatchBody(live *gws.Event, drifted []string) *gws.Event {
 			body.Transparency = live.Transparency
 		case "visibility":
 			body.Visibility = live.Visibility
+		case "recurrence":
+			body.Recurrence = live.Recurrence
 		}
 	}
 	return body

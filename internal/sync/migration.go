@@ -24,21 +24,25 @@ import (
 //     mirror at the current SchemaVersion with a fresh checksum. SPEC.md
 //     "Schema version migration" routes this cell here rather than to
 //     skip(unchanged).
-//   - source_changed && mirror_drifted: source-wins-by-default. SPEC says
-//     newer-wins isn't reliable across schema versions (v1 mirrors lack a
-//     usable user-edit timestamp; v2 mirrors have one but we keep v1
-//     semantics for simplicity and consistency), so we patch from source
-//     unconditionally with conflict=migration_source_won.
+//   - mirror_drifted (with or without source_changed): source-wins-by-
+//     default. We can't safely propagate during migration because the
+//     "drift" may be schema-induced (e.g. a v3 field that didn't exist
+//     in the v2 mirror, like Location) rather than a real user edit.
+//     Distinguishing the two would require per-field schema-version
+//     metadata we don't have. So source always wins on any drift during
+//     migration; conflict=migration_source_won surfaces this to the user.
+//     This is the conservative trade-off matching v1 semantics (v1 mirrors
+//     have no reliable user-edit timestamp at all).
 //   - source_changed && !mirror_drifted: standard patch(source_updated).
 //     The cell behaves identically to the standard matrix; falls through
 //     to the existing patch path so the legacy/current paths converge
 //     afterward.
-//   - !source_changed && mirror_drifted: standard propagate or revert.
-//     Falls through to mirror.Classify for the same reason.
 //
-// The two cells that diverge from the standard matrix are handled inline;
-// the other two fall through to the standard mirror.Classify dispatch.
-// This mirrors the recurring handler's migration routing in
+// Three of four cells are handled inline (migration_upgrade for the no-
+// drift case, migration_source_won for any mirror drift). Only
+// !MirrorDrifted && SourceChanged falls through to mirror.Classify, which
+// correctly handles it as ActionPatch / ReasonSourceUpdated. This mirrors
+// the recurring handler's migration routing in
 // internal/recurring/handler.go.
 func (c *Classifier) reconcileMigration(
 	ctx context.Context,
@@ -59,28 +63,37 @@ func (c *Classifier) reconcileMigration(
 		// fresh checksum.
 		return c.doMigrationUpgrade(ctx, source, mirrorEvent, desired)
 
-	case signal.SourceChanged && signal.MirrorDrifted:
-		// migration_source_won: source wins regardless of timestamps.
+	case signal.MirrorDrifted:
+		// ANY mirror drift during migration (with or without source change)
+		// is source-wins. Drift may be schema-induced (e.g. v2 mirrors lack
+		// the Location field that v3 introduced); we cannot safely propagate
+		// the mirror's value to source because the diff might not be a user
+		// edit at all. The migration_source_won conflict warns the user that
+		// the mirror's pre-migration content was overwritten by source -
+		// this is acceptable because (a) v1 mirrors had no reliable user-
+		// edit timestamp (existing rationale), and (b) v2->v3 mirror diffs
+		// in the new Location field aren't user edits at all.
 		return c.doMigrationSourceWon(ctx, source, mirrorEvent, desired)
 	}
 
-	// Source-only or mirror-only: identical to the standard matrix. Fall
-	// through to the standard outcome dispatch so the propagate/revert/
-	// patch logic stays in one place.
+	// Only !MirrorDrifted && SourceChanged falls through. The standard
+	// matrix routes this to ActionPatch / ReasonSourceUpdated, identical
+	// to the standard cell.
 	outcome := mirror.Classify(signal, c.SourceWritable, source.Updated, mirrorEvent.Updated)
 	switch outcome.Action {
 	case mirror.ActionSkip:
-		// Unreachable: the v1 cells we'd land here for are source-only or
-		// mirror-only, both of which are non-skip outcomes via Classify.
-		// The two skip-eligible cells (!source_changed && !mirror_drifted,
-		// and source_changed && mirror_drifted) are handled inline above.
+		// Unreachable: !MirrorDrifted && SourceChanged routes through
+		// Classify to ActionPatch, never ActionSkip. The skip-eligible
+		// (!source_changed && !mirror_drifted) and drift-handling
+		// (mirror_drifted) cells are handled inline above.
 		return fmt.Errorf("sync: unreachable %s in reconcileMigration", outcome.Action)
 	case mirror.ActionPatch:
 		return c.doPatchFromSource(ctx, source, mirrorEvent, desired, outcome)
-	case mirror.ActionPropagate:
-		return c.doPropagate(ctx, source, mirrorEvent, desired, outcome)
-	case mirror.ActionRevert:
-		return c.doRevert(ctx, source, mirrorEvent, desired, outcome)
+	case mirror.ActionPropagate, mirror.ActionRevert:
+		// Unreachable: ActionPropagate / ActionRevert require mirror_drifted=
+		// true, which is handled by the inline migration_source_won case
+		// above.
+		return fmt.Errorf("sync: unreachable %s in reconcileMigration", outcome.Action)
 	}
 	// mirror.Classify returns only the four actions above; reaching here
 	// would mean the matrix grew a new cell without updating this switch.

@@ -1227,11 +1227,15 @@ func TestHandle_V1Mirror_NoActualDrift_PatchesAsMigrationUpgrade(t *testing.T) {
 	}
 }
 
-func TestHandle_V1Mirror_ActualDrift_Revert(t *testing.T) {
+func TestHandle_V1Mirror_ActualDrift_MigrationSourceWon(t *testing.T) {
 	// v1 mirror, source unchanged, live fields differ from desired -> the
-	// recompute lands on !source_changed && mirror_drifted, which falls
-	// through to Classify and behaves identically to the v2 mirror-only
-	// drift cell. With SourceWritable=false this reverts the mirror.
+	// recompute lands on !source_changed && mirror_drifted. During migration
+	// any mirror drift routes to migration_source_won regardless of
+	// SourceWritable: drift may be schema-induced (a v3 field that didn't
+	// exist when the mirror was written) and we can't distinguish that from
+	// real user edits without per-field schema metadata. Source always wins
+	// during migration; subsequent reconciliations after the schema upgrade
+	// use the standard drift matrix.
 	api := newStubAPI()
 	mirrorParent := makeMirrorParent("mp-1")
 	source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
@@ -1244,14 +1248,16 @@ func TestHandle_V1Mirror_ActualDrift_Revert(t *testing.T) {
 	})
 	api.queueInstances([]gws.Event{*mi})
 
-	api.queuePatch(mi)
-	api.queuePatch(mi)
+	postMain := *mi
+	postMain.Summary = source.Summary
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
 
 	h := &Handler{
 		API:              api,
 		SourceCalendarID: "src-cal",
 		TargetCalendarID: "tgt-cal",
-		SourceWritable:   false, // -> revert
+		SourceWritable:   false, // -> would have reverted under old behavior
 		LookupMirrorParent: func(_ mirror.SourceTuple) (*gws.Event, bool) {
 			return mirrorParent, true
 		},
@@ -1260,8 +1266,17 @@ func TestHandle_V1Mirror_ActualDrift_Revert(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Handle returned error: %v", err)
 	}
-	if got.Action != mirror.ActionRevert || got.Reason != mirror.ReasonTargetEdited {
-		t.Errorf("expected revert(target_edited) for v1 with actual drift; got %+v", got)
+	if got.Action != mirror.ActionPatch || got.Reason != mirror.ReasonSourceUpdated {
+		t.Errorf("expected patch(source_updated) for v1 with mirror drift during migration; got %+v", got)
+	}
+	if got.Conflict != mirror.ConflictMigrationSourceWon {
+		t.Errorf("expected ConflictMigrationSourceWon; got %q", got.Conflict)
+	}
+	// No source-side patch (consistent with all migration_source_won paths).
+	for _, c := range api.calls {
+		if c.Op == "EventsPatch" && c.CalendarID == "src-cal" {
+			t.Errorf("migration_source_won must not patch source; got call %+v", c)
+		}
 	}
 }
 
@@ -1500,6 +1515,108 @@ func TestHandle_V2MirrorInstanceEmptyTransparencyDoesNotPropagate(t *testing.T) 
 	}
 	if v := patches[0].Body.ExtendedProperties.Private[mirror.ExtKeyVersion]; v != mirror.SchemaVersion {
 		t.Errorf("main patch body version = %q, want %q", v, mirror.SchemaVersion)
+	}
+}
+
+// TestHandle_V2MirrorInstanceLocationDriftRoutesToMigrationSourceWon pins
+// the data-loss bug fix for the v2 -> v3 migration of recurring instances.
+// v2 instance mirrors lack the `location` managed field; when the source
+// instance has a location and the v2 mirror has empty Location,
+// DriftedFieldNames reports MirrorDrifted=true. The previous code fell
+// through to the standard Classify, which routed !source_changed &&
+// mirror_drifted to propagate (with sourceWritable=true), patching SOURCE
+// with the mirror's empty location and clobbering the source's real value.
+// The fix routes any MirrorDrifted=true during migration to
+// migration_source_won so the source instance is never written to.
+func TestHandle_V2MirrorInstanceLocationDriftRoutesToMigrationSourceWon(t *testing.T) {
+	api := newStubAPI()
+	mirrorParent := makeMirrorParent("mp-1")
+	source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
+	source.Location = "Conference Room A / video: https://meet.example.com/xyz"
+
+	// v2 mirror instance with empty Location. Live managed fields for
+	// everything else match desired-from-source, so the only drift is the
+	// missing location.
+	desired := mirror.BuildInstancePayload("src-cal", source)
+	mi := &gws.Event{
+		ID:           "mi-1",
+		Status:       gws.EventStatusConfirmed,
+		Summary:      desired.Summary,
+		Description:  desired.Description,
+		Start:        desired.Start,
+		End:          desired.End,
+		Location:     "", // v2 instance has no location
+		Transparency: desired.Transparency,
+		Visibility:   desired.Visibility,
+		Updated:      source.Updated,
+		ExtendedProperties: &gws.ExtendedProperties{
+			Private: map[string]string{
+				mirror.ExtKeySource:        "src-cal:src-evt",
+				mirror.ExtKeySourceUpdated: source.Updated,
+				mirror.ExtKeyVersion:       "2",
+				mirror.ExtKeyChecksum:      "sha256:legacy-v2-checksum",
+			},
+		},
+	}
+	api.queueInstances([]gws.Event{*mi})
+
+	// Queue three patch responses so the buggy propagate path
+	// (EventsPatch source + EventsPatch mirror + checksum follow-up) and
+	// the fixed migration path (EventsPatch mirror + checksum follow-up)
+	// both complete without queue-exhaustion noise; the assertions below
+	// are the actual red/green signal.
+	postMain := *mi
+	postMain.Location = source.Location
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+
+	h := &Handler{
+		API:              api,
+		SourceCalendarID: "src-cal",
+		TargetCalendarID: "tgt-cal",
+		SourceWritable:   true,
+		LookupMirrorParent: func(_ mirror.SourceTuple) (*gws.Event, bool) {
+			return mirrorParent, true
+		},
+	}
+	got, err := h.Handle(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if got.Action != mirror.ActionPatch || got.Reason != mirror.ReasonSourceUpdated {
+		t.Errorf("expected patch(source_updated) for v2 instance with location drift; got %+v", got)
+	}
+	if got.Conflict != mirror.ConflictMigrationSourceWon {
+		t.Errorf("expected ConflictMigrationSourceWon; got %q", got.Conflict)
+	}
+	// Critical: NO source-side patch (the propagate bug would clobber
+	// source's real location with the mirror's empty value).
+	for _, c := range api.calls {
+		if c.Op == "EventsPatch" && c.CalendarID == "src-cal" {
+			t.Errorf("migration_source_won must not patch source instance; got call %+v", c)
+		}
+	}
+	patches := api.callsByOp("EventsPatch")
+	if len(patches) != 2 {
+		t.Fatalf("expected 2 EventsPatch (mirror main + checksum followup); got %d", len(patches))
+	}
+	for i, p := range patches {
+		if p.CalendarID != "tgt-cal" || p.EventID != "mi-1" {
+			t.Errorf("patches[%d] should target the mirror instance; got %s/%s", i, p.CalendarID, p.EventID)
+		}
+	}
+	// Main patch body must carry the new SchemaVersion ("3") and source's
+	// location.
+	body := patches[0].Body
+	if body == nil || body.ExtendedProperties == nil {
+		t.Fatal("main patch body missing ExtendedProperties")
+	}
+	if v := body.ExtendedProperties.Private[mirror.ExtKeyVersion]; v != mirror.SchemaVersion {
+		t.Errorf("main patch body version = %q, want %q", v, mirror.SchemaVersion)
+	}
+	if body.Location != source.Location {
+		t.Errorf("main patch body Location = %q, want %q (source's location)", body.Location, source.Location)
 	}
 }
 

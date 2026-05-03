@@ -198,9 +198,11 @@ On first encounter of any legacy mirror, calendar-sync derives `mirror_drifted` 
 Then the four-way matrix runs as usual:
 
 - `!source_changed && !mirror_drifted`: no drift, just upgrade. Re-write the mirror at the current `version` with a fresh checksum (and, for v2 mirrors, picking up the `location` field from source). Action `patch`, reason `migration_upgrade`.
-- `!source_changed && mirror_drifted`: drift handling as normal (`propagate` or `revert`).
+- `!source_changed && mirror_drifted`: source wins by default during migration (same conservative rationale as `source_changed && mirror_drifted`). The mirror is rewritten from source with `migration_source_won` conflict logged. We don't propagate during migration because the drift may be schema-induced (e.g. a v3 field that didn't exist in the v2 mirror) rather than a real user edit, and we can't safely distinguish.
 - `source_changed && !mirror_drifted`: `patch` from source as normal.
 - `source_changed && mirror_drifted`: source wins by default during migration (more conservative than newer-wins). A `warn` log records `migration_source_won` so the user knows mirror edits may have been overwritten. v1 mirrors fall under this rule because they have no reliable user-edit timestamp; v2 mirrors keep the same rule for simplicity and consistency, even though their `updated` timestamp is technically reliable.
+
+`migration_source_won` is used for both the `source_changed && mirror_drifted` cell and the `!source_changed && mirror_drifted` cell during migration; any drift on a legacy mirror routes through the same source-wins path.
 
 After this single migration write, the mirror is at the current `version` and subsequent reconciliations use the standard drift detection model.
 

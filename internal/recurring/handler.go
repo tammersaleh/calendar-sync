@@ -409,21 +409,27 @@ func (h *Handler) cancelMirrorInstance(ctx context.Context, mirrorInstance *gws.
 // Legacy mirrors (any version != current SchemaVersion) get the live-vs-
 // desired drift recomputation per SPEC's migration rules.
 //
-// Two cells of the migration matrix diverge from the standard matrix and
-// are handled here directly rather than by mirror.Classify:
+// Three cells of the migration matrix diverge from the standard matrix
+// and are handled here directly rather than by mirror.Classify:
 //
 //   - !source_changed && !mirror_drifted: SPEC routes this to
 //     patch+migration_upgrade (rewrite at the current SchemaVersion with
 //     a fresh checksum, picking up any new managed fields). The standard
 //     matrix would skip(unchanged).
-//   - source_changed && mirror_drifted: SPEC says source-wins-by-default
-//     during migration (v1 mirrors lack a reliable user-edit timestamp
-//     for newer-wins; v2 mirrors keep the same simpler behavior so the
-//     migration cell stays consistent across legacy versions). The
-//     standard matrix uses newer-wins via Classify.
+//   - mirror_drifted (with or without source_changed): SPEC says source-
+//     wins-by-default during migration. We can't safely propagate during
+//     migration because the "drift" may be schema-induced (e.g. v3's
+//     Location field that didn't exist in v2 mirrors) rather than a real
+//     user edit, and we have no per-field schema-version metadata to
+//     tell the two apart. So source always wins on any drift; conflict=
+//     migration_source_won surfaces this to the user. v1 mirrors lack a
+//     reliable user-edit timestamp; v2 mirrors keep the same simpler
+//     behavior so the migration cell stays consistent across legacy
+//     versions.
 //
-// The other two cells (source-only, mirror-only) match the standard
-// behavior, so after the recompute we fall through to Classify for those.
+// Only the source-only cell (!mirror_drifted && source_changed) falls
+// through to mirror.Classify, where it correctly maps to ActionPatch /
+// ReasonSourceUpdated.
 func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *gws.Event) (Result, error) {
 	signal := mirror.ComputeDriftSignal(source, mirrorInstance)
 	desired := mirror.BuildInstancePayload(h.SourceCalendarID, source)
@@ -465,9 +471,14 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 				Reason:                  ReasonMigrationUpgrade,
 				PostWriteMirrorInstance: post,
 			}, nil
-		case signal.SourceChanged && signal.MirrorDrifted:
-			// SPEC source-wins-by-default during migration. No newer-wins
-			// tiebreak; the mirror's edits are overwritten unconditionally.
+		case signal.MirrorDrifted:
+			// ANY mirror drift during migration (with or without source
+			// change) is source-wins. Drift may be schema-induced (e.g. v2
+			// instances lack the Location field that v3 introduced); we
+			// cannot safely propagate the mirror's value to source because
+			// the diff might not be a user edit at all. The mirror's edits
+			// are overwritten unconditionally with conflict=
+			// migration_source_won.
 			desired.ID = ""
 			post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, desired)
 			if err != nil {
@@ -480,8 +491,8 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 				PostWriteMirrorInstance: post,
 			}, nil
 		}
-		// Source-only or mirror-only: same shape as v2, fall through to
-		// Classify so the propagate/revert logic stays in one place.
+		// Source-only (!mirror_drifted && source_changed): falls through
+		// to Classify, which routes to ActionPatch / ReasonSourceUpdated.
 	}
 
 	outcome := mirror.Classify(signal, h.SourceWritable, source.Updated, mirrorInstance.Updated)

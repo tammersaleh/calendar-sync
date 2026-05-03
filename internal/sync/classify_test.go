@@ -1414,6 +1414,251 @@ func TestClassify_Step8_V2Mirror_EmptyTransparencyDoesNotPropagate(t *testing.T)
 	}
 }
 
+// TestClassify_Step8_V2Mirror_LocationDriftRoutesToMigrationSourceWon pins
+// the data-loss bug fix for the v2 -> v3 migration. v2 mirrors lack the
+// `location` managed field; when the source has a location and the v2 mirror
+// has empty Location, DriftedFieldNames reports MirrorDrifted=true. The
+// previous code fell through to the standard Classify, which routed
+// !source_changed && mirror_drifted to propagate (with sourceWritable=true),
+// patching SOURCE with the mirror's empty location and clobbering source's
+// real value. The fix routes any MirrorDrifted=true during migration to
+// migration_source_won so the source is never written to.
+func TestClassify_Step8_V2Mirror_LocationDriftRoutesToMigrationSourceWon(t *testing.T) {
+	api := newStubAPI()
+	inv := NewInventory("tgt-cal")
+	sink, captured := captureOutputs()
+
+	source := makeNonRecurringSource("src-evt", "2026-04-29T20:00:00Z", &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"})
+	source.Location = "Conference Room A / video: https://meet.example.com/xyz"
+
+	// v2 mirror with empty Location (the v2 schema didn't manage it).
+	// Live managed fields for everything ELSE match desired-from-source, so
+	// the only drift is the mirror's missing location.
+	desired := mirror.BuildPayload("src-cal", source)
+	mirrorEv := &gws.Event{
+		ID:           "mi-1",
+		Status:       gws.EventStatusConfirmed,
+		Summary:      desired.Summary,
+		Description:  desired.Description,
+		Start:        desired.Start,
+		End:          desired.End,
+		Location:     "", // v2 mirror has no location
+		Transparency: desired.Transparency,
+		Visibility:   desired.Visibility,
+		Updated:      source.Updated,
+		ExtendedProperties: &gws.ExtendedProperties{
+			Private: map[string]string{
+				mirror.ExtKeySource:        "src-cal:src-evt",
+				mirror.ExtKeySourceUpdated: source.Updated,
+				mirror.ExtKeyVersion:       "2",
+				mirror.ExtKeyChecksum:      "sha256:legacy-v2-checksum",
+			},
+		},
+	}
+	inv.Set(mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt"}, mirrorEv)
+
+	// Queue three patch responses so the buggy propagate path
+	// (EventsPatch source + EventsPatch mirror + checksum follow-up) and
+	// the fixed migration path (EventsPatch mirror + checksum follow-up)
+	// both complete without queue-exhaustion noise; the assertions below
+	// are the actual red/green signal.
+	postMain := *mirrorEv
+	postMain.Location = source.Location
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+
+	c := newClassifier(t, api, inv, sink, classifyOptions{sourceWritable: true})
+	if err := c.Classify(context.Background(), source); err != nil {
+		t.Fatalf("Classify error: %v", err)
+	}
+	got := firstOutcome(t, *captured)
+	if got.Action != mirror.ActionPatch || got.Reason != mirror.ReasonSourceUpdated {
+		t.Errorf("got %s/%s, want patch/source_updated (must NOT propagate empty location to source)", got.Action, got.Reason)
+	}
+	if got.Conflict != mirror.ConflictMigrationSourceWon {
+		t.Errorf("Conflict = %q, want migration_source_won", got.Conflict)
+	}
+	// Critical assertion: NO source-side EventsPatch (no clobbering source's
+	// location with the mirror's empty value).
+	for _, c := range api.calls {
+		if c.Op == "EventsPatch" && c.CalendarID == "src-cal" {
+			t.Errorf("migration_source_won must not patch source; got call %+v", c)
+		}
+	}
+	patches := api.callsByOp("EventsPatch")
+	if len(patches) != 2 {
+		t.Fatalf("expected 2 EventsPatch (mirror main + checksum); got %d", len(patches))
+	}
+	for i, p := range patches {
+		if p.CalendarID != "tgt-cal" || p.EventID != "mi-1" {
+			t.Errorf("patches[%d] should target the mirror; got %s/%s", i, p.CalendarID, p.EventID)
+		}
+	}
+	// Main patch body must carry the new SchemaVersion ("3") and source's
+	// location - the mirror is rewritten with v3 schema + source's content.
+	body := patches[0].Body
+	if body == nil || body.ExtendedProperties == nil {
+		t.Fatal("main patch body missing ExtendedProperties")
+	}
+	if v := body.ExtendedProperties.Private[mirror.ExtKeyVersion]; v != mirror.SchemaVersion {
+		t.Errorf("main patch body version = %q, want %q", v, mirror.SchemaVersion)
+	}
+	if body.Location != source.Location {
+		t.Errorf("main patch body Location = %q, want %q (source's location)", body.Location, source.Location)
+	}
+}
+
+// TestClassify_Step8_V2Mirror_RealUserEditOnSummaryRoutesToMigrationSourceWon
+// pins that ANY mirror drift during migration routes to migration_source_won,
+// even when it's a genuine user edit (not just a schema-induced diff). The
+// conservative trade-off matches v1 migration: the mirror's pre-migration
+// edits are overwritten by source. We can't reliably distinguish schema-
+// induced from user-edit drift during migration, so source always wins.
+func TestClassify_Step8_V2Mirror_RealUserEditOnSummaryRoutesToMigrationSourceWon(t *testing.T) {
+	api := newStubAPI()
+	inv := NewInventory("tgt-cal")
+	sink, captured := captureOutputs()
+
+	source := makeNonRecurringSource("src-evt", "2026-04-29T20:00:00Z", &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"})
+
+	// v2 mirror with a real user edit on summary. Source unchanged
+	// (storedSourceUpdated == source.Updated -> SourceChanged=false).
+	desired := mirror.BuildPayload("src-cal", source)
+	mirrorEv := &gws.Event{
+		ID:           "mi-1",
+		Status:       gws.EventStatusConfirmed,
+		Summary:      "User edit", // genuine user edit
+		Description:  "User edit\n\n---\nSource: " + source.HTMLLink,
+		Start:        desired.Start,
+		End:          desired.End,
+		Transparency: desired.Transparency,
+		Visibility:   desired.Visibility,
+		Updated:      "2026-04-30T08:00:00Z", // mirror Updated newer than source
+		ExtendedProperties: &gws.ExtendedProperties{
+			Private: map[string]string{
+				mirror.ExtKeySource:        "src-cal:src-evt",
+				mirror.ExtKeySourceUpdated: source.Updated,
+				mirror.ExtKeyVersion:       "2",
+				mirror.ExtKeyChecksum:      "sha256:legacy-v2-checksum",
+			},
+		},
+	}
+	inv.Set(mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt"}, mirrorEv)
+
+	// Queue three patch responses (see comment in
+	// TestClassify_Step8_V2Mirror_LocationDriftRoutesToMigrationSourceWon).
+	postMain := *mirrorEv
+	postMain.Summary = source.Summary
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+
+	c := newClassifier(t, api, inv, sink, classifyOptions{sourceWritable: true})
+	if err := c.Classify(context.Background(), source); err != nil {
+		t.Fatalf("Classify error: %v", err)
+	}
+	got := firstOutcome(t, *captured)
+	if got.Action != mirror.ActionPatch || got.Reason != mirror.ReasonSourceUpdated {
+		t.Errorf("got %s/%s, want patch/source_updated", got.Action, got.Reason)
+	}
+	if got.Conflict != mirror.ConflictMigrationSourceWon {
+		t.Errorf("Conflict = %q, want migration_source_won", got.Conflict)
+	}
+	// Critical: NO source-side patch. Even a real user edit on summary
+	// during migration is overwritten by source rather than propagated.
+	for _, c := range api.calls {
+		if c.Op == "EventsPatch" && c.CalendarID == "src-cal" {
+			t.Errorf("migration_source_won must not patch source; got call %+v", c)
+		}
+	}
+	patches := api.callsByOp("EventsPatch")
+	if len(patches) != 2 {
+		t.Fatalf("expected 2 EventsPatch (mirror main + checksum); got %d", len(patches))
+	}
+	// Main patch body must overwrite the mirror's summary with source's.
+	body := patches[0].Body
+	if body == nil {
+		t.Fatal("main patch body nil")
+	}
+	if body.Summary != source.Summary {
+		t.Errorf("main patch body Summary = %q, want %q (mirror's user edit must be overwritten)", body.Summary, source.Summary)
+	}
+}
+
+// TestClassify_Step8_V2Mirror_SourceChangedNoMirrorDriftStillPatchesNormally
+// pins that the source_changed && !mirror_drifted cell still falls through
+// to the standard Classify path during migration - it should patch from
+// source as a normal source_updated, no migration_source_won conflict.
+// This is the only cell that doesn't divert to a migration-specific outcome.
+func TestClassify_Step8_V2Mirror_SourceChangedNoMirrorDriftStillPatchesNormally(t *testing.T) {
+	api := newStubAPI()
+	inv := NewInventory("tgt-cal")
+	sink, captured := captureOutputs()
+
+	source := makeNonRecurringSource("src-evt", "2026-04-30T11:00:00Z", &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"})
+	source.Summary = "Source new"
+
+	// v2 mirror with stored source_updated OLDER than source.Updated
+	// -> SourceChanged=true. Live fields match desired-from-source EXCEPT
+	// for the new source.Summary - so we have to drift the mirror's summary
+	// AWAY from source's new value while still keeping the no-drift signal.
+	// Trick: set mirror's summary == source.Summary (the new one) so
+	// DriftedFieldNames(mirrorEv, desired) reports zero drifted fields.
+	desired := mirror.BuildPayload("src-cal", source)
+	mirrorEv := &gws.Event{
+		ID:           "mi-1",
+		Status:       gws.EventStatusConfirmed,
+		Summary:      desired.Summary,
+		Description:  desired.Description,
+		Start:        desired.Start,
+		End:          desired.End,
+		Transparency: desired.Transparency,
+		Visibility:   desired.Visibility,
+		Updated:      "2026-04-30T10:00:00Z",
+		ExtendedProperties: &gws.ExtendedProperties{
+			Private: map[string]string{
+				mirror.ExtKeySource:        "src-cal:src-evt",
+				mirror.ExtKeySourceUpdated: "2026-04-29T20:00:00Z", // older -> SourceChanged=true
+				mirror.ExtKeyVersion:       "2",
+				mirror.ExtKeyChecksum:      "sha256:legacy-v2-checksum",
+			},
+		},
+	}
+	inv.Set(mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt"}, mirrorEv)
+
+	postMain := *mirrorEv
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+
+	c := newClassifier(t, api, inv, sink, classifyOptions{sourceWritable: true})
+	if err := c.Classify(context.Background(), source); err != nil {
+		t.Fatalf("Classify error: %v", err)
+	}
+	got := firstOutcome(t, *captured)
+	if got.Action != mirror.ActionPatch || got.Reason != mirror.ReasonSourceUpdated {
+		t.Errorf("got %s/%s, want patch/source_updated", got.Action, got.Reason)
+	}
+	// No conflict: this cell is the standard source-only path; no
+	// migration_source_won banner because there's no mirror drift to lose.
+	if got.Conflict != mirror.ConflictNone {
+		t.Errorf("Conflict = %q, want none (no mirror drift -> standard patch)", got.Conflict)
+	}
+	patches := api.callsByOp("EventsPatch")
+	if len(patches) != 2 {
+		t.Fatalf("expected 2 EventsPatch (mirror main + checksum); got %d", len(patches))
+	}
+	// Main patch must carry v3 schema (the upgrade still runs even on the
+	// fall-through cell).
+	body := patches[0].Body
+	if body == nil || body.ExtendedProperties == nil {
+		t.Fatal("main patch body missing ExtendedProperties")
+	}
+	if v := body.ExtendedProperties.Private[mirror.ExtKeyVersion]; v != mirror.SchemaVersion {
+		t.Errorf("main patch body version = %q, want %q", v, mirror.SchemaVersion)
+	}
+}
+
 // ---------- error propagation ----------
 
 func TestClassify_DeleteErrorPropagates(t *testing.T) {

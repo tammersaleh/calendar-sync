@@ -1,5 +1,14 @@
 # Changelog
 
+## [2.1.2](https://github.com/tammersaleh/calendar-sync/compare/v2.1.1...v2.1.2) (2026-05-03)
+
+
+### Bug Fixes
+
+* normalize transparency/visibility in ManagedFieldsFromEvent for stable checksums ([9143cc4](https://github.com/tammersaleh/calendar-sync/commit/9143cc45f3a4e733468f9148a2ff088784693427))
+* route any drift during migration to source-wins, not propagate ([8e96a3d](https://github.com/tammersaleh/calendar-sync/commit/8e96a3dc325943271c41a0034c58605ec240653c))
+* use DriftedFieldNames-based comparison for migration drift recompute ([3d612a0](https://github.com/tammersaleh/calendar-sync/commit/3d612a0f4256b11c1be774735790bc3e7c00df44))
+
 ## [2.1.1](https://github.com/tammersaleh/calendar-sync/compare/v2.1.0...v2.1.1) (2026-05-03)
 
 

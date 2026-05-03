@@ -111,6 +111,23 @@ func (i *Inventory) Tuples() []mirror.SourceTuple {
 // considers those mirrors unmanageable. The orphan walk catches them
 // indirectly when the user triggers `mirror prune`.
 //
+// Two-pass shape (see B16 in doc/bugs.md): when calendar-sync writes a
+// recurring parent, Google auto-materializes the parent's instances and
+// copies the parent's extendedProperties.private to each materialized
+// instance. So an instance that has been overridden on the target carries
+// the parent's calendar-sync:source value verbatim (EventID = source
+// parent's ID, no instance suffix), parsing to the SAME source-tuple as
+// the parent itself. Indexing both naively last-writer-wins, and a stray
+// instance can shadow the real parent in inventory - then a normal
+// source-parent reconcile fires drift detection against the instance's
+// per-occurrence fields and propagates them back to the source parent,
+// destroying the recurring series. The fix is to gather all events first,
+// build a (mirror parent ID -> parsed source-tuple) map, then in pass 2
+// drop any instance whose source-tuple matches its parent's source-tuple
+// (mirror.IsInheritedRecurringInstance). Explicitly-managed instances
+// carry a per-instance source-tuple (EventID with the `_<UTC>` suffix)
+// and are kept.
+//
 // log may be nil; when non-nil it receives one info-level entry per version
 // pass (after the events.list call returns) carrying target + count, so the
 // daemon log surfaces the pre-reconcile inventory baseline that the rest of
@@ -118,55 +135,105 @@ func (i *Inventory) Tuples() []mirror.SourceTuple {
 func BuildInventory(ctx context.Context, api API, target string, log Logger) (*Inventory, error) {
 	inv := NewInventory(target)
 
-	// One pass per known schema version: current first (the common case),
-	// then every legacy version that may still exist on user calendars.
-	// Legacy entries are merged into the same inventory; reconciliation
-	// time decides whether to migrate them.
+	type taggedEvent struct {
+		ev      gws.Event
+		version string
+	}
+	var allEvents []taggedEvent
+
+	// Pass 0: list per known schema version, accumulate.
 	for _, version := range []string{mirror.SchemaVersion, "2", "1"} {
 		params := gws.EventsListParams{
-			CalendarID:             target,
-			ShowDeleted:            true,
+			CalendarID:              target,
+			ShowDeleted:             true,
 			PrivateExtendedProperty: []string{mirror.ExtKeyVersion + "=" + version},
 		}
 		events, _, err := api.EventsList(ctx, params)
 		if err != nil {
 			return nil, fmt.Errorf("inventory rebuild for %s (version=%s): %w", target, version, err)
 		}
-		var added, skipped int
 		for i := range events {
-			ev := events[i]
-			// Tombstones (events deleted via events.delete; status=cancelled)
-			// reach this listing because ShowDeleted:true is set above. Skip
-			// them: SPEC's cancelled-and-revived flow inspects status via a
-			// per-event events.get triggered by a 409 on insert, not via the
-			// inventory. Indexing tombstones would mislead the orphan walk
-			// (which would try to events.delete them and hit
-			// api_invalid_request "Resource has been deleted") and the
-			// standard reconcile path (which would treat them as live mirrors
-			// needing drift checks).
-			if ev.Status == gws.EventStatusCancelled {
-				skipped++
-				continue
-			}
-			tuple, ok := parseSourceFromMirror(&ev)
-			if !ok {
-				skipped++
-				continue
-			}
-			inv.Set(tuple, &ev)
-			added++
+			allEvents = append(allEvents, taggedEvent{ev: events[i], version: version})
 		}
-		if log != nil {
+	}
+
+	// Pass 1: for every event that looks like a parent (no RecurringEventID
+	// AND parseable source-tuple), record its source-tuple under its mirror
+	// ID. Cancelled tombstones are eligible parents in this pass - their
+	// source-tuple still anchors the inheritance check for any live instance
+	// whose recurringEventId points at them. The cancelled tombstone itself
+	// won't be indexed in pass 2.
+	parentSourceTuples := make(map[string]mirror.SourceTuple)
+	for _, te := range allEvents {
+		ev := te.ev
+		if ev.RecurringEventID != "" {
+			continue
+		}
+		tuple, ok := parseSourceFromMirror(&ev)
+		if !ok {
+			continue
+		}
+		parentSourceTuples[ev.ID] = tuple
+	}
+
+	// Pass 2: index each event, skipping cancelled tombstones, unparseable
+	// source values, and inherited recurring instances.
+	addedByVersion := make(map[string]int)
+	skippedByVersion := make(map[string]int)
+	for _, te := range allEvents {
+		ev := te.ev
+		// Tombstones (events deleted via events.delete; status=cancelled)
+		// reach this listing because ShowDeleted:true is set above. Skip
+		// them: SPEC's cancelled-and-revived flow inspects status via a
+		// per-event events.get triggered by a 409 on insert, not via the
+		// inventory. Indexing tombstones would mislead the orphan walk
+		// (which would try to events.delete them and hit
+		// api_invalid_request "Resource has been deleted") and the
+		// standard reconcile path (which would treat them as live mirrors
+		// needing drift checks).
+		if ev.Status == gws.EventStatusCancelled {
+			skippedByVersion[te.version]++
+			continue
+		}
+		tuple, ok := parseSourceFromMirror(&ev)
+		if !ok {
+			skippedByVersion[te.version]++
+			continue
+		}
+		// Inherited-instance filter: if this is a recurring instance and
+		// its parent's source-tuple matches its own, the instance only
+		// holds Google's auto-copied parent metadata. Indexing it would
+		// shadow the real parent at the same key.
+		if ev.RecurringEventID != "" {
+			if parentTuple, found := parentSourceTuples[ev.RecurringEventID]; found {
+				if mirror.IsInheritedRecurringInstance(&ev, parentTuple.EventID) {
+					skippedByVersion[te.version]++
+					continue
+				}
+			}
+		}
+		inv.Set(tuple, &ev)
+		addedByVersion[te.version]++
+	}
+
+	if log != nil {
+		// Emit one log line per version pass that actually saw events, with
+		// the per-version added/skipped counts the legacy single-pass
+		// implementation reported. Versions whose listing returned zero
+		// events still log so dashboard scrapes see all three lines.
+		eventsByVersion := make(map[string]int)
+		for _, te := range allEvents {
+			eventsByVersion[te.version]++
+		}
+		for _, version := range []string{mirror.SchemaVersion, "2", "1"} {
 			log.Info("sync.BuildInventory pass",
 				"target", target,
 				"schema_version", version,
-				"events_returned", len(events),
-				"added", added,
-				"unparseable_skipped", skipped,
+				"events_returned", eventsByVersion[version],
+				"added", addedByVersion[version],
+				"unparseable_skipped", skippedByVersion[version],
 			)
 		}
-	}
-	if log != nil {
 		log.Info("sync.BuildInventory complete",
 			"target", target,
 			"total_mirrors", len(inv.Tuples()),

@@ -40,6 +40,18 @@ Fix sketch: switch to `html/template` (handles XML-class escaping for content), 
 
 ## Fixed
 
+### B16 - inherited recurring-instance mirror shadows parent in inventory, propagate clobbers source parent (CRITICAL)
+
+When calendar-sync writes a recurring parent mirror, Google auto-materializes the parent's instances and copies the parent's `extendedProperties.private` (including `calendar-sync:source`) to each materialized instance. If the user then edits an instance on the target side, `events.list` returns it as a real entry with the inherited `calendar-sync:source` still pointing at the source PARENT's tuple - the same value the actual parent mirror carries.
+
+`BuildInventory` indexed events keyed by parsed source-tuple, so the inherited instance and the parent both landed at `{source_cal, parent_id}`. Last-writer-wins; whichever pass returned the instance after the parent (depends on Google's iteration order) shadowed the parent in inventory.
+
+Then on the next sync, `reconcileNormal` for the source PARENT looked up that key, got the mirror INSTANCE (with its per-occurrence start/end and possibly a recurrence inherited from the API response shape), computed drift against the parent's stored checksum (always drifts because instance fields differ from parent fields), and routed to `propagate(target_edited)`. The propagate body included start/end/recurrence from the instance, sent to the source PARENT via events.patch. The source parent's recurrence anchor moved to the user's edited time, breaking the entire series.
+
+Surfaced after the user edited a recurring-mirror instance on cw with `propagate_target_edits=true` and a manual `calendar-sync run` triggered the propagate. The personal source's `Lunch & Reading` recurring parent was moved from 2026-02-23T11:30 to 2026-05-20T12:00; recovered manually via a direct `events.patch` back to the original anchor.
+
+Fixed by switching `BuildInventory` to a two-pass shape: pass 1 builds a (mirror parent ID -> parsed source-tuple) map across all schema-version queries, pass 2 indexes each event but skips any instance whose parsed source-tuple matches its parent's recorded source-tuple (`mirror.IsInheritedRecurringInstance`). Explicitly-managed instances (whose `calendar-sync:source` carries the `_<UTC>` per-instance suffix) have a different source-tuple than the parent and are kept. SPEC.md and tests updated.
+
 ### B15 - recurring-instance handler clobbers source overrides on first encounter (CRITICAL)
 
 When calendar-sync writes a recurring parent mirror, Google auto-materializes the parent's instances using the parent's RRULE. The auto-materialized instances inherit the parent's `extendedProperties.private` (including `calendar-sync:checksum`) but their live managed fields differ from the parent's (each instance has its own start/end). The standard drift matrix saw `mirror_drifted=true` (live checksum != stored), and when source had a per-instance override (e.g. a user rescheduled one occurrence), `source_changed=true` as well. The newer-wins tiebreak picked the freshly-materialized mirror over the pre-existing source override and routed to `propagate(target_edited, conflict_target_won)`, sending the mirror's RRULE-projected start/end back to the source - reverting the user's reschedule.

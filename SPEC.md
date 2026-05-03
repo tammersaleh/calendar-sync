@@ -1026,6 +1026,8 @@ All responses are merged into the single in-memory inventory. Legacy entries are
 
 Without the legacy queries, mirrors that were inserted before the latest schema bump would never appear in inventory and would never be reconciled or cleaned up - they'd become permanent zombies.
 
+The rebuild runs in two passes to keep auto-materialized recurring-instance mirrors from shadowing their parent at the same source-tuple key. When calendar-sync writes a recurring parent, Google materializes the parent's instances and copies the parent's `extendedProperties.private` to each materialized instance verbatim; an instance the user has overridden on the target therefore comes back from `events.list` with `calendar-sync:source` pointing at the source PARENT's tuple, the same value the actual parent mirror carries. Pass 1 builds a (mirror parent ID -> source-tuple) map across all version queries. Pass 2 indexes each event, dropping any instance (`recurringEventId != ""`) whose parsed source-tuple matches its parent's recorded source-tuple - those are inherited and would clobber the parent. Explicitly-managed instances (`calendar-sync:source = "<S>:<source_instance_id>"` with the `_<UTC>` suffix) carry a per-instance source-tuple that does not collide with the parent and are kept.
+
 ### Classification logic
 
 This runs once per source event `E` per pdir `(P, D)`. Called from both startup (over the full source list) and per-tick (over the delta).

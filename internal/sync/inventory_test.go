@@ -204,6 +204,114 @@ func TestBuildInventory_SkipsCancelledTombstones(t *testing.T) {
 	}
 }
 
+// TestBuildInventory_InheritedInstanceDoesNotOverwriteParent pins the fix for
+// B16: when calendar-sync writes a recurring parent mirror, Google
+// auto-materializes its instances and copies the parent's
+// extendedProperties.private to each instance verbatim. So an instance the
+// user has overridden on the target lands in events.list with
+// `calendar-sync:source` pointing at the source PARENT - the same value the
+// real parent mirror carries. Both events parse to the same source-tuple key
+// and one would overwrite the other in inventory. Last-writer-wins lets the
+// instance's drift state masquerade as the parent's, which produces a
+// catastrophic propagate that rewrites the source parent with the
+// instance's per-occurrence start/end/recurrence.
+//
+// The fix builds a parent-id -> source-tuple map in a first pass, then in a
+// second pass uses mirror.IsInheritedRecurringInstance to skip any instance
+// whose parsed source-tuple matches its mirror parent's source-tuple.
+func TestBuildInventory_InheritedInstanceDoesNotOverwriteParent(t *testing.T) {
+	api := newStubAPI()
+	parent := makeMirrorWithSource("mp1", "src-cal:src-parent-1", mirror.SchemaVersion)
+	// Auto-materialized instance the user has overridden on the target. Google
+	// echoes back the inherited extended properties exactly.
+	inherited := makeMirrorWithSource("mp1_20260520T183000Z", "src-cal:src-parent-1", mirror.SchemaVersion)
+	inherited.RecurringEventID = "mp1"
+	api.queueList([]gws.Event{*parent, *inherited}, "")
+	api.queueList(nil, "") // v=2 empty
+	api.queueList(nil, "") // v=1 empty
+
+	inv, err := BuildInventory(context.Background(), api, "tgt-cal", nil)
+	if err != nil {
+		t.Fatalf("BuildInventory error: %v", err)
+	}
+	got, ok := inv.Lookup(mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-parent-1"})
+	if !ok {
+		t.Fatal("parent missing from inventory at its source-tuple key")
+	}
+	if got.ID != "mp1" {
+		t.Errorf("inventory at parent's source-tuple = %q, want %q (the parent ID); inherited instance must not overwrite parent",
+			got.ID, "mp1")
+	}
+	// Also try the reverse list order - the bug surfaces on iteration order.
+	api2 := newStubAPI()
+	api2.queueList([]gws.Event{*inherited, *parent}, "")
+	api2.queueList(nil, "")
+	api2.queueList(nil, "")
+	inv2, err := BuildInventory(context.Background(), api2, "tgt-cal", nil)
+	if err != nil {
+		t.Fatalf("BuildInventory error (reverse order): %v", err)
+	}
+	got2, ok := inv2.Lookup(mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-parent-1"})
+	if !ok || got2.ID != "mp1" {
+		t.Errorf("reverse-order inventory at parent's tuple: got=%v ok=%v, want parent mp1", got2, ok)
+	}
+}
+
+// TestBuildInventory_ManagedInstanceStillIndexed pins that the inherited-
+// instance filter does NOT skip explicitly-managed instances. A managed
+// instance carries its own per-instance source-tuple (EventID = source
+// instance ID with the `_<UTC>` suffix), which is different from the parent's
+// source-tuple, so there's no collision and no reason to drop it.
+func TestBuildInventory_ManagedInstanceStillIndexed(t *testing.T) {
+	api := newStubAPI()
+	parent := makeMirrorWithSource("mp1", "src-cal:src-parent-1", mirror.SchemaVersion)
+	managed := makeMirrorWithSource("mp1_20260520T183000Z",
+		"src-cal:src-parent-1_20260520T183000Z", // explicit per-instance source
+		mirror.SchemaVersion)
+	managed.RecurringEventID = "mp1"
+	api.queueList([]gws.Event{*parent, *managed}, "")
+	api.queueList(nil, "")
+	api.queueList(nil, "")
+
+	inv, err := BuildInventory(context.Background(), api, "tgt-cal", nil)
+	if err != nil {
+		t.Fatalf("BuildInventory error: %v", err)
+	}
+	if got, ok := inv.Lookup(mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-parent-1"}); !ok || got.ID != "mp1" {
+		t.Errorf("parent missing or wrong; got=%v ok=%v", got, ok)
+	}
+	if got, ok := inv.Lookup(mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-parent-1_20260520T183000Z"}); !ok || got.ID != "mp1_20260520T183000Z" {
+		t.Errorf("managed instance missing from inventory; got=%v ok=%v", got, ok)
+	}
+}
+
+// TestBuildInventory_OrphanInheritedInstance covers the edge case where the
+// parent isn't in the listing (e.g. a partial response, or the parent has
+// somehow been removed without the instance being cancelled). With the
+// parent absent, IsInheritedRecurringInstance can't fire (no parent map
+// entry), so the instance falls through and is indexed. That keeps the
+// inventory non-empty even in pathological data states - the orphan walk
+// will discover the orphan and clean up. The test pins that we don't
+// silently drop entries when we can't prove inheritance.
+func TestBuildInventory_OrphanInheritedInstance(t *testing.T) {
+	api := newStubAPI()
+	orphanInstance := makeMirrorWithSource("mp_missing_20260520T183000Z",
+		"src-cal:src-parent-missing",
+		mirror.SchemaVersion)
+	orphanInstance.RecurringEventID = "mp_missing"
+	api.queueList([]gws.Event{*orphanInstance}, "")
+	api.queueList(nil, "")
+	api.queueList(nil, "")
+
+	inv, err := BuildInventory(context.Background(), api, "tgt-cal", nil)
+	if err != nil {
+		t.Fatalf("BuildInventory error: %v", err)
+	}
+	if _, ok := inv.Lookup(mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-parent-missing"}); !ok {
+		t.Error("orphan instance with no parent in listing should still be indexed (orphan walk cleans up later)")
+	}
+}
+
 func TestInventory_LookupSetDelete(t *testing.T) {
 	inv := NewInventory("tgt-cal")
 	if inv.Target() != "tgt-cal" {

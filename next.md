@@ -4,59 +4,57 @@ Handoff for the next session. Read this first, then `SPEC.md`, then `CLAUDE.md`.
 
 - v2.0.0: per-pair config scoping, `direction` field removed (BREAKING)
 - v2.1.0: location managed-field (v3 schema)
-- v2.1.1: 5 fix commits during real-calendar migration (transparency normalization, recurrence on parents, migration drift recompute, etc.)
-- v2.1.2: nothing user-facing (release-please picked up the fix backlog)
+- v2.1.1: 5 fix commits during real-calendar migration
+- v2.1.2: nothing user-facing
 - v2.1.3: B15 (inherited recurring-instance source-wins bootstrap)
-- v2.1.4 (in flight): B16 (BuildInventory two-pass to skip inherited instances)
+- v2.1.4: B16 (BuildInventory two-pass to skip inherited instances)
 
-The B17 target-syncToken work is captured in detail in `backlog/B17-target-syncToken.md` and is deliberately not in this version.
+## Current state
 
-## Where we are
+### Daemon
 
-### Repo state
+Running on v2.1.4 via launchd. Two pairs in bidirectional sync at `horizon=365d`:
 
-- main pushed through `af7dda7`. v2.1.4 release-please cycle in flight.
-- Two pairs running bidirectional sync at `horizon=365d` per `~/.config/calendar-sync/config.toml`.
+- `work-personal`: source = `tsaleh@coreweave.com`, target = `me@tammersaleh.com`
+- `personal-to-work`: source = `me@tammersaleh.com`, target = `tsaleh@coreweave.com`
 
-### Daemon state
+Functional and idempotent on the steady-state path. **No data corruption risk.** But currently CPU/quota-heavy: one flaky recurring event (TARS Office Hours, possibly the parent-of-recurring-exception shape) throws transient HTTP 500s on `events.get`, which fails the pdir, invalidates the source syncToken, and triggers a fast-track FullSync. The next FullSync hits the same flake. The daemon has been running back-to-back ~24-minute FullSyncs since startup. Zero writes, zero propagates. See B18 below.
 
-Currently STOPPED via `launchctl unload` so the user can recover from a B16-induced corruption (recovered manually). After v2.1.4 lands and the homebrew formula updates, the steps to resume are:
+### Recent live writes worth knowing about
 
-```
-brew upgrade --cask tammersaleh/tap/calendar-sync
-launchctl load ~/Library/LaunchAgents/org.calendar-sync.agent.plist
-calendar-sync status
-```
+- A B16 recurrence-propagate bug clobbered the personal `Lunch & Reading` parent during a manual `calendar-sync run` earlier in the session (moved its anchor from 2026-02-23 to 2026-05-20). Recovered manually by patching the source back. Source data is intact.
+- Bidirectional sync is exercising correctly: source-side and target-side edits both reconcile (target-side at FullSync rate today, not tick rate - see B17).
 
-The first tick after restart will be a full sync (~24min based on prior measurements). Subsequent ticks are sub-second incremental.
+## Backlog
 
-### Known limitation
+Three queued items. All in `backlog/` with full design docs:
 
-Per `backlog/B17-target-syncToken.md`: target-side edits propagate at the next FULL re-sync (`[settings].full_sync_interval`, default 24h), not at tick rate. Workaround: `launchctl unload && calendar-sync run --pair <name> && launchctl load`.
+### B18 - per-event error tolerance (`backlog/B18-per-event-error-tolerance.md`)
 
-### Bug list
+The daemon's CPU/quota loop. One flaky event = endless FullSyncs. Fix is to discriminate transient read errors (HTTP 5xx on `events.get`, gws subprocess timeouts, recurring-handler 5xx) from fatal ones (write failures) inside `runClassifyLoop`, so the former skip + advance the token while the latter keep gating it. Two implementation options sketched. Recommended next: this one. Smallest surgery, biggest immediate UX win.
 
-`doc/bugs.md` is the canonical record. Open bugs unchanged from prior sessions (B3 timeouts, B5 stderr leak, B8/B9 launchd plist edge cases). All non-blocking.
+### B17 - target-syncToken for sub-tick target-edit propagation (`backlog/B17-target-syncToken.md`)
 
-## What's left
+Target-side edits propagate at FullSync rate (24h default) rather than tick rate (60s default). Architect's design + Codex's review of must-fix items already captured. Phase 1 covers ~80% of cases; Phase 2 needed for mirror-only-override propagation (the user's specific Lunch & Reading 5/20 case).
 
-In rough priority:
+### Codex full-codebase correctness review
 
-1. **B17 (target-syncToken)**: full design + Codex's review live in `backlog/B17-target-syncToken.md`. Phase 1 (target-delta phase, dispatch through Classifier) addresses ~80% of cases. Phase 2 (source-override creation for mirror-only edits) is needed for the user's specific Lunch & Reading style case to propagate at tick rate. Estimate one focused session.
-2. **Codex full-codebase correctness review**: deferred until B17 lands. Run after Phase 1 to catch any regressions or missed edge cases that the recent B15/B16/B17 fixes might have introduced.
-3. **B3/B5/B8/B9**: cosmetic / edge cases per `doc/bugs.md`. Skip unless asked.
+Queued for after B17 and B18 land. Catches anything the recent B15/B16/B17/B18 fixes might have missed.
 
-## What this session did
+## Optional knob without backlog work
 
-- Confirmed B14 (one-cycle convergence) was correctly diagnosed - run #5/#6 after the d723624 normalization fix were idempotent.
-- Rolled out personal→cw bidirectionally up to 365d. 22 mirrors landed on cw.
-- Surfaced B15 (inherited recurring-instance bootstrap source-wins) at 14d via dry-run; fixed and shipped as v2.1.3.
-- Daemon installed via Homebrew; ran cleanly for ~30 minutes including the first 24-min full sync.
-- User edited Lunch & Reading 5/20 mirror to validate target-edit propagation.
-- Bug B16 surfaced: inventory parent/instance collision caused a manual `calendar-sync run` to clobber the source recurring parent's anchor (moved Lunch & Reading from Feb 23 11:30 to May 20 12:00). Recovered manually via `events.patch`.
-- B17 (the original UX issue motivating the user's edit-to-test) deferred to `backlog/B17-target-syncToken.md`.
-- B16 fix shipped as v2.1.4.
+`[settings].poll_interval = "15s"` and `[settings].full_sync_interval = "1h"` validate fine and have headroom (idle ticks are ~1.1s; full sync is 3-24min depending on syncToken state). Doesn't fix B18 but reduces the worst-case target-edit-propagation window from 24h to 1h without any code change.
+
+## Repo state
+
+Pushed through HEAD. Two backlog docs committed (B17, B18). The `next.md` and `backlog/` are the only "in-flight" surface; main is clean.
+
+## What's NOT in scope right now
+
+- B3 (gws timeouts at 365d horizon) — workaround is `--timeout=30m` on `calendar-sync run`. Daemon doesn't hit this.
+- B5 (gws stderr leak into error messages) — cosmetic.
+- B8/B9 (launchd plist edge cases) — non-default paths only.
 
 ## When this file becomes useless
 
-When B17 ships and the daemon has run a full week without target-edit-related anomalies, delete this file. The fixed inventory + per-target syncToken + bidirectional rollout will be the new normal in SPEC.md and `doc/bugs.md` from then on.
+When B17 + B18 ship, Codex full review is clean, and the daemon has run a quiet week (no back-to-back FullSyncs, no propagate-related anomalies), delete this file. The fixed inventory + per-target syncToken + per-event error tolerance + bidirectional rollout become the new normal in `SPEC.md` and `doc/bugs.md`.

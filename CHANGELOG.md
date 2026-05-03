@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.1.1](https://github.com/tammersaleh/calendar-sync/compare/v2.1.0...v2.1.1) (2026-05-03)
+
+
+### Bug Fixes
+
+* detect recurrence drift on parent mirrors ([ca97784](https://github.com/tammersaleh/calendar-sync/commit/ca97784d6dafd9f1f07f121e41a28c358736e0c5))
+* normalize default transparency/visibility in drift comparison ([180abab](https://github.com/tammersaleh/calendar-sync/commit/180abab23fb9b112df996032fd5a2d4452eb6dc3))
+
 ## [2.1.0](https://github.com/tammersaleh/calendar-sync/compare/v2.0.0...v2.1.0) (2026-05-02)
 
 

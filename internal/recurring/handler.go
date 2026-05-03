@@ -436,10 +436,12 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 	)
 	if signal.NeedsMigration {
 		// Per SPEC.md "Schema version migration", recompute MirrorDrifted
-		// for v1 mirrors via direct managed-field comparison rather than
-		// the missing-checksum signal which would always say true.
-		signal.MirrorDrifted = mirror.Checksum(mirror.ManagedFieldsFromEvent(mirrorInstance)) !=
-			mirror.Checksum(mirror.ManagedFieldsFromEvent(desired))
+		// for legacy mirrors via mirror.DriftedFieldNames rather than the
+		// missing-checksum signal (which would always say true) or raw
+		// Checksum (which doesn't normalize transparency/visibility defaults
+		// or order-insensitive recurrence). DriftedFieldNames matches the
+		// propagate body's drift set so the two views can't disagree.
+		signal.MirrorDrifted = len(mirror.DriftedFieldNames(mirrorInstance, desired)) > 0
 
 		h.debug("recurring.applyDriftMatrix: migration recompute",
 			"source_event", source.ID,

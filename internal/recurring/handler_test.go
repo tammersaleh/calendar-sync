@@ -1415,6 +1415,94 @@ func TestHandle_V2Mirror_NeedsMigration_PatchesAsMigrationUpgrade(t *testing.T) 
 	}
 }
 
+// TestHandle_V2MirrorInstanceEmptyTransparencyDoesNotPropagate pins the
+// fix for the migration drift recompute in the recurring handler. Google's
+// events.list omits transparency when its value equals the default
+// ("opaque"); a v2 mirror instance whose Transparency comes back empty must
+// NOT count as drifted just because the desired-from-source payload writes
+// "opaque" explicitly. A raw Checksum comparison would say drifted;
+// DriftedFieldNames normalizes the default and reports zero drifted fields.
+// The migration cell must therefore route to migration_upgrade.
+func TestHandle_V2MirrorInstanceEmptyTransparencyDoesNotPropagate(t *testing.T) {
+	api := newStubAPI()
+	mirrorParent := makeMirrorParent("mp-1")
+	source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
+
+	desired := mirror.BuildInstancePayload("src-cal", source)
+	mi := &gws.Event{
+		ID:          "mi-1",
+		Status:      gws.EventStatusConfirmed,
+		Summary:     desired.Summary,
+		Description: desired.Description,
+		Start:       desired.Start,
+		End:         desired.End,
+		// Transparency intentionally empty: Google's API omits "opaque"
+		// from list responses. The buggy raw-Checksum recompute hashed
+		// this differently from desired's explicit "opaque" and flipped
+		// MirrorDrifted=true.
+		Transparency: "",
+		Visibility:   desired.Visibility,
+		Updated:      source.Updated,
+		ExtendedProperties: &gws.ExtendedProperties{
+			Private: map[string]string{
+				mirror.ExtKeySource:        "src-cal:src-evt",
+				mirror.ExtKeySourceUpdated: source.Updated,
+				mirror.ExtKeyVersion:       "2",
+				// v2 checksum was over v2 ManagedFields (no Location).
+				mirror.ExtKeyChecksum: "sha256:legacy-v2-checksum",
+			},
+		},
+	}
+	api.queueInstances([]gws.Event{*mi})
+
+	// Queue three patch responses so the buggy propagate path
+	// (EventsPatch source + EventsPatch mirror + checksum follow-up) and
+	// the fixed migration path (EventsPatch mirror + checksum follow-up)
+	// both complete without queue-exhaustion noise; the assertions below
+	// are the actual red/green signal.
+	postMain := *mi
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+
+	h := &Handler{
+		API:              api,
+		SourceCalendarID: "src-cal",
+		TargetCalendarID: "tgt-cal",
+		SourceWritable:   true,
+		LookupMirrorParent: func(_ mirror.SourceTuple) (*gws.Event, bool) {
+			return mirrorParent, true
+		},
+	}
+	got, err := h.Handle(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if got.Action != mirror.ActionPatch || got.Reason != ReasonMigrationUpgrade {
+		t.Errorf("expected patch(migration_upgrade) for v2 mirror with empty transparency; got %+v", got)
+	}
+	if got.Conflict != mirror.ConflictNone {
+		t.Errorf("migration_upgrade should not carry a conflict; got %q", got.Conflict)
+	}
+	// Migration upgrade must NOT patch the source. The bug routed this
+	// case to propagate, which would patch source-side fields.
+	for _, c := range api.calls {
+		if c.Op == "EventsPatch" && c.CalendarID == "src-cal" {
+			t.Errorf("migration_upgrade must not patch source; got call %+v", c)
+		}
+	}
+	patches := api.callsByOp("EventsPatch")
+	if len(patches) != 2 {
+		t.Fatalf("expected 2 EventsPatch (main + checksum followup); got %d", len(patches))
+	}
+	if patches[0].Body == nil || patches[0].Body.ExtendedProperties == nil {
+		t.Fatalf("main patch body missing ExtendedProperties; got %+v", patches[0].Body)
+	}
+	if v := patches[0].Body.ExtendedProperties.Private[mirror.ExtKeyVersion]; v != mirror.SchemaVersion {
+		t.Errorf("main patch body version = %q, want %q", v, mirror.SchemaVersion)
+	}
+}
+
 // ---------- helper-level tests ----------
 
 func TestComputeOriginalStart(t *testing.T) {

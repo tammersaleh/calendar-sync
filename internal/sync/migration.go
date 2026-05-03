@@ -14,8 +14,11 @@ import (
 // mirror.ComputeDriftSignal would return MirrorDrifted=true for a v1 mirror
 // (no stored checksum) and is unreliable for any pre-current-version mirror
 // whose stored checksum was computed over a smaller managed-field set; this
-// function recomputes MirrorDrifted via direct managed-field comparison
-// (live vs desired-from-source) and then routes by the four-way matrix:
+// function recomputes MirrorDrifted via mirror.DriftedFieldNames (live vs
+// desired-from-source), so the migration path's "drift" definition stays
+// consistent with the propagate body's drifted set - both use the same
+// transparency/visibility/recurrence normalization. Then routes by the
+// four-way matrix:
 //
 //   - !source_changed && !mirror_drifted: migration_upgrade. Re-write the
 //     mirror at the current SchemaVersion with a fresh checksum. SPEC.md
@@ -44,9 +47,11 @@ func (c *Classifier) reconcileMigration(
 	signal mirror.DriftSignal,
 ) error {
 	// Recompute MirrorDrifted via live-vs-desired managed-field comparison
-	// (the SPEC's "Schema version migration" path).
-	signal.MirrorDrifted = mirror.Checksum(mirror.ManagedFieldsFromEvent(mirrorEvent)) !=
-		mirror.Checksum(mirror.ManagedFieldsFromEvent(desired))
+	// (the SPEC's "Schema version migration" path). DriftedFieldNames
+	// normalizes transparency/visibility defaults and uses order-insensitive
+	// recurrence equality, matching the propagate body's drift set so the
+	// two views can't disagree.
+	signal.MirrorDrifted = len(mirror.DriftedFieldNames(mirrorEvent, desired)) > 0
 
 	switch {
 	case !signal.SourceChanged && !signal.MirrorDrifted:

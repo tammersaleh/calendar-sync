@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.6](https://github.com/tammersaleh/calendar-sync/compare/v2.1.5...v2.1.6) (2026-05-04)
+
+
+### Bug Fixes
+
+* carry on through 410/404 in classify deleteOrSkip path ([985ddc7](https://github.com/tammersaleh/calendar-sync/commit/985ddc7f1bf906208f898a162be67f907c400135))
+
 ## [2.1.5](https://github.com/tammersaleh/calendar-sync/compare/v2.1.4...v2.1.5) (2026-05-04)
 
 

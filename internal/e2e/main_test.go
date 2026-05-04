@@ -33,27 +33,30 @@ func TestMain(m *testing.M) {
 		// or the test binary hangs.
 		os.Exit(m.Run())
 	}
+	os.Exit(runWithFixtures(m))
+}
 
-	tmpRoot, err := os.MkdirTemp("", "calendar-sync-e2e-*")
+// runWithFixtures wraps the fixture lifecycle in a function so its
+// `defer`s actually run before os.Exit (which does NOT run defers).
+// A test panic, a timeout fatal, or a normal m.Run() return all unwind
+// through this function's defer stack, guaranteeing fixture teardown.
+func runWithFixtures(m *testing.M) (exitCode int) {
+	tmpRoot, err := os.MkdirTemp("/tmp", "cs-e2e-")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "e2e: mktemp: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
-	// We don't t.Cleanup tmpRoot from TestMain (no t available), so do
-	// it manually before each Exit path.
-	cleanupTmp := func() { _ = os.RemoveAll(tmpRoot) }
+	defer os.RemoveAll(tmpRoot)
 
 	bin, err := buildBinary(tmpRoot)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "e2e: build calendar-sync: %v\n", err)
-		cleanupTmp()
-		os.Exit(1)
+		return 1
 	}
 	binaryPath = bin
 
-	// Use a sandbox-rooted gws client throughout TestMain so any
-	// stray `download.html` from gws lands in tmpRoot rather than
-	// the user's repo.
+	// Sandbox-rooted gws client so any stray `download.html` from gws
+	// lands in tmpRoot rather than the user's repo.
 	c := gws.New(gws.WithWorkDir(tmpRoot))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -61,27 +64,24 @@ func TestMain(m *testing.M) {
 	cancel()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "e2e: create fixtures: %v\n", err)
-		cleanupTmp()
-		os.Exit(1)
+		return 1
 	}
 	fixtureSourceID = srcID
 	fixtureTargetID = tgtID
 
-	code := m.Run()
+	defer func() {
+		// Always tear fixtures down. Errors here don't override the
+		// test exit code (a teardown failure shouldn't mask a real
+		// test pass) but they do go to stderr so a leaked fixture
+		// is loud.
+		teardownCtx, teardownCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer teardownCancel()
+		if err := destroyFixtures(teardownCtx, c); err != nil {
+			fmt.Fprintf(os.Stderr, "e2e: destroy fixtures: %v\n", err)
+		}
+	}()
 
-	// Always tear fixtures down, even on test failure or panic, so
-	// repeated `mise run test:e2e` invocations don't leave stale
-	// calendars accumulating in the user's calendarList.
-	teardownCtx, teardownCancel := context.WithTimeout(context.Background(), 60*time.Second)
-	if err := destroyFixtures(teardownCtx, c); err != nil {
-		fmt.Fprintf(os.Stderr, "e2e: destroy fixtures: %v\n", err)
-		// Don't override the test exit code with a teardown error;
-		// surface to stderr and keep the original m.Run() exit.
-	}
-	teardownCancel()
-
-	cleanupTmp()
-	os.Exit(code)
+	return m.Run()
 }
 
 // buildBinary compiles the calendar-sync binary for the test run. One

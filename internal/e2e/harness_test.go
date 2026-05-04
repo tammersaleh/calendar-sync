@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -83,7 +84,7 @@ func Setup(t *testing.T, opts SetupOptions) *Harness {
 		horizon = "365d"
 	}
 
-	sandbox := t.TempDir()
+	sandbox := shortTempDir(t)
 
 	h := &Harness{
 		T:            t,
@@ -235,7 +236,7 @@ func (h *Harness) Run(ctx context.Context, extraArgs ...string) RunResult {
 	exit := 0
 	if err != nil {
 		var ee *exec.ExitError
-		if asExit(err, &ee) {
+		if errors.As(err, &ee) {
 			exit = ee.ExitCode()
 		} else {
 			h.T.Fatalf("run %v: launch failed: %v", args, err)
@@ -250,23 +251,26 @@ func (h *Harness) Run(ctx context.Context, extraArgs ...string) RunResult {
 	return res
 }
 
-// asExit is errors.As specialized; defined here to avoid an extra
-// import line at the call site and to keep the type assertion next to
-// the run logic.
-func asExit(err error, target **exec.ExitError) bool {
-	for e := err; e != nil; {
-		if ee, ok := e.(*exec.ExitError); ok {
-			*target = ee
-			return true
-		}
-		type unwrapper interface{ Unwrap() error }
-		uw, ok := e.(unwrapper)
-		if !ok {
-			return false
-		}
-		e = uw.Unwrap()
+// shortTempDir returns a tempdir with a short path so Unix sockets
+// created inside it stay under macOS's 104-byte sun_path limit. The
+// default `t.TempDir()` location under macOS's per-test-name folder is
+// too long for a socket. Used for the harness sandbox because the
+// watch-mode scenario will bind its IPC socket inside it.
+//
+// Mirrors `cmd/testhelpers_test.go`'s shortTempDir; duplicated here
+// because that file is in a different package and not exported.
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "cs-e2e-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
 	}
-	return false
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		t.Fatalf("Abs(%q): %v", dir, err)
+	}
+	return abs
 }
 
 // parseStdoutJSONL splits the run command's stdout into outcomes plus
@@ -320,19 +324,9 @@ func (res RunResult) AssertOutcome(t *testing.T, m OutcomeMatch) Outcome {
 	t.Helper()
 	var matches []Outcome
 	for _, o := range res.Outcomes {
-		if m.Action != "" && o.Action != m.Action {
-			continue
+		if matchOutcome(o, m) {
+			matches = append(matches, o)
 		}
-		if m.Reason != "" && o.Reason != m.Reason {
-			continue
-		}
-		if m.SourceEvent != "" && o.SourceEvent != m.SourceEvent {
-			continue
-		}
-		if m.TargetEvent != "" && o.TargetEvent != m.TargetEvent {
-			continue
-		}
-		matches = append(matches, o)
 	}
 	switch len(matches) {
 	case 0:
@@ -343,6 +337,84 @@ func (res RunResult) AssertOutcome(t *testing.T, m OutcomeMatch) Outcome {
 		t.Fatalf("expected exactly one outcome matching %+v, got %d: %s", m, len(matches), formatOutcomes(matches))
 	}
 	return Outcome{}
+}
+
+// AssertNoOutcomeForSource asserts that no outcome row references
+// sourceEventID. Used by filter scenarios (transparency, declined,
+// outside-horizon) that expect the source to produce no mirror.
+//
+// Note: the harness does NOT support an "exactly N total outcomes"
+// assertion. Shared fixture calendars accumulate Google-side
+// tombstones from prior tests; tombstones surface in subsequent runs
+// as `skip(cancelled)` outcomes the assertion would have to ignore.
+// Tests that care about specific events should filter by source_event
+// (via OutcomeMatch.SourceEvent or this helper) and not assume
+// outcome counts are noise-free.
+func (res RunResult) AssertNoOutcomeForSource(t *testing.T, sourceEventID string) {
+	t.Helper()
+	for _, o := range res.Outcomes {
+		if o.SourceEvent == sourceEventID {
+			t.Fatalf("expected no outcome for source %s, got: %+v", sourceEventID, o)
+		}
+	}
+}
+
+// AssertOutcomesForSource asserts that the outcomes whose SourceEvent
+// matches sourceEventID exactly cover the given matchers (in any
+// order). Extra outcomes that DON'T reference sourceEventID are
+// ignored - they represent noise from other concurrent test events,
+// tombstones, etc.
+//
+// Use this when a single source event should produce multiple
+// outcomes (e.g. a recurring source produces one parent outcome + one
+// per instance override) and you want to pin the full set.
+func (res RunResult) AssertOutcomesForSource(t *testing.T, sourceEventID string, want []OutcomeMatch) {
+	t.Helper()
+	var got []Outcome
+	for _, o := range res.Outcomes {
+		if o.SourceEvent == sourceEventID {
+			got = append(got, o)
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("outcomes for source %s: got %d, want %d\nwant: %+v\ngot:%s",
+			sourceEventID, len(got), len(want), want, formatOutcomes(got))
+	}
+	used := make([]bool, len(got))
+	for i, m := range want {
+		matched := -1
+		for j, o := range got {
+			if used[j] {
+				continue
+			}
+			if matchOutcome(o, m) {
+				matched = j
+				break
+			}
+		}
+		if matched < 0 {
+			t.Fatalf("matcher %d (%+v) had no match in outcomes for source %s:%s", i, m, sourceEventID, formatOutcomes(got))
+		}
+		used[matched] = true
+	}
+}
+
+// matchOutcome returns true if o matches m (empty fields wildcard).
+// Shared between AssertOutcome and AssertOutcomesForSource.
+func matchOutcome(o Outcome, m OutcomeMatch) bool {
+	if m.Action != "" && o.Action != m.Action {
+		return false
+	}
+	if m.Reason != "" && o.Reason != m.Reason {
+		return false
+	}
+	if m.SourceEvent != "" && o.SourceEvent != m.SourceEvent {
+		return false
+	}
+	if m.TargetEvent != "" && o.TargetEvent != m.TargetEvent {
+		return false
+	}
+	return true
 }
 
 // AssertSuccess fails the test if exit code is non-zero or _meta is

@@ -4,7 +4,9 @@ package e2e
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/tammersaleh/calendar-sync/internal/gws"
@@ -36,22 +38,39 @@ var fixtureSummaries = []string{sourceCalSummary, targetCalSummary}
 // Safety: a calendar matching by summary but NOT carrying fixtureMarker
 // in its description is treated as a real user calendar and the call
 // fails. The harness will not delete anything it didn't create.
+//
+// Atomic-ish: if any insert or visibility-wait fails, every fixture
+// already created during this call is best-effort deleted before the
+// error propagates. The user shouldn't be left with an orphaned
+// half-suite of fixtures.
 func createFixtures(ctx context.Context, c *gws.Client) (sourceID, targetID string, err error) {
 	if err := destroyFixtures(ctx, c); err != nil {
 		return "", "", fmt.Errorf("pre-create cleanup: %w", err)
 	}
 
 	created := make(map[string]string, len(fixtureSummaries))
+	rollback := func() {
+		for _, id := range created {
+			// Best-effort cleanup; surface failures to stderr only.
+			// At this point we're already in an error path.
+			rbCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_ = c.CalendarsDelete(rbCtx, id)
+			cancel()
+		}
+	}
+
 	for _, summary := range fixtureSummaries {
-		cal, err := c.CalendarsInsert(ctx, &gws.Calendar{
+		cal, insErr := c.CalendarsInsert(ctx, &gws.Calendar{
 			Summary:     summary,
 			Description: fixtureMarker,
 			TimeZone:    fixtureTimeZone,
 		})
-		if err != nil {
-			return "", "", fmt.Errorf("create fixture %q: %w", summary, err)
+		if insErr != nil {
+			rollback()
+			return "", "", fmt.Errorf("create fixture %q: %w", summary, insErr)
 		}
 		if cal.ID == "" {
+			rollback()
 			return "", "", fmt.Errorf("create fixture %q: response missing id", summary)
 		}
 		created[summary] = cal.ID
@@ -64,6 +83,7 @@ func createFixtures(ctx context.Context, c *gws.Client) (sourceID, targetID stri
 	// poll briefly so a future "look up by summary mid-test" doesn't
 	// flake.
 	if err := waitForFixturesVisible(ctx, c, created); err != nil {
+		rollback()
 		return "", "", err
 	}
 
@@ -72,8 +92,16 @@ func createFixtures(ctx context.Context, c *gws.Client) (sourceID, targetID stri
 
 // destroyFixtures deletes any calendar in the user's calendarList whose
 // summary matches a fixture name AND whose description carries the
-// fixture marker. Idempotent: a missing fixture is not an error. A
-// summary collision without the marker is a hard error.
+// fixture marker. Idempotent: a missing fixture is not an error, and a
+// 404/410 from the actual delete (the calendar vanished between list
+// and delete) is also treated as success.
+//
+// Errors from individual calendars accumulate; the function returns
+// after attempting all of them, joining error messages so a failed
+// teardown reports every problem rather than just the first one.
+//
+// A summary collision without the marker is a hard error - the harness
+// refuses to delete anything it didn't create.
 func destroyFixtures(ctx context.Context, c *gws.Client) error {
 	entries, err := c.CalendarListList(ctx)
 	if err != nil {
@@ -85,36 +113,53 @@ func destroyFixtures(ctx context.Context, c *gws.Client) error {
 		wanted[s] = true
 	}
 
+	var errs []string
 	for _, e := range entries {
 		if !wanted[e.Summary] {
 			continue
 		}
 		if e.AccessRole != "owner" {
-			return fmt.Errorf("fixture-name collision: calendar %q has accessRole=%q (not owner); refusing to delete", e.Summary, e.AccessRole)
+			errs = append(errs, fmt.Sprintf("calendar %q is not owned by this account (accessRole=%q); refusing to delete", e.Summary, e.AccessRole))
+			continue
 		}
 		// CalendarListEntry doesn't carry description; fetch the
-		// underlying Calendar resource so the safety marker check
-		// looks at the same field createFixtures populates.
-		cal, err := c.CalendarsGet(ctx, e.ID)
-		if err != nil {
-			return fmt.Errorf("verify fixture marker on %q (%s): %w", e.Summary, e.ID, err)
+		// underlying Calendar resource for the marker check.
+		cal, getErr := c.CalendarsGet(ctx, e.ID)
+		if getErr != nil {
+			// 404 mid-loop: someone deleted it between list and get.
+			// Tolerate.
+			if errors.Is(getErr, gws.ErrAPINotFound) || errors.Is(getErr, gws.ErrAPIGone) {
+				continue
+			}
+			errs = append(errs, fmt.Sprintf("verify marker on %q (%s): %v", e.Summary, e.ID, getErr))
+			continue
 		}
 		if cal.Description != fixtureMarker {
-			return fmt.Errorf("fixture-name collision: calendar %q (%s) does not carry the harness safety marker; refusing to delete (description=%q)", e.Summary, e.ID, cal.Description)
+			errs = append(errs, fmt.Sprintf("calendar %q (%s) does not carry the harness safety marker; refusing to delete (description=%q)", e.Summary, e.ID, cal.Description))
+			continue
 		}
-		if err := c.CalendarsDelete(ctx, e.ID); err != nil {
-			return fmt.Errorf("delete fixture %q (%s): %w", e.Summary, e.ID, err)
+		if delErr := c.CalendarsDelete(ctx, e.ID); delErr != nil {
+			if errors.Is(delErr, gws.ErrAPINotFound) || errors.Is(delErr, gws.ErrAPIGone) {
+				continue
+			}
+			errs = append(errs, fmt.Sprintf("delete %q (%s): %v", e.Summary, e.ID, delErr))
 		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("destroyFixtures: %s", strings.Join(errs, "; "))
 	}
 	return nil
 }
 
 // waitForFixturesVisible polls calendarList until every newly created
-// fixture appears, or the deadline passes. Calendar creation is
-// generally available immediately on the events endpoint but
-// calendarList propagation lags a few seconds.
+// fixture appears, or the context's deadline (or a 20-second cap,
+// whichever is sooner) passes. Calendar creation is generally
+// available immediately on the events endpoint but calendarList
+// propagation lags a few seconds.
 func waitForFixturesVisible(ctx context.Context, c *gws.Client, created map[string]string) error {
-	deadline := time.Now().Add(20 * time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
 	for {
 		entries, err := c.CalendarListList(ctx)
 		if err != nil {
@@ -122,25 +167,22 @@ func waitForFixturesVisible(ctx context.Context, c *gws.Client, created map[stri
 		}
 		seen := make(map[string]bool, len(created))
 		for _, e := range entries {
-			if _, ok := created[e.Summary]; ok && e.ID == created[e.Summary] {
+			if id, ok := created[e.Summary]; ok && e.ID == id {
 				seen[e.Summary] = true
 			}
 		}
 		if len(seen) == len(created) {
 			return nil
 		}
-		if time.Now().After(deadline) {
+		select {
+		case <-ctx.Done():
 			missing := []string{}
 			for s := range created {
 				if !seen[s] {
 					missing = append(missing, s)
 				}
 			}
-			return fmt.Errorf("fixtures not visible in calendarList after 20s: %v", missing)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
+			return fmt.Errorf("fixtures not visible in calendarList: %v (%w)", missing, ctx.Err())
 		case <-time.After(500 * time.Millisecond):
 		}
 	}

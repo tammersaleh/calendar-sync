@@ -8,17 +8,20 @@ Handoff for the next session. Read this first, then `SPEC.md`, then `CLAUDE.md`.
 - v2.1.2: nothing user-facing
 - v2.1.3: B15 (inherited recurring-instance source-wins bootstrap)
 - v2.1.4: B16 (BuildInventory two-pass to skip inherited instances)
+- v2.1.5 (pending release): B18 (per-event transient read error tolerance)
 
 ## Current state
 
 ### Daemon
 
-Running on v2.1.4 via launchd. Two pairs in bidirectional sync at `horizon=365d`:
+Still running on v2.1.4 via launchd at the time of writing. The B18 fix landed on `main` as commit `d66b12e`; the release-please PR will pick it up and ship v2.1.5 once CI is green. After the release lands, run `brew upgrade calendar-sync && calendar-sync uninstall && calendar-sync install` to pick it up. Until then the daemon will keep doing back-to-back FullSyncs.
+
+Two pairs in bidirectional sync at `horizon=365d`:
 
 - `work-personal`: source = `tsaleh@coreweave.com`, target = `me@tammersaleh.com`
 - `personal-to-work`: source = `me@tammersaleh.com`, target = `tsaleh@coreweave.com`
 
-Functional and idempotent on the steady-state path. **No data corruption risk.** But currently CPU/quota-heavy: one flaky recurring event (TARS Office Hours, possibly the parent-of-recurring-exception shape) throws transient HTTP 500s on `events.get`, which fails the pdir, invalidates the source syncToken, and triggers a fast-track FullSync. The next FullSync hits the same flake. The daemon has been running back-to-back ~24-minute FullSyncs since startup. Zero writes, zero propagates. See B18 below.
+Functional and idempotent on the steady-state path. **No data corruption risk.** Once v2.1.5 is in place, the TARS Office Hours flake (and any other persistently-flaky recurring read) will surface as a `transient=true` warn line on each tick instead of pinning the source's syncToken.
 
 ### Recent live writes worth knowing about
 
@@ -27,11 +30,9 @@ Functional and idempotent on the steady-state path. **No data corruption risk.**
 
 ## Backlog
 
-Three queued items. All in `backlog/` with full design docs:
+### B19 - stale inventory after partial recurring-instance repair-path failure (NEW)
 
-### B18 - per-event error tolerance (`backlog/B18-per-event-error-tolerance.md`)
-
-The daemon's CPU/quota loop. One flaky event = endless FullSyncs. Fix is to discriminate transient read errors (HTTP 5xx on `events.get`, gws subprocess timeouts, recurring-handler 5xx) from fatal ones (write failures) inside `runClassifyLoop`, so the former skip + advance the token while the latter keep gating it. Two implementation options sketched. Recommended next: this one. Smallest surgery, biggest immediate UX win.
+Surfaced during B18 code review (pre-existing; B18's transient tolerance makes it observable). When `recurring/handler.go` `locateMirrorInstance`'s repair path succeeds at `forceRewriteMirrorParent` (two `events.patch` writes) but the subsequent `events.instances` flakes transiently, `Handle` discards the post-rewrite mirror parent on the error return path. The next tick's classify loop sees stale inventory and may re-fire the force-rewrite. Bounded by `full_sync_interval` (FullSync rebuilds inventory). Spurious double-writes only - no data loss, no source-side effect. Full design + fix sketch in `doc/bugs.md` Open. Small fix; touches `recurring.Handler`'s Result/error contract.
 
 ### B17 - target-syncToken for sub-tick target-edit propagation (`backlog/B17-target-syncToken.md`)
 
@@ -39,15 +40,15 @@ Target-side edits propagate at FullSync rate (24h default) rather than tick rate
 
 ### Codex full-codebase correctness review
 
-Queued for after B17 and B18 land. Catches anything the recent B15/B16/B17/B18 fixes might have missed.
+Queued for after B17 lands. Catches anything the recent B15/B16/B18 fixes might have missed.
 
 ## Optional knob without backlog work
 
-`[settings].poll_interval = "15s"` and `[settings].full_sync_interval = "1h"` validate fine and have headroom (idle ticks are ~1.1s; full sync is 3-24min depending on syncToken state). Doesn't fix B18 but reduces the worst-case target-edit-propagation window from 24h to 1h without any code change.
+`[settings].poll_interval = "15s"` and `[settings].full_sync_interval = "1h"` validate fine and have headroom (idle ticks are ~1.1s; full sync is 3-24min depending on syncToken state). Reduces worst-case target-edit-propagation window from 24h to 1h without any code change.
 
 ## Repo state
 
-Pushed through HEAD. Two backlog docs committed (B17, B18). The `next.md` and `backlog/` are the only "in-flight" surface; main is clean.
+Pushed through HEAD. Main is clean. Backlog docs: B17, B18 (B18 design doc can be deleted after release-please ships v2.1.5 since the spec + bugs.md now carry the canonical version).
 
 ## What's NOT in scope right now
 
@@ -57,4 +58,4 @@ Pushed through HEAD. Two backlog docs committed (B17, B18). The `next.md` and `b
 
 ## When this file becomes useless
 
-When B17 + B18 ship, Codex full review is clean, and the daemon has run a quiet week (no back-to-back FullSyncs, no propagate-related anomalies), delete this file. The fixed inventory + per-target syncToken + per-event error tolerance + bidirectional rollout become the new normal in `SPEC.md` and `doc/bugs.md`.
+When B17 ships, B19 ships, the Codex full review is clean, and the daemon has run a quiet week (no back-to-back FullSyncs, no propagate-related anomalies), delete this file. The fixed inventory + per-target syncToken + per-event error tolerance + bidirectional rollout become the new normal in `SPEC.md` and `doc/bugs.md`.

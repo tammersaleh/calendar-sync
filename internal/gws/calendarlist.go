@@ -1,6 +1,7 @@
 package gws
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,71 @@ type CalendarListEntry struct {
 	ID         string `json:"id"`
 	Summary    string `json:"summary,omitempty"`
 	AccessRole string `json:"accessRole"`
+}
+
+// calendarListPage is one page of calendarList.list output. gws --page-all
+// emits one of these per line of NDJSON.
+type calendarListPage struct {
+	Items         []CalendarListEntry `json:"items"`
+	NextPageToken string              `json:"nextPageToken,omitempty"`
+}
+
+// CalendarListList enumerates every entry on the authenticated user's
+// calendar list. SPEC.md does not require this for the sync loop (the
+// loop resolves IDs one at a time via CalendarListGet), but it is the
+// natural way to look up a calendar by display summary - the entry point
+// for F1 (sync non-primary calendars) and a prerequisite for E2E test
+// fixture management (find / create / delete by name).
+//
+// Returns the full merged item list across pages; callers filter by
+// summary, accessRole, etc. client-side.
+func (c *Client) CalendarListList(ctx context.Context) ([]CalendarListEntry, error) {
+	c.debug("gws.CalendarListList")
+	args := []string{
+		"calendar", "calendarList", "list",
+		"--page-all",
+		"--format", "json",
+	}
+
+	stdout, stderr, exit, err := c.execute(ctx, args)
+	if err != nil {
+		return nil, err
+	}
+	if exit != 0 {
+		return nil, classifyError(stdout, stderr, exit, "calendarList.list")
+	}
+
+	pages, err := parseCalendarListPages(stdout)
+	if err != nil {
+		return nil, fmt.Errorf("gws calendarList.list: %w", err)
+	}
+
+	var out []CalendarListEntry
+	for _, p := range pages {
+		out = append(out, p.Items...)
+	}
+	c.debug("gws.CalendarListList result", "items", len(out))
+	return out, nil
+}
+
+// parseCalendarListPages decodes gws --page-all NDJSON output into one
+// page per line. Mirrors parseNDJSONPages in events.go but with the
+// calendarList page shape. A non-empty stdout that yields no pages is an
+// error - silent truncation would mask gws/format-flag bugs.
+func parseCalendarListPages(stdout []byte) ([]calendarListPage, error) {
+	var pages []calendarListPage
+	dec := json.NewDecoder(bytes.NewReader(stdout))
+	for dec.More() {
+		var p calendarListPage
+		if err := dec.Decode(&p); err != nil {
+			return nil, fmt.Errorf("parse calendarList page: %w", err)
+		}
+		pages = append(pages, p)
+	}
+	if len(pages) == 0 && len(bytes.TrimSpace(stdout)) > 0 {
+		return nil, fmt.Errorf("no pages parsed but stdout was non-empty: %q", string(stdout))
+	}
+	return pages, nil
 }
 
 // CalendarListGet returns the user's CalendarListEntry for calendarID.

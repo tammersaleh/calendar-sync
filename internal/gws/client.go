@@ -32,6 +32,7 @@ type Logger interface {
 // one-to-one to the Calendar API calls SPEC.md uses.
 type Client struct {
 	binPath string
+	workDir string
 	log     Logger
 }
 
@@ -42,6 +43,17 @@ type Option func(*Client)
 // relies on PATH; tests use this with a fully-qualified path to the fake.
 func WithBinary(path string) Option {
 	return func(c *Client) { c.binPath = path }
+}
+
+// WithWorkDir sets the working directory for every gws subprocess this
+// client launches. Default is unset, which means the subprocess inherits
+// the parent's cwd. The motivating case: gws's `events.delete` and
+// `calendars.delete` write a stray `download.html` in cwd on success
+// (Calendar API returns 204 No Content, which gws renders as an empty
+// "downloaded" file). Pointing workDir at a sandbox keeps strays from
+// landing in the user's repo. Empty string keeps the inherit-cwd default.
+func WithWorkDir(dir string) Option {
+	return func(c *Client) { c.workDir = dir }
 }
 
 // WithLogger wires a structured logger for per-call diagnostics. Every
@@ -83,6 +95,9 @@ func (c *Client) debug(msg string, args ...any) {
 // context.DeadlineExceeded. The exit code in that case is reported as -1.
 func (c *Client) execute(ctx context.Context, args []string) (stdout, stderr []byte, exitCode int, err error) {
 	cmd := exec.CommandContext(ctx, c.binPath, args...)
+	if c.workDir != "" {
+		cmd.Dir = c.workDir
+	}
 
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf

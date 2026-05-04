@@ -88,6 +88,67 @@ Manual operator workflow during deploy: list cancelled mirrors with confirmed so
 
 While investigating B20, found a separate active drift on the same Lunch & Reading event: source 5/11 instance at 11:30, mirror 5/11 instance at 11:00, daemon reports `unchanged`. The mirror's stored checksum matches the 11:00 managed fields, source.updated matches stored source_updated, so the drift signal misses it. This may be a side-effect of B20 (a stale mirror state where source change was silently overwritten), or a separate issue around per-instance source pointers and the daemon's reconciliation order. Asked the user for the desired source-of-truth before deciding fix strategy.
 
+### B23 - drift signal never compares source-now to mirror-now directly
+
+Surfaced 2026-05-04 during B20 investigation. The 5/11 Lunch & Reading instance sat in a stable state where source.start = 11:30, mirror.start = 11:00, and the daemon classified every tick as `reason: unchanged`.
+
+`mirror.ComputeDriftSignal` builds two signals from stored bookkeeping on the mirror:
+
+- `source_changed = source.Updated > mirror.calendar-sync:source_updated`
+- `mirror_drifted = sha256(canonical(mirror.<managed fields>)) != mirror.calendar-sync:checksum`
+
+If both fire `false`, the four-way matrix returns `Action: skip / Reason: unchanged`. But "neither side changed since the last write" is not the same as "source and mirror agree right now." There is no signal that compares the source's CURRENT managed fields against the mirror's CURRENT managed fields.
+
+Most ways the daemon writes the mirror keep stored bookkeeping faithful: a successful `events.patch` followed by the checksum follow-up writes both `source_updated` and `checksum` together. The hole is when the daemon's write is a managed-field no-op:
+
+1. Mirror has stored bookkeeping (source_updated=U0, checksum=H(F_mir)) and managed fields F_mir.
+2. Source's `updated` bumps to U1 without its managed fields actually changing - typical when Google cascades the `updated` timestamp from a parent edit to all per-instance overrides without touching the override's start/end.
+3. Daemon ticks. source_changed=true (U1 > U0), mirror_drifted=false (H(F_mir) still matches stored). ActionPatch fires.
+4. Daemon builds desired = BuildPayload(source). If source's managed fields are still equal to F_mir (the typical case for a cascaded `updated` bump), the patch body matches the mirror's existing fields. The patch is a no-op on managed fields.
+5. Checksum follow-up runs. Reads post-write resource (= F_mir), computes H(F_mir), patches that. Stored source_updated bumped to U1.
+6. Mirror is now at (source_updated=U1, checksum=H(F_mir), F_mir). Daemon sees stored ↔ current fields agree.
+
+That state is fine if F_src == F_mir. It becomes wrong if F_src != F_mir and the daemon never observed the divergence. The most plausible path to this divergence:
+
+- Pre-B20 fix path or a manual edit cycle where the mirror was at F_mir, the source was at F_src, and a write somewhere left stored bookkeeping locked in a state matching the mirror's fields without ever syncing the actual values.
+- Or: a propagate-then-revert cycle where the source was patched to F_mir, the daemon recorded that, then the source was patched back to F_src in a separate operation. Step 6 already applied; the daemon misses the second source change because its bookkeeping says "in sync."
+
+Once locked in, drift detection misses every subsequent edit that doesn't bump source's `updated` past stored. The mirror diverges silently.
+
+### Why this is structural, not a one-line fix
+
+The drift signal is not "incorrect" - it correctly answers "did either side change since the last write?" That's what stored bookkeeping can answer. But "are the two sides currently in sync?" is a different question that requires comparing F_src and F_mir directly. Adding that comparison fundamentally changes the contract:
+
+- It would catch this class of stale-bookkeeping bug.
+- It also catches every case where the daemon's last write produced an unexpected post-write resource (Google normalized a field, the wire format differed). Some of those are intentional and absorbed by the canonical-form rules in `mirror.Checksum`; the remaining edge cases would surface as new "drift" each tick where there isn't really any user-visible drift.
+- Once you add a current-state comparison, the four-way matrix grows. A new cell exists for "stored bookkeeping says clean, but managed fields disagree" - what action do you take? It's not source_changed (the source's stored timestamp matches), and it's not mirror_drifted in the usual sense (the mirror's checksum matches its current fields). The cleanest answer is to treat it like source_changed (rewrite mirror from source), but that's a SPEC-level decision.
+
+### Fix sketch
+
+Add a third drift signal `fields_disagree = !managedFieldsEqual(F_src, F_mir)`. When it fires and the existing two signals are both false, route to `ActionPatch / ReasonStaleBookkeeping` (new reason). The patch path is identical to the existing source_updated cell - rewrite the mirror from source.
+
+The check itself is cheap: `mirror.DriftedFieldNames(mirrorEvent, desired)` already exists and returns a non-empty slice when the two diverge. Plumbing it into `ComputeDriftSignal`'s output is straightforward.
+
+The harder question is "what does the matrix do when fields_disagree=true AND mirror_drifted=true?" That's a real conflict the existing matrix doesn't model: stored bookkeeping says mirror clean, hash says mirror drifted, fields disagree with source. The conservative answer is source_won (treat like source_changed_and_mirror_drifted with conflict_source_won). Worth Codex review before locking in.
+
+### Test plan
+
+In `internal/mirror/drift_test.go` (or wherever ComputeDriftSignal tests live):
+
+1. `TestDriftSignal_FieldsDisagreeWithCleanBookkeeping`: source and mirror managed fields differ, stored source_updated == source.Updated, stored checksum == hash(mirror fields). Expect: `signal.FieldsDisagree=true`, all other signals false.
+2. `TestDriftSignal_AlignedFieldsAndBookkeeping`: source and mirror managed fields match, stored bookkeeping matches. Expect: all signals false.
+
+In `internal/sync/reconcile_test.go` and `internal/recurring/handler_test.go`:
+
+3. `TestReconcileNormal_StaleBookkeepingTriggersPatch`: synthesize a mirror with clean stored bookkeeping but field divergence from source. Expect: ActionPatch with new reason, mirror rewritten from source, post-write checksum and source_updated reflect the new state.
+4. Same shape for recurring instance via `applyDriftMatrix`.
+
+### Relationship to B20
+
+B20 is a specific symptom of B23: cancelled mirror with confirmed source has F_src == F_mir on managed fields (status isn't a managed field) but they disagree on Status. B20's Option A fix (explicit revive branch) handles the Status-specific case without touching the broader drift signal. B23 is the structural fix that catches Status, Location, Start, and any other field divergence from a stale-bookkeeping path.
+
+Recommended order: ship B20's narrow fix first to unblock the user-visible symptom; tackle B23 separately because it's a SPEC-level change with broader test surface and matrix implications.
+
 ### B19 - stale inventory after partial recurring-instance repair-path failure
 
 Surfaced during B18 code review (pre-existing, made observable by B18's transient tolerance).

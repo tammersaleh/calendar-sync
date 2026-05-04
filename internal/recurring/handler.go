@@ -202,14 +202,18 @@ func (h *Handler) Handle(ctx context.Context, source *gws.Event) (Result, error)
 	}
 
 	mirrorInstance, parentAfterRepair, status, err := h.locateMirrorInstance(ctx, source, mirrorParent)
-	if err != nil {
-		return Result{}, err
-	}
 	if parentAfterRepair != nil {
 		// Step 2's repair path force-rewrote the mirror parent; surface that
-		// to the sync layer alongside any step-1 write.
+		// to the sync layer alongside any step-1 write. Done BEFORE the
+		// error check so an error on the retry events.instances doesn't
+		// drop the post-rewrite resource (B19): the rewrite already
+		// completed, and the sync layer's inventory must reflect that
+		// even when the rest of step 2 failed.
 		mirrorParent = parentAfterRepair
 		postWriteMirrorParent = parentAfterRepair
+	}
+	if err != nil {
+		return Result{PostWriteMirrorParent: postWriteMirrorParent}, err
 	}
 	if status.unmaterializable {
 		h.debug("recurring.Handle: instance unmaterializable -> skip",
@@ -227,11 +231,18 @@ func (h *Handler) Handle(ctx context.Context, source *gws.Event) (Result, error)
 	}
 
 	res, err := h.reconcileInstance(ctx, source, mirrorInstance)
-	if err != nil {
-		return Result{}, err
+	// Surface the post-write mirror parent (if step 1 or step 2 produced
+	// one) on both the success AND error paths. reconcileInstance never
+	// sets PostWriteMirrorParent itself (it returns PostWriteMirrorInstance),
+	// so the nil-guard always fires here in practice; the guard is
+	// future-proofing in case a later refactor adds a parent write inside
+	// reconcileInstance. The B19 motivation is the error path: dropping
+	// the parent write here would leave the sync layer's inventory stale
+	// and trigger spurious force-rewrites on subsequent ticks.
+	if res.PostWriteMirrorParent == nil {
+		res.PostWriteMirrorParent = postWriteMirrorParent
 	}
-	res.PostWriteMirrorParent = postWriteMirrorParent
-	return res, nil
+	return res, err
 }
 
 // resolveMirrorParent runs SPEC.md §"Step 1". Returns the mirror parent

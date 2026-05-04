@@ -1242,6 +1242,8 @@ Repair path:
 3. Retry the `events.instances` lookup.
 4. If still empty, the exception falls outside the mirror's recurrence even after refresh. `skip(reason=instance_unmaterializable)` and log at level `warn` with both the source parent's and mirror parent's recurrence arrays. The next full sync (within `full_sync_interval`) re-checks the parent and usually self-heals.
 
+If step 2 succeeds but step 3 returns an error (the retry `events.instances` fails for any reason - transient 5xx, gws subprocess timeout, etc.), the recurring handler must still surface the post-rewrite mirror parent through its return Result so the sync layer's inventory reflects the completed force-rewrite. Without that propagation, the next tick's classify loop sees a stale inventory entry and re-fires the force-rewrite - bounded only by the next full sync's inventory rebuild. The sync layer applies the post-write inventory updates from the Result (keying the mirror parent by the source PARENT's tuple `(canonical_source_calendar_id, E.recurringEventId)`) before returning the underlying error so the per-event error tolerance (transient skip vs fatal) decision in `runClassifyLoop` operates on a consistent inventory view.
+
 #### Step 3: decide insert/patch/delete/propagate/revert
 
 Apply these rules in order to the source exception `E`. The "user-facing action" reported on stdout is shown alongside.

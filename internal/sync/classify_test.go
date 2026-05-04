@@ -271,6 +271,104 @@ func TestClassify_Step2_RecurringDelegation_UpdatesInventory(t *testing.T) {
 	}
 }
 
+// TestClassify_Step2_RecurringDelegation_PartialRepairOnError_UpdatesInventory
+// pins B19. When the recurring handler's locate-and-repair path
+// successfully writes a new mirror parent (forceRewriteMirrorParent
+// fires 2 patches) but the subsequent events.instances retry returns
+// a transient error, classifyRecurringInstance must still apply the
+// post-write mirror parent to the inventory. Without this propagation,
+// the next tick's classify loop sees the stale inventory entry and
+// re-fires the force-rewrite - bounded only by the next FullSync's
+// inventory rebuild.
+func TestClassify_Step2_RecurringDelegation_PartialRepairOnError_UpdatesInventory(t *testing.T) {
+	api := newStubAPI()
+	inv := NewInventory("tgt-cal")
+	sink, _ := captureOutputs()
+
+	source := &gws.Event{
+		ID:                "src-evt",
+		Status:            gws.EventStatusConfirmed,
+		Summary:           "Standup",
+		Description:       "Standup",
+		Updated:           "2026-04-30T10:00:00Z",
+		HTMLLink:          "https://www.google.com/calendar/event?eid=ABC",
+		RecurringEventID:  "src-parent",
+		OriginalStartTime: &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"},
+		Start:             &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z"},
+		End:               &gws.EventDateTime{DateTime: "2026-05-01T14:00:00Z"},
+		Transparency:      gws.TransparencyOpaque,
+	}
+
+	// Stale mirror parent in inventory (recurrence will be replaced by repair).
+	parentTuple := mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-parent"}
+	staleParent := &gws.Event{
+		ID:         "mp-1",
+		Summary:    "Standup (stale)",
+		Recurrence: []string{"RRULE:FREQ=WEEKLY"}, // outdated; repair will rewrite
+	}
+	inv.Set(parentTuple, staleParent)
+
+	// First instances lookup: empty (triggers repair). The sync stub's
+	// EventsInstances dequeues from instancesErrors before instancesResp, so
+	// a leading nil error sentinel keeps the first call on the success path.
+	api.instancesErrors = append(api.instancesErrors, nil)
+	api.queueInstances(nil)
+
+	// Repair fetches the source parent.
+	sourceParent := &gws.Event{
+		ID:         "src-parent",
+		Status:     gws.EventStatusConfirmed,
+		Summary:    "Standup",
+		Recurrence: []string{"RRULE:FREQ=DAILY"}, // new rule from source
+		Updated:    "2026-04-30T09:00:00Z",
+		HTMLLink:   "https://www.google.com/calendar/event?eid=PP",
+	}
+	api.queueGet("src-cal", "src-parent", sourceParent)
+
+	// forceRewriteMirrorParent fires 2 patches (main + checksum follow-up).
+	postPatchParent := *staleParent
+	postPatchParent.Recurrence = []string{"RRULE:FREQ=DAILY"} // matches sourceParent
+	api.queuePatch(&postPatchParent)
+	postChecksumParent := postPatchParent
+	api.queuePatch(&postChecksumParent)
+
+	// Second instances lookup (the retry): transient 5xx.
+	api.instancesErrors = append(api.instancesErrors, &gws.Error{
+		Code:     gws.CodeBackendError,
+		ExitCode: 1,
+		Op:       "events.instances",
+	})
+
+	rec := &recurring.Handler{
+		API:              api,
+		SourceCalendarID: "src-cal",
+		TargetCalendarID: "tgt-cal",
+		SourceWritable:   true,
+		LookupMirrorParent: func(_ mirror.SourceTuple) (*gws.Event, bool) {
+			return staleParent, true
+		},
+	}
+
+	c := newClassifier(t, api, inv, sink, classifyOptions{
+		sourceWritable: true,
+		recurring:      rec,
+	})
+	err := c.Classify(context.Background(), source)
+	if err == nil {
+		t.Fatal("Classify should return the transient retry error so the caller (runClassifyLoop) can decide whether to skip-and-advance")
+	}
+
+	// Inventory must hold the post-rewrite mirror parent now, not the stale one.
+	got, ok := inv.Lookup(parentTuple)
+	if !ok {
+		t.Fatal("inventory must still hold the mirror parent")
+	}
+	if len(got.Recurrence) != 1 || got.Recurrence[0] != "RRULE:FREQ=DAILY" {
+		t.Errorf("inventory mirror parent recurrence = %v, want [RRULE:FREQ=DAILY] (post-rewrite); got %+v",
+			got.Recurrence, got)
+	}
+}
+
 // TestClassify_Step2_RecurringDelegation_BothPostWritesUpdated covers the
 // case where the recurring handler returns BOTH PostWriteMirrorParent AND
 // PostWriteMirrorInstance non-nil - the step-2 force-rewrite path. Both

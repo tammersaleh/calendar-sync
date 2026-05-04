@@ -196,14 +196,14 @@ func (c *Classifier) classifyRecurringInstance(ctx context.Context, source *gws.
 		return errors.New("sync: Classifier.Recurring is nil; cannot classify recurring instance")
 	}
 	res, err := c.Recurring.Handle(ctx, source)
-	if err != nil {
-		return err
-	}
 
-	// Apply inventory updates from the recurring handler. The handler's
-	// own write paths (cancellation, patch, propagate, revert, migration)
-	// all return PostWriteMirrorInstance; mirror-parent rewrites return
-	// PostWriteMirrorParent. Both are folded back into our inventory.
+	// Apply inventory updates from any post-writes BEFORE returning on
+	// error (B19). The recurring handler may have completed a partial
+	// write before erroring - typically forceRewriteMirrorParent
+	// succeeded but the followup events.instances flaked. Dropping the
+	// post-write resource here would leave the inventory stale and
+	// trigger spurious force-rewrites on subsequent ticks until the
+	// next FullSync rebuilds inventory from scratch.
 	if res.PostWriteMirrorParent != nil {
 		c.Inventory.Set(
 			mirror.SourceTuple{CalendarID: c.SourceCalendarID, EventID: source.RecurringEventID},
@@ -215,6 +215,10 @@ func (c *Classifier) classifyRecurringInstance(ctx context.Context, source *gws.
 			mirror.SourceTuple{CalendarID: c.SourceCalendarID, EventID: source.ID},
 			res.PostWriteMirrorInstance,
 		)
+	}
+
+	if err != nil {
+		return err
 	}
 
 	out := Outcome{

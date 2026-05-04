@@ -32,20 +32,6 @@ Pre-existing in `internal/config/loader.go:25-44`; not introduced by B7. Normal 
 
 Fix sketch: `filepath.Abs` the result of `config.FindPath` (or just inside the launchd plist generator path before stamping into WatchPaths). Add a unit test that drives FindPath with a relative `--config` and asserts the returned path is absolute.
 
-### B19 - stale inventory after partial recurring-instance repair-path failure
-
-Surfaced during B18 code review (pre-existing, made observable by B18's transient tolerance).
-
-`recurring/handler.go` `locateMirrorInstance`'s repair path: if the source-parent `events.get` succeeds and `forceRewriteMirrorParent` succeeds (two `events.patch` calls fired) but the second `events.instances` call then returns a transient error, `Handle` returns `Result{}, err`. The `parentAfterRepair` value is dropped; `classifyRecurringInstance` propagates the error and never updates the inventory with the rewritten mirror parent.
-
-Pre-B18: the transient error failed the pdir, the syncToken stayed pinned, the next tick re-delivered the same instance, the force-rewrite fired again. Spurious re-writes on every tick until the second `events.instances` stopped flaking.
-
-Post-B18: the transient error is logged and skipped. The token advances. The inventory keeps the stale (pre-rewrite) mirror parent. The next tick sees the stale entry; if the source instance comes up again, `locateMirrorInstance` may re-fire the force-rewrite. Bounded by `full_sync_interval` (the FullSync's `rebuildInventories` rebuilds from scratch and picks up the actual server state).
-
-Impact: spurious double-writes on the mirror parent, bounded to once per tick within a full-sync window. No data loss, no source-side effect.
-
-Fix sketch: have `Handle` propagate `postWriteMirrorParent` even on a subsequent error, by either returning a populated Result alongside the error, or by having `classifyRecurringInstance` apply inventory updates from a partial-result path. Test pin: synthesize the locate flow where `forceRewriteMirrorParent` succeeds and the follow-up `events.instances` returns 5xx; assert the inventory holds the post-rewrite mirror parent and the next tick doesn't re-fire the force-rewrite.
-
 ### B9 - plist generator does not XML-escape the config path
 
 `internal/launchd/install.go` uses `text/template` (not `html/template`) to render the plist. A config path containing `&`, `<`, or `>` would produce malformed XML and `launchctl load` would reject it. Pre-existing limitation; unlikely to bite default users (`~/.config/calendar-sync/config.toml` has no special chars), but a user with a path like `/tmp/sync&backup/config.toml` gets a broken plist.
@@ -53,6 +39,24 @@ Fix sketch: have `Handle` propagate `postWriteMirrorParent` even on a subsequent
 Fix sketch: switch to `html/template` (handles XML-class escaping for content), or wrap the path in `xml.EscapeText` before stamping. Test should generate a plist with `&`, `<`, `>` in the config path and verify the output parses as valid XML.
 
 ## Fixed
+
+### B19 - stale inventory after partial recurring-instance repair-path failure
+
+Surfaced during B18 code review (pre-existing; B18's transient tolerance turned the failure mode from "syncToken pinned forever" to "spurious double-writes per tick until next FullSync"). The recurring handler's `locateMirrorInstance` repair path fires up to 3 API calls: source-parent `events.get`, `forceRewriteMirrorParent` (2 `events.patch` writes), then a retry `events.instances`. If step 1 and 2 succeeded but step 3 returned a transient error, `Handle` returned `Result{}, err` and `classifyRecurringInstance` skipped the inventory update on the error path. The post-rewrite mirror parent was dropped on the floor; the next tick saw the stale inventory entry and re-fired the force-rewrite.
+
+Fixed by propagating the post-write mirror parent through the Result even on the error path, and having the sync layer apply the inventory updates before returning the error:
+
+- `internal/recurring/handler.go` `Handle`: capture `parentAfterRepair` BEFORE the `locateMirrorInstance` error check. On error, return `Result{PostWriteMirrorParent: postWriteMirrorParent}, err`. Also on the `reconcileInstance` error path: surface `postWriteMirrorParent` if `res.PostWriteMirrorParent` is nil. The behavior of the success path is unchanged.
+
+- `internal/sync/classify.go` `classifyRecurringInstance`: apply inventory updates from `res.PostWriteMirrorParent` and `res.PostWriteMirrorInstance` BEFORE the err check. The Outcome emit only fires on success; only the inventory state mutation moved earlier.
+
+The error itself still bubbles up to `runClassifyLoop` where B18's transient-read classifier decides whether to log+skip (advancing the token) or fail the pdir (gating the token). Either way the inventory is now consistent with the writes that did complete.
+
+Test pins:
+- `internal/recurring/handler_test.go`: `TestHandle_Step2_RepairSucceedsThenRetryFails_ReturnsParentAfterRepair` - asserts Result.PostWriteMirrorParent is non-nil with the post-rewrite Recurrence value when the retry events.instances errors.
+- `internal/sync/classify_test.go`: `TestClassify_Step2_RecurringDelegation_PartialRepairOnError_UpdatesInventory` - integration test asserting the inventory entry reflects the post-rewrite mirror parent (new Recurrence rule from source) after Classify returns the underlying error.
+
+SPEC §"Zero-result instance lookup" updated with the partial-repair-error contract.
 
 ### B23 - drift signal never compared source-now to mirror-now directly
 

@@ -593,6 +593,96 @@ func TestHandle_Step2_RepairAfterZeroResults(t *testing.T) {
 	}
 }
 
+// TestHandle_Step2_RepairSucceedsThenRetryFails_ReturnsParentAfterRepair
+// pins B19. The repair path may fire 3 API calls in sequence:
+//
+//  1. events.get on the source parent
+//  2. forceRewriteMirrorParent (events.patch x2: main + checksum follow-up)
+//  3. events.instances retry on the rewritten mirror parent
+//
+// If step 3 returns a transient error (HTTP 5xx, gws subprocess timeout,
+// etc.) AFTER step 2 has already written the rewritten parent to Google,
+// the handler must surface the post-rewrite resource via Result.
+// PostWriteMirrorParent so the sync layer can update its inventory. Without
+// this propagation Handle would return Result{}, err and the inventory
+// keeps the pre-rewrite mirror parent. The next tick's classify loop
+// would re-fetch the same instance, find inventory still stale, and
+// re-fire the force-rewrite (a wasted double-write per tick until the
+// next FullSync rebuilds inventory from scratch).
+func TestHandle_Step2_RepairSucceedsThenRetryFails_ReturnsParentAfterRepair(t *testing.T) {
+	api := newStubAPI()
+	mirrorParent := makeMirrorParent("mp-1")
+	source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
+
+	// First instances lookup: empty (triggers repair). The stub's EventsInstances
+	// dequeues from instancesErrors before instancesResponses, so a leading
+	// nil error sentinel keeps the first call on the success path.
+	api.instancesErrors = append(api.instancesErrors, nil)
+	api.queueInstances(nil)
+
+	// Repair fetches source parent.
+	sourceParent := &gws.Event{
+		ID:         "src-parent",
+		Status:     gws.EventStatusConfirmed,
+		Summary:    "Standup updated rules",
+		Recurrence: []string{"RRULE:FREQ=DAILY"},
+		Updated:    "2026-04-29T22:00:00Z",
+		HTMLLink:   "https://www.google.com/calendar/event?eid=PP",
+	}
+	api.queueGet("src-cal", "src-parent", sourceParent)
+
+	// forceRewriteMirrorParent fires two patches (main + checksum follow-up).
+	postPatchParent := *mirrorParent
+	postPatchParent.Recurrence = []string{"RRULE:FREQ=DAILY"}
+	postPatchParent.Summary = "Standup updated rules"
+	postPatchParent.Description = "\n\n---\nSource: " + sourceParent.HTMLLink
+	postPatchParent.Transparency = gws.TransparencyOpaque
+	postPatchParent.Visibility = gws.VisibilityPrivate
+	api.queuePatch(&postPatchParent)
+	postChecksumParent := postPatchParent
+	postChecksumParent.ExtendedProperties = &gws.ExtendedProperties{Private: map[string]string{}}
+	api.queuePatch(&postChecksumParent)
+
+	// Second instances lookup (the retry): transient 5xx.
+	api.instancesErrors = append(api.instancesErrors, &gws.Error{
+		Code:     gws.CodeBackendError,
+		ExitCode: 1,
+		Op:       "events.instances",
+	})
+
+	h := &Handler{
+		API:              api,
+		SourceCalendarID: "src-cal",
+		TargetCalendarID: "tgt-cal",
+		LookupMirrorParent: func(_ mirror.SourceTuple) (*gws.Event, bool) {
+			return mirrorParent, true
+		},
+	}
+	got, err := h.Handle(context.Background(), source)
+	if err == nil {
+		t.Fatal("Handle should return the transient error from the retry events.instances")
+	}
+	if got.PostWriteMirrorParent == nil {
+		t.Fatalf("PostWriteMirrorParent must be set even on retry-error path so the sync layer can update its inventory; got Result.Action=%q", got.Action)
+	}
+	// The post-rewrite resource is the post-checksum mirror parent (the
+	// helper's return value), not the pre-repair stub.
+	if got.PostWriteMirrorParent.ID != mirrorParent.ID {
+		t.Errorf("PostWriteMirrorParent.ID = %q, want %q (the rewritten parent has the same id - events.patch URLs by id)",
+			got.PostWriteMirrorParent.ID, mirrorParent.ID)
+	}
+	// Sanity: the recurrence on the post-write resource reflects the new
+	// rule from sourceParent, not the pre-repair stub's empty value.
+	if len(got.PostWriteMirrorParent.Recurrence) != 1 ||
+		got.PostWriteMirrorParent.Recurrence[0] != "RRULE:FREQ=DAILY" {
+		t.Errorf("PostWriteMirrorParent.Recurrence = %v, want [RRULE:FREQ=DAILY] (post-rewrite state)",
+			got.PostWriteMirrorParent.Recurrence)
+	}
+	if n := len(api.callsByOp("EventsPatch")); n != 2 {
+		t.Errorf("forceRewriteMirrorParent should still fire 2 patches even when retry fails; got %d", n)
+	}
+}
+
 func TestHandle_Step2_InstanceUnmaterializable(t *testing.T) {
 	api := newStubAPI()
 	mirrorParent := makeMirrorParent("mp-1")

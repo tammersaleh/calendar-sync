@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.8](https://github.com/tammersaleh/calendar-sync/compare/v2.1.7...v2.1.8) (2026-05-04)
+
+
+### Bug Fixes
+
+* detect source-mirror divergence with clean stored bookkeeping ([4cc79aa](https://github.com/tammersaleh/calendar-sync/commit/4cc79aab20e3380eb239d9c7d343599cbd0c64f2))
+
 ## [2.1.7](https://github.com/tammersaleh/calendar-sync/compare/v2.1.6...v2.1.7) (2026-05-04)
 
 

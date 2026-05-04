@@ -192,6 +192,14 @@ The wrapper exposes `nextSyncToken` from the LAST NDJSON page (or empty string i
 
 Source-cancelled / declined / tentative / transparent all patch the mirror instance with `{status: cancelled}` and stop. No follow-up `calendar-sync:checksum` write happens because no managed field changed; the existing checksum on the mirror is still accurate. This is one of two write paths in the recurring handler that bypass `patchMirrorWithChecksum` (the other is the source-side patch in `propagate`, which writes to the source, not a mirror).
 
+### Revive cell sits before the four-way drift matrix
+
+Both `Classifier.reconcileNormal` and `recurring.Handler.applyDriftMatrix` short-circuit to a revive path when `mirror.Status == EventStatusCancelled` at classify time. By the time those functions run, the source has already passed steps 3-7 (cancelled / declined / tentative / transparent / outside_horizon - all filtered upstream), so a cancelled mirror at this point is the leftover of an earlier cancellation cell whose source has flipped back. Status is intentionally NOT in `mirror.ManagedFields` (adding it would force a checksum migration across every existing v3 mirror), so the standard drift signal would emit `skip/unchanged` and leave the mirror cancelled forever.
+
+The revive patches with the full managed-field payload plus `status=confirmed`, then runs the standard checksum follow-up. Outcome shape mirrors `insert.go`'s post-409 `reviveCancelledMirror`: `ActionInsert + ReasonSourceUpdated`. Two helpers exist in parallel: `Classifier.reviveCancelledMirror` (non-recurring, in `insert.go`) and `Handler.reviveCancelledMirrorInstance` (recurring, in `handler.go`). The non-recurring path is reused as-is for both 409-recovery and B20.
+
+Ordering matters: the revive check fires BEFORE the inherited/migration branches in the recurring handler, and BEFORE the `NeedsMigration` branch in `reconcileNormal`. A cancelled mirror at any schema version or inheritance state takes the revive path - the rewrite at the current `SchemaVersion` IS the migration in those cases. `BuildPayload` always writes `mirror.SchemaVersion` so the revive doubles as a schema upgrade for legacy mirrors.
+
 ### `config.CompactDuration` is the single source of truth for wire durations
 
 Both SPEC line 588 (`config show`) and SPEC line 725 (IPC `status`) format durations the same way: `60s` (whole seconds) or `24h` (whole hours), but never Go's verbose `1m0s` / `24h0m0s`. The implementation lives in `internal/config/duration.go` as `CompactDuration(time.Duration) string` with a `Duration.Compact()` method for the typed wrapper. The daemon's `compactDuration` in `internal/daemon/socket.go` is a thin delegate so the two layers can't drift.

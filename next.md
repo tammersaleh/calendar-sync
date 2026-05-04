@@ -30,6 +30,12 @@ Functional and idempotent on the steady-state path. **No data corruption risk.**
 
 ## Backlog
 
+### B20 - cancelled mirror with confirmed source classifies `unchanged` forever (CRITICAL, NEW)
+
+Surfaced 2026-05-03 evening when the user noticed missing future Lunch & Reading instances on the work mirror. 5 mirror instances (5/4 - 5/8) sat at status=cancelled while the source was confirmed; daemon reported `unchanged` every tick because Status isn't a managed field and the stored checksum still matched. Manually revived the 5 instances via direct gws patch (status=confirmed). Full design + fix sketch in `doc/bugs.md` Open. Lean: Option A (revive branch in classify before mirror.Classify), avoids forcing a re-checksum across every existing mirror that Option B (add Status to ManagedFields) would require.
+
+Side note in bugs.md: an active drift on 5/11 (source 11:30, mirror 11:00) was found during the same investigation. Daemon reports `unchanged` for that instance too. Awaiting user input on which side is the source of truth before deciding whether it's part of B20 or a separate issue.
+
 ### B19 - stale inventory after partial recurring-instance repair-path failure (NEW)
 
 Surfaced during B18 code review (pre-existing; B18's transient tolerance makes it observable). When `recurring/handler.go` `locateMirrorInstance`'s repair path succeeds at `forceRewriteMirrorParent` (two `events.patch` writes) but the subsequent `events.instances` flakes transiently, `Handle` discards the post-rewrite mirror parent on the error return path. The next tick's classify loop sees stale inventory and may re-fire the force-rewrite. Bounded by `full_sync_interval` (FullSync rebuilds inventory). Spurious double-writes only - no data loss, no source-side effect. Full design + fix sketch in `doc/bugs.md` Open. Small fix; touches `recurring.Handler`'s Result/error contract.

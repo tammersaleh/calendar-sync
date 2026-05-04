@@ -9,6 +9,51 @@ import (
 	"github.com/tammersaleh/calendar-sync/internal/testhelpers"
 )
 
+func TestCalendarsGet_HappyPath(t *testing.T) {
+	scenario := testhelpers.Scenario{
+		Calls: []testhelpers.ScenarioCall{
+			{Stdout: `{"id":"c_abc@group.calendar.google.com","summary":"calendar-sync-e2e-source","description":"calendar-sync E2E test fixture; safe to delete","timeZone":"UTC"}`, Exit: 0},
+		},
+	}
+	var (
+		got    *gws.Calendar
+		gotErr error
+	)
+	calls := testhelpers.WithFakeGWS(t, scenario, func() {
+		got, gotErr = gws.New().CalendarsGet(context.Background(), "c_abc@group.calendar.google.com")
+	})
+	if gotErr != nil {
+		t.Fatalf("CalendarsGet returned error: %v", gotErr)
+	}
+	if got.Description != "calendar-sync E2E test fixture; safe to delete" {
+		t.Errorf("CalendarsGet description = %q, want fixture marker", got.Description)
+	}
+	wantPrefix := []string{"calendar", "calendars", "get"}
+	for i, w := range wantPrefix {
+		if calls[0].Args[i] != w {
+			t.Errorf("call.Args[%d] = %q, want %q", i, calls[0].Args[i], w)
+		}
+	}
+	if calID, _ := calls[0].Params["calendarId"].(string); calID != "c_abc@group.calendar.google.com" {
+		t.Errorf("--params calendarId = %v, want c_abc@group.calendar.google.com", calls[0].Params["calendarId"])
+	}
+}
+
+func TestCalendarsGet_NonZeroExitReturnsError(t *testing.T) {
+	scenario := testhelpers.Scenario{
+		Calls: []testhelpers.ScenarioCall{
+			{Stderr: `{"error":"not found"}`, Exit: 1},
+		},
+	}
+	var gotErr error
+	testhelpers.WithFakeGWS(t, scenario, func() {
+		_, gotErr = gws.New().CalendarsGet(context.Background(), "missing")
+	})
+	if gotErr == nil {
+		t.Fatal("expected error on non-zero exit, got nil")
+	}
+}
+
 func TestCalendarsInsert_HappyPath(t *testing.T) {
 	scenario := testhelpers.Scenario{
 		Calls: []testhelpers.ScenarioCall{

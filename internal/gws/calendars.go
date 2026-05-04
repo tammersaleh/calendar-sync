@@ -20,6 +20,39 @@ type Calendar struct {
 	TimeZone    string `json:"timeZone,omitempty"`
 }
 
+// CalendarsGet returns the Calendar resource for calendarID. Distinct
+// from CalendarListGet, which returns the user-scoped listing entry;
+// this returns the underlying calendar with owner-scoped fields like
+// `description` that don't appear on the listing entry. Used by the
+// E2E fixture safety marker check.
+func (c *Client) CalendarsGet(ctx context.Context, calendarID string) (*Calendar, error) {
+	c.debug("gws.CalendarsGet", "calendar_id", calendarID)
+	paramsJSON, err := json.Marshal(map[string]any{"calendarId": calendarID})
+	if err != nil {
+		return nil, fmt.Errorf("gws calendars.get: marshal params: %w", err)
+	}
+
+	args := []string{
+		"calendar", "calendars", "get",
+		"--params", string(paramsJSON),
+		"--format", "json",
+	}
+
+	stdout, stderr, exit, err := c.execute(ctx, args)
+	if err != nil {
+		return nil, err
+	}
+	if exit != 0 {
+		return nil, classifyError(stdout, stderr, exit, "calendars.get")
+	}
+
+	var out Calendar
+	if err := json.Unmarshal(stdout, &out); err != nil {
+		return nil, fmt.Errorf("gws calendars.get: parse response: %w (stdout: %q)", err, string(stdout))
+	}
+	return &out, nil
+}
+
 // CalendarsInsert creates a secondary calendar owned by the authenticated
 // user. The returned *Calendar carries the assigned id (a group-calendar
 // id of the form `c_<hash>@group.calendar.google.com`).

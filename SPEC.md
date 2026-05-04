@@ -980,6 +980,29 @@ Every `poll_interval`, the internal scheduler fires the per-tick path. For each 
 
 The conditional advancement is what protects against the original "source-keyed state loses events on partial failure" bug: a failed pdir prevents the source's token from moving past events it didn't process, so the next tick re-delivers them.
 
+#### Per-event transient read tolerance
+
+The token-gating rule above treats "any per-event classify error" as pdir failure. That conflates two error classes: write failures (mirror state may be partially updated) versus read flakes (a 5xx on `events.get` for a horizon check, a 400 on `events.instances` from Google's recurring-exception indexing quirk). One persistently-flaky source event under the strict rule keeps the source's token pinned forever, and the daemon falls into back-to-back FullSyncs.
+
+Per-event errors during the classify loop are split into two classes:
+
+- **Transient read** errors are logged at `warn` (the `transient` field on the log line is `true`) and skipped. The pdir keeps running. The token is allowed to advance once every other event in the delta succeeds. The skipped event is re-evaluated on the next tick (if it appears in a future delta) or the next FullSync (which re-walks every source event regardless). The transient class is intentionally narrow - only well-understood Calendar API hiccups that don't represent state mutation:
+
+  | Op                  | Code(s)                                                       | Why transient                                              |
+  |---------------------|---------------------------------------------------------------|------------------------------------------------------------|
+  | `events.instances`  | `backend_error`, `api_invalid_request`, `api_not_found`       | Read-side; horizon eligibility / mirror-instance lookup    |
+  | `events.get`        | `backend_error`, `api_not_found`                              | Read-side; recurring-handler parent fetch                  |
+
+  `events.get` + `api_invalid_request` is intentionally NOT transient: 400 there is much more likely a request-shape bug than a Google quirk, and silencing it would hide real issues.
+
+- **Fatal** errors (everything else) keep the pdir's `Err` non-nil and the token pinned. This includes:
+  - any write op (`events.insert` / `events.patch` / `events.delete`) regardless of code, because a partially-applied write must be re-attempted on a stable token;
+  - rate-limit / auth / forbidden / 410-gone / network errors, because skipping them defeats backoff or hides config drift;
+  - context cancellation / deadline exceeded, because those signal whole-pass shutdown (SIGTERM) or run-budget exhaustion (`calendar-sync run --timeout`) rather than per-event flake;
+  - the post-409 `events.get` inside the insert-recovery path, because that read drives a write decision (revive cancelled mirror vs reconcile alive mirror) and a flake leaves the daemon unable to know the colliding mirror's state.
+
+A pdir whose loop contains any fatal error fails the pdir even if other events in the same loop only flaked transiently - the conditional-advancement rule still gates the token. Only loops with zero fatal errors clear the gate.
+
 Empty deltas (the common case) cost a single API call per source - measured at ~270ms for an empty incremental response.
 
 ### Daemon lifecycle: periodic full re-sync
@@ -1354,6 +1377,8 @@ else:
 ```
 
 Each pdir's syncToken is advanced independently on its own success per the conditional-advancement rule.
+
+A pdir is considered successful when every event in its delta either classified cleanly or hit a transient read error (per §"Per-event transient read tolerance"). Any fatal per-event error fails the pdir, gates token advancement, and contributes to `_meta.failures`.
 
 ## State
 

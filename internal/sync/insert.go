@@ -32,7 +32,13 @@ func (c *Classifier) doInsert(ctx context.Context, source *gws.Event) error {
 	// resource and reconcile from there.
 	existing, err := c.API.EventsGet(ctx, c.TargetCalendarID, payload.ID)
 	if err != nil {
-		return fmt.Errorf("post-409 events.get %s/%s: %w", c.TargetCalendarID, payload.ID, err)
+		// Wrap with the errInsertCollisionRead marker so the classify
+		// loop's transient-read detector keeps this fatal: the read's
+		// result drives a write decision (revive cancelled vs reconcile
+		// alive), and a flake here can't be safely skipped without
+		// leaving the colliding mirror in an unknown state.
+		return fmt.Errorf("post-409 events.get %s/%s: %w (%w)",
+			c.TargetCalendarID, payload.ID, err, errInsertCollisionRead)
 	}
 	if existing.Status == gws.EventStatusCancelled {
 		return c.reviveCancelledMirror(ctx, source, existing)

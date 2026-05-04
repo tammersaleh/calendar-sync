@@ -807,6 +807,14 @@ func (r *Reconciler) runClassifyLoop(
 		)
 
 		if err := c.Classify(ctx, &ev); err != nil {
+			// Per-event error tolerance (B18): a narrow set of read-side
+			// flakes (events.get / events.instances 5xx etc.) get logged
+			// + skipped without invalidating the syncToken. Everything
+			// else - writes, rate-limit, auth, context shutdown - stays
+			// fatal so the next tick can re-attempt cleanly. See
+			// isTransientClassifyReadError for the matrix and SPEC
+			// §"Conditional advancement" / §"Partial failure semantics".
+			transient := isTransientClassifyReadError(err)
 			r.warn("sync.runClassifyLoop: classify error",
 				"pair", c.Pair,
 				"direction", c.Direction,
@@ -814,7 +822,11 @@ func (r *Reconciler) runClassifyLoop(
 				"recurring_event_id", ev.RecurringEventID,
 				"summary", ev.Summary,
 				"error", err.Error(),
+				"transient", transient,
 			)
+			if transient {
+				continue
+			}
 			errs = append(errs, fmt.Errorf("classify %s/%s: %w",
 				c.SourceCalendarID, ev.ID, err))
 		}

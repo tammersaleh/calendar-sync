@@ -32,6 +32,20 @@ Pre-existing in `internal/config/loader.go:25-44`; not introduced by B7. Normal 
 
 Fix sketch: `filepath.Abs` the result of `config.FindPath` (or just inside the launchd plist generator path before stamping into WatchPaths). Add a unit test that drives FindPath with a relative `--config` and asserts the returned path is absolute.
 
+### B19 - stale inventory after partial recurring-instance repair-path failure
+
+Surfaced during B18 code review (pre-existing, made observable by B18's transient tolerance).
+
+`recurring/handler.go` `locateMirrorInstance`'s repair path: if the source-parent `events.get` succeeds and `forceRewriteMirrorParent` succeeds (two `events.patch` calls fired) but the second `events.instances` call then returns a transient error, `Handle` returns `Result{}, err`. The `parentAfterRepair` value is dropped; `classifyRecurringInstance` propagates the error and never updates the inventory with the rewritten mirror parent.
+
+Pre-B18: the transient error failed the pdir, the syncToken stayed pinned, the next tick re-delivered the same instance, the force-rewrite fired again. Spurious re-writes on every tick until the second `events.instances` stopped flaking.
+
+Post-B18: the transient error is logged and skipped. The token advances. The inventory keeps the stale (pre-rewrite) mirror parent. The next tick sees the stale entry; if the source instance comes up again, `locateMirrorInstance` may re-fire the force-rewrite. Bounded by `full_sync_interval` (the FullSync's `rebuildInventories` rebuilds from scratch and picks up the actual server state).
+
+Impact: spurious double-writes on the mirror parent, bounded to once per tick within a full-sync window. No data loss, no source-side effect.
+
+Fix sketch: have `Handle` propagate `postWriteMirrorParent` even on a subsequent error, by either returning a populated Result alongside the error, or by having `classifyRecurringInstance` apply inventory updates from a partial-result path. Test pin: synthesize the locate flow where `forceRewriteMirrorParent` succeeds and the follow-up `events.instances` returns 5xx; assert the inventory holds the post-rewrite mirror parent and the next tick doesn't re-fire the force-rewrite.
+
 ### B9 - plist generator does not XML-escape the config path
 
 `internal/launchd/install.go` uses `text/template` (not `html/template`) to render the plist. A config path containing `&`, `<`, or `>` would produce malformed XML and `launchctl load` would reject it. Pre-existing limitation; unlikely to bite default users (`~/.config/calendar-sync/config.toml` has no special chars), but a user with a path like `/tmp/sync&backup/config.toml` gets a broken plist.
@@ -39,6 +53,21 @@ Fix sketch: `filepath.Abs` the result of `config.FindPath` (or just inside the l
 Fix sketch: switch to `html/template` (handles XML-class escaping for content), or wrap the path in `xml.EscapeText` before stamping. Test should generate a plist with `&`, `<`, `>` in the config path and verify the output parses as valid XML.
 
 ## Fixed
+
+### B18 - one flaky source event pins the syncToken, daemon falls into back-to-back FullSyncs
+
+A single recurring source event (TARS Office Hours) intermittently failed its horizon-eligibility lookup with HTTP 500 from `events.get`. Each tick: classify errored on that event, the pdir was marked failed, the conditional-advancement gate kept the source's syncToken pinned, the next tick saw an empty token and triggered `NeedsFullResync`, the scheduler ran a fast-track ~24-minute FullSync, the FullSync re-hit the same flake. The daemon ran 4 back-to-back FullSyncs in ~50 minutes with zero writes and zero data risk - just CPU and quota burn.
+
+Surfaced live during the v2.1.4 daemon's first hour. Root cause is the strict "any per-event classify error fails the pdir" rule conflating two error classes: write failures (mirror state may be partially updated) versus read flakes that don't represent state mutation. The strict rule is correct for writes and necessary to preserve idempotency. For read flakes it's overkill: the next tick or FullSync re-evaluates the event, and Calendar API hiccups on `events.get`/`events.instances` are common enough that one flaky event shouldn't pin the entire pdir.
+
+Fixed by carving out a narrow transient-read class in the classify loop. `internal/sync/transient.go` defines `isTransientClassifyReadError` over a (op, code) matrix:
+
+- `events.instances` + {`backend_error`, `api_invalid_request`, `api_not_found`}
+- `events.get` + {`backend_error`, `api_not_found`}
+
+`events.get` + `api_invalid_request` (400) intentionally stays fatal: a request-shape rejection there is more likely a programmer bug than a Google quirk. Write ops, rate-limit, auth, forbidden, 410-gone, network, context-canceled, and the post-409 `events.get` inside insert recovery (marked via `errInsertCollisionRead` so the helper can distinguish it from a standalone read) are all explicitly fatal. Any fatal error in a loop still pins the token; transient errors only count as "skip and continue" when nothing else broke.
+
+`runClassifyLoop` (`internal/sync/reconciler.go`) checks the helper after the warn log; the log line carries a `transient` field so an operator can grep for the underlying flakiness. SPEC.md §"Per-event transient read tolerance" documents the matrix and reasoning. Test pins live in `internal/sync/transient_test.go`: helper unit tests for every matrix cell, integration tests at the Tick level for transient skip + token advance, write failure stays fatal, post-409 lookup stays fatal, context errors stay fatal, mixed transient+fatal still fails the pdir, rate_limited stays fatal.
 
 ### B16 - inherited recurring-instance mirror shadows parent in inventory, propagate clobbers source parent (CRITICAL)
 

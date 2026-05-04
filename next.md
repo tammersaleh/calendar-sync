@@ -1,6 +1,8 @@
 # next.md
 
-Handoff for the next session. Read this first, then `SPEC.md`, then `CLAUDE.md`. Previous sessions shipped:
+Handoff for the next session. Read this first, then `SPEC.md`, then `CLAUDE.md`.
+
+## Version history
 
 - v2.0.0: per-pair config scoping, `direction` field removed (BREAKING)
 - v2.1.0: location managed-field (v3 schema)
@@ -9,64 +11,145 @@ Handoff for the next session. Read this first, then `SPEC.md`, then `CLAUDE.md`.
 - v2.1.3: B15 (inherited recurring-instance source-wins bootstrap)
 - v2.1.4: B16 (BuildInventory two-pass to skip inherited instances)
 - v2.1.5: B18 (per-event transient read error tolerance)
-- v2.1.6 (pending release): B22 (carry-on through 410/404 in classify-path delete)
-- v2.1.7 (pending release): B20 (revive cancelled mirror when source is syncable)
+- v2.1.6: B22 (carry on through 410/404 in classify deleteOrSkip)
+- v2.1.7: B20 (revive cancelled mirror when source is syncable) + repository docs (CLAUDE.md, next.md)
+- v2.1.8: B23 (drift signal field-disagreement detection)
+- v2.1.9 (pending): B19 (preserve post-write parent across recurring-handler errors) - committed and pushed; release-please will cut it shortly
 
 ## Current state
 
 ### Daemon
 
-Running on v2.1.5 (B18 in place; verified 435 transient skips today). Pair `work-personal` was failing every tick from B22's already-deleted-mirror 410, but the v2.1.6 fix is committed - waiting on release-please. After v2.1.7 cuts, run `brew upgrade calendar-sync && calendar-sync uninstall && calendar-sync install` to pick up both B22 and B20.
+Running on v2.1.7 via launchd at the time of writing (pid 17773, started 2026-05-04T19:44:11Z). When the next session starts:
+
+```bash
+brew update && brew upgrade calendar-sync && calendar-sync version
+calendar-sync uninstall && calendar-sync install
+calendar-sync status
+```
+
+This will pick up B19 (and B23 if you're not yet on v2.1.8 either).
 
 Two pairs in bidirectional sync at `horizon=365d`:
 
 - `work-personal`: source = `tsaleh@coreweave.com`, target = `me@tammersaleh.com`
 - `personal-to-work`: source = `me@tammersaleh.com`, target = `tsaleh@coreweave.com`
 
-Functional and idempotent on the steady-state path. **No data corruption risk.**
+Functional and idempotent on the steady-state path. **No data corruption risk.** B18's transient-read tolerance is firing 400+ times/day on a known flaky event (CoreWeave Orientation 404s) - working as designed.
+
+### Repo state
+
+`main` matches `origin/main`. No local commits stacked. Untracked files (`.claude/`, `doc/dry-run.err`, `download.html`) are stale and unrelated to this work; can be cleaned up or ignored.
 
 ### Recent live writes worth knowing about
 
-- B20 recovery: 5 Lunch & Reading mirror instances on work calendar (5/4-5/8) were stuck at status=cancelled with source confirmed. Manually patched all 5 to status=confirmed; daemon now sees them as `unchanged` (correctly). With v2.1.7 in place, future occurrences of this class of stuck-state will self-heal on the next tick.
-- 5/11 Lunch & Reading: source was at 11:30, mirror at 11:00. User confirmed 11am is correct. Patched source to 11:00; daemon reconciled successfully (`action: patch, reason: source_updated`).
-- Earlier: A B16 recurrence-propagate bug clobbered the personal `Lunch & Reading` parent (moved anchor from 2026-02-23 to 2026-05-20). Recovered manually. Source data is intact.
+- 5 Lunch & Reading mirror instances (5/4-5/8) were stuck at status=cancelled. Manually revived via direct gws patch; the daemon now sees them as `unchanged` (correctly). Once v2.1.7 is in place, future occurrences of this class of stuck-state will self-heal on the next tick (B20).
+- 5/11 Lunch & Reading: source patched to 11:00 to match the mirror's existing state per user preference; daemon reconciled cleanly via `action: patch, reason: source_updated`.
+- Earlier: B16 recurrence-propagate bug clobbered the personal Lunch & Reading parent (anchor moved 2026-02-23 → 2026-05-20). Recovered manually. Source data is intact.
 
-### Push state
+## NEXT TASK: build a true end-to-end testing system
 
-2 commits stacked locally on `main` waiting for SSH key reload:
+The user's explicit ask for the next session.
 
-- `bcaebce fix: revive cancelled mirror when source is syncable` (B20)
-- `a50a47f docs: queue B23 (drift signal blind spot) in backlog`
+### Why this matters
 
-Earlier B22 fix (`985ddc7`) already pushed.
+Five bugs shipped in this session (B18, B19, B20, B22, B23) - all caught only after they manifested in production. Unit tests with the fake-gws harness are fast but don't catch:
 
-## Backlog
+- Bugs that depend on Google's actual API semantics (e.g., does Google bump `updated` on a managed-field-no-op patch? does cascading a parent edit bump instance overrides' `updated`?).
+- Bugs that surface only with multi-tick state evolution against a real backend.
+- Cross-pair race conditions, concurrent edit handling, real recurrence projection behavior.
+- Latency-sensitive paths and real timeout behavior.
 
-### B23 - drift signal never compares source-now to mirror-now directly (CRITICAL, NEW)
+E2E tests against real Google Calendar would have caught most of B15/B16's bugs and at least the diagnosis path for B23.
 
-Surfaced during B20 investigation. The drift signal correctly answers "did either side change since the last write?" but never asks "are the two sides in sync right now?" Once stored bookkeeping locks into a state where both signals match, any subsequent divergence in managed fields is invisible. B20 is a specific symptom on the Status field. B23 is the structural fix: add a `fields_disagree` signal that compares `hash(source.managed)` to `hash(mirror.managed)` directly. SPEC-level change, requires Codex review on the four-way matrix expansion. Full design in `doc/bugs.md` Open.
+### Test calendars
 
-### B19 - stale inventory after partial recurring-instance repair-path failure
+The user has set up dedicated test calendars in their Google account:
 
-Pre-existing; B18 makes it observable. Spurious double-writes bounded by `full_sync_interval`. Small fix touching `recurring.Handler`'s Result/error contract. Full design in `doc/bugs.md` Open.
+- `calendar-sync-test-A`
+- `calendar-sync-test-B`
+- (potentially more: `-C`, `-D` if multi-pair scenarios are needed)
+
+These are real Google Calendars but isolated from any personal/work data. Tests can create, modify, and delete events freely.
+
+### Design constraints
+
+- **Real `gws` subprocess.** No fake harness. Uses the user's keyring credentials (already configured for the production daemon).
+- **Opt-in only.** Must NOT run during `mise run test` since:
+  1. Tests hit real Google API and burn quota
+  2. They require valid credentials (CI doesn't have them)
+  3. They have network dependency
+  4. They take orders of magnitude longer than unit tests
+
+  Recommended: Go build tag `//go:build e2e` and a `mise run test:e2e` task that explicitly enables it. Or a `--tags=e2e` flag to `go test`.
+
+- **Idempotent.** Each test cleans up after itself - delete every event it created, even on test failure. Use `t.Cleanup(...)` aggressively.
+
+- **Unique events.** Tests should timestamp event titles or use UUIDs so concurrent test runs don't collide. Same for the calendars themselves: a stale event from a prior run shouldn't cause a flake.
+
+- **Reasonable timeouts.** Real API calls take 100ms-2s each. A full E2E test suite of 20-30 scenarios shouldn't take more than a few minutes.
+
+### What to test (priority order)
+
+1. **Happy-path source-to-mirror sync.** Create source event, run sync, verify mirror exists with correct managed fields, correct extended properties, correct checksum.
+
+2. **Modify source, sync, verify mirror updated.** Patch path. Critical: verify `calendar-sync:source_updated` and `calendar-sync:checksum` get refreshed correctly (the data flow B23's drift-signal blind spot was about).
+
+3. **Delete source, sync, verify mirror deleted.** SPEC step 3 (cancelled).
+
+4. **Recurring parent + source-side instance override.** Verify the mirror has both the parent and the explicit instance override. Then verify modifying the source's instance override propagates to the mirror's instance.
+
+5. **B20 revive.** Create source, sync, manually patch mirror to status=cancelled, verify next sync revives it (`action: insert, reason: source_updated`). This is the test that would have caught the original 5/4-5/8 Lunch & Reading bug.
+
+6. **B23 stale-bookkeeping.** Trickier - need to construct the state where stored bookkeeping says clean but managed fields disagree. One approach: manually patch the mirror's `start` field via direct gws (NOT through calendar-sync), which bumps mirror.updated but doesn't recompute the stored checksum. Then run sync and verify the new `stale_bookkeeping` cell fires.
+
+7. **Bidirectional propagate.** With `propagate_target_edits=true`: edit mirror, run sync, verify source got patched.
+
+8. **Decline / tentative / transparency filtering.** Each one creates the mirror first, then changes source state, verifies the mirror is cancelled (B20-style) or skipped.
+
+9. **Outside-horizon.** Create source event past horizon, verify no mirror. Move it into horizon, verify mirror appears.
+
+10. **409 collision recovery.** Pre-create a mirror with the deterministic ID, then run sync. Verify it's detected and reconciled (or revived if cancelled).
+
+### What's hard or impossible to test E2E
+
+- **B18 transient read tolerance.** Hard to inject a 5xx from Google deliberately. Skip - rely on unit tests.
+- **B19 partial-repair-error.** Same - need a mid-flow API failure. Skip.
+- **B22 410-on-delete.** Could provoke by deleting the mirror externally between two ticks, but timing-dependent. Maybe leave to unit.
+- **Schema migration.** No way to write a v1 mirror via current code. Could be tested by manually constructing the extended properties via direct gws.
+
+### Architecture notes (for the implementer)
+
+- **Where to put the code.** Suggest `internal/e2e/` as a new test package, or a top-level `e2e/` directory. Keeps the build tag and the helpers grouped.
+- **Helper structure.** Need a `Setup` that resolves test calendar IDs (probably via gws + matching by summary), creates a config.toml pointing at them, starts the binary in `run --once` mode. Need `Teardown` that lists every event in test calendars and deletes them all.
+- **Run mode.** `calendar-sync run` (one-shot) is more amenable to test than `watch` (daemon). Tests should orchestrate: setup → events → run → assert → teardown.
+- **State assertions.** After running sync, query the calendar via gws directly and assert on event presence/absence, managed field values, extended properties, status, etc.
+- **Avoid the production daemon.** The production daemon must NOT be running against the test calendars (and shouldn't be configured to anyway, since they're separate calendar IDs). Explicit check at test setup that no daemon is running on the test config socket.
+
+### What this would have caught
+
+- B23's 5/11 11:30/11:00 mismatch: scenario "user manually edits mirror.start without bumping source.updated" hits the stale-bookkeeping cell. E2E test would have surfaced the divergence before production.
+- B20's stuck-cancelled mirrors: scenario "source flips transparent → opaque" leaves mirror cancelled forever. E2E test detects.
+- B16's parent-clobber: write a test that exercises the inherited-instance + propagate flow against real Google. The bug would have surfaced during the test setup, not at user runtime.
+
+## Other backlog (lower priority)
 
 ### B17 - target-syncToken for sub-tick target-edit propagation (`backlog/B17-target-syncToken.md`)
 
 Target-side edits propagate at FullSync rate (24h default) rather than tick rate (60s default). Architect's design + Codex's review of must-fix items already captured. Phase 1 covers ~80% of cases; Phase 2 needed for mirror-only-override propagation.
 
+This is independent of E2E testing but would benefit from it: target-edit propagation is exactly the kind of thing E2E tests catch.
+
 ### Codex full-codebase correctness review
 
-Queued for after B17/B19/B23 land. Catches anything the recent B15/B16/B18/B20/B22 fixes might have missed.
+Queued. Catches anything the recent B15/B16/B18/B19/B20/B22/B23 fixes might have missed. Probably worth running AFTER E2E testing infrastructure exists, so the review can include test coverage analysis.
 
-## Optional knob without backlog work
+### Cleanup
 
-`[settings].poll_interval = "15s"` and `[settings].full_sync_interval = "1h"` validate fine and have headroom. Reduces worst-case target-edit-propagation window from 24h to 1h without any code change.
+- `backlog/B18-per-event-error-tolerance.md` is stale (B18 shipped). Canonical doc lives in SPEC.md and `doc/bugs.md`. Safe to delete.
+- `backlog/B17-target-syncToken.md` is still relevant.
 
-## Repo state
-
-Local main: 2 commits ahead of origin (B20 + B23 docs). Backlog docs: `B17-target-syncToken.md` is the only relevant one - `B18-per-event-error-tolerance.md` can be deleted (B18 shipped; the canonical doc lives in SPEC.md and bugs.md).
-
-## What's NOT in scope right now
+## Out of scope
 
 - B3 (gws timeouts at 365d horizon) — workaround is `--timeout=30m` on `calendar-sync run`. Daemon doesn't hit this.
 - B5 (gws stderr leak into error messages) — cosmetic.
@@ -74,4 +157,4 @@ Local main: 2 commits ahead of origin (B20 + B23 docs). Backlog docs: `B17-targe
 
 ## When this file becomes useless
 
-When B17, B19, B23 ship, the Codex full review is clean, and the daemon has run a quiet week (no back-to-back FullSyncs, no stuck-cancelled-mirror anomalies, no propagate-related anomalies), delete this file. Everything in here will be normal then.
+When the E2E test system is in place, B17 ships, and the daemon has run a quiet week, delete this file. The fix history will live in `doc/bugs.md`; design context in `SPEC.md` and `CLAUDE.md`.

@@ -2,6 +2,16 @@
 
 Handoff for the next session. Read this first, then `SPEC.md`, then `CLAUDE.md`.
 
+## E2E test system landed (this session)
+
+The full E2E suite is in place at `internal/e2e/` (build tag `e2e`). 12 scenarios across happy-path, modify, delete, transparency-filter, outside-horizon, 409 collision, B20 revive, recurring parent + instance override, instance override propagation, B23 stale-bookkeeping, target-edit propagate, and watch-mode tick. Run with `mise run test:e2e`. Wall-clock ~160s against real Google Calendar.
+
+The harness auto-creates and tears down its fixture calendars by name (`calendar-sync-e2e-source` / `-target`) so anyone with `gws auth` can clone and run. `mise run check` (the pre-push gate) is unaffected; default `go test ./...` doesn't see the package.
+
+One scenario was deliberately dropped from the original plan: `TestE2E_Declined_NoMirror`. Google's API doesn't echo back `self: true` on attendees for events authored against a group calendar where the auth user is the data owner, so the harness can't construct an event the production classifier would identify as source-owner-declined. SPEC's declined / tentative paths are unit-tested in `internal/sync/classify_test.go` with synthetic events.
+
+See `doc/e2e-design.md` for the architecture rationale.
+
 ## Version history
 
 - v2.0.0: per-pair config scoping, `direction` field removed (BREAKING)
@@ -47,100 +57,15 @@ Functional and idempotent on the steady-state path. **No data corruption risk.**
 - 5/11 Lunch & Reading: source patched to 11:00 to match the mirror's existing state per user preference; daemon reconciled cleanly via `action: patch, reason: source_updated`.
 - Earlier: B16 recurrence-propagate bug clobbered the personal Lunch & Reading parent (anchor moved 2026-02-23 → 2026-05-20). Recovered manually. Source data is intact.
 
-## NEXT TASK: build a true end-to-end testing system
+## NEXT TASK: F1 + F2
 
-The user's explicit ask for the next session.
-
-### Why this matters
-
-Five bugs shipped in this session (B18, B19, B20, B22, B23) - all caught only after they manifested in production. Unit tests with the fake-gws harness are fast but don't catch:
-
-- Bugs that depend on Google's actual API semantics (e.g., does Google bump `updated` on a managed-field-no-op patch? does cascading a parent edit bump instance overrides' `updated`?).
-- Bugs that surface only with multi-tick state evolution against a real backend.
-- Cross-pair race conditions, concurrent edit handling, real recurrence projection behavior.
-- Latency-sensitive paths and real timeout behavior.
-
-E2E tests against real Google Calendar would have caught most of B15/B16's bugs and at least the diagnosis path for B23.
-
-### Test calendars
-
-The user has set up dedicated test calendars in their Google account:
-
-- `calendar-sync-test-A`
-- `calendar-sync-test-B`
-- (potentially more: `-C`, `-D` if multi-pair scenarios are needed)
-
-These are real Google Calendars but isolated from any personal/work data. Tests can create, modify, and delete events freely.
-
-### Design constraints
-
-- **Real `gws` subprocess.** No fake harness. Uses the user's keyring credentials (already configured for the production daemon).
-- **Opt-in only.** Must NOT run during `mise run test` since:
-  1. Tests hit real Google API and burn quota
-  2. They require valid credentials (CI doesn't have them)
-  3. They have network dependency
-  4. They take orders of magnitude longer than unit tests
-
-  Recommended: Go build tag `//go:build e2e` and a `mise run test:e2e` task that explicitly enables it. Or a `--tags=e2e` flag to `go test`.
-
-- **Idempotent.** Each test cleans up after itself - delete every event it created, even on test failure. Use `t.Cleanup(...)` aggressively.
-
-- **Unique events.** Tests should timestamp event titles or use UUIDs so concurrent test runs don't collide. Same for the calendars themselves: a stale event from a prior run shouldn't cause a flake.
-
-- **Reasonable timeouts.** Real API calls take 100ms-2s each. A full E2E test suite of 20-30 scenarios shouldn't take more than a few minutes.
-
-### What to test (priority order)
-
-1. **Happy-path source-to-mirror sync.** Create source event, run sync, verify mirror exists with correct managed fields, correct extended properties, correct checksum.
-
-2. **Modify source, sync, verify mirror updated.** Patch path. Critical: verify `calendar-sync:source_updated` and `calendar-sync:checksum` get refreshed correctly (the data flow B23's drift-signal blind spot was about).
-
-3. **Delete source, sync, verify mirror deleted.** SPEC step 3 (cancelled).
-
-4. **Recurring parent + source-side instance override.** Verify the mirror has both the parent and the explicit instance override. Then verify modifying the source's instance override propagates to the mirror's instance.
-
-5. **B20 revive.** Create source, sync, manually patch mirror to status=cancelled, verify next sync revives it (`action: insert, reason: source_updated`). This is the test that would have caught the original 5/4-5/8 Lunch & Reading bug.
-
-6. **B23 stale-bookkeeping.** Trickier - need to construct the state where stored bookkeeping says clean but managed fields disagree. One approach: manually patch the mirror's `start` field via direct gws (NOT through calendar-sync), which bumps mirror.updated but doesn't recompute the stored checksum. Then run sync and verify the new `stale_bookkeeping` cell fires.
-
-7. **Bidirectional propagate.** With `propagate_target_edits=true`: edit mirror, run sync, verify source got patched.
-
-8. **Decline / tentative / transparency filtering.** Each one creates the mirror first, then changes source state, verifies the mirror is cancelled (B20-style) or skipped.
-
-9. **Outside-horizon.** Create source event past horizon, verify no mirror. Move it into horizon, verify mirror appears.
-
-10. **409 collision recovery.** Pre-create a mirror with the deterministic ID, then run sync. Verify it's detected and reconciled (or revived if cancelled).
-
-### What's hard or impossible to test E2E
-
-- **B18 transient read tolerance.** Hard to inject a 5xx from Google deliberately. Skip - rely on unit tests.
-- **B19 partial-repair-error.** Same - need a mid-flow API failure. Skip.
-- **B22 410-on-delete.** Could provoke by deleting the mirror externally between two ticks, but timing-dependent. Maybe leave to unit.
-- **Schema migration.** No way to write a v1 mirror via current code. Could be tested by manually constructing the extended properties via direct gws.
-
-### Architecture notes (for the implementer)
-
-- **Where to put the code.** Suggest `internal/e2e/` as a new test package, or a top-level `e2e/` directory. Keeps the build tag and the helpers grouped.
-- **Helper structure.** Need a `Setup` that resolves test calendar IDs (probably via gws + matching by summary), creates a config.toml pointing at them, starts the binary in `run --once` mode. Need `Teardown` that lists every event in test calendars and deletes them all.
-- **Run mode.** `calendar-sync run` (one-shot) is more amenable to test than `watch` (daemon). Tests should orchestrate: setup → events → run → assert → teardown.
-- **State assertions.** After running sync, query the calendar via gws directly and assert on event presence/absence, managed field values, extended properties, status, etc.
-- **Avoid the production daemon.** The production daemon must NOT be running against the test calendars (and shouldn't be configured to anyway, since they're separate calendar IDs). Explicit check at test setup that no daemon is running on the test config socket.
-
-### What this would have caught
-
-- B23's 5/11 11:30/11:00 mismatch: scenario "user manually edits mirror.start without bumping source.updated" hits the stale-bookkeeping cell. E2E test would have surfaced the divergence before production.
-- B20's stuck-cancelled mirrors: scenario "source flips transparent → opaque" leaves mirror cancelled forever. E2E test detects.
-- B16's parent-clobber: write a test that exercises the inherited-instance + propagate flow against real Google. The bug would have surfaced during the test setup, not at user runtime.
-
-## Queued AFTER the E2E system lands
-
-Two features the user wants the next session to tackle as soon as the E2E test infrastructure is in place. Both benefit hugely from being able to assert behavior against real Google calendars.
+Two features queued for after E2E. Both benefit from the harness now in place - new scenarios go in `internal/e2e/`. The E2E harness already added `gws.CalendarListList` (which F1 needs) and `gws.WithWorkDir` (which F2's stale-binary detection might want), so the gws layer is already partly there.
 
 ### F1 - Sync non-primary calendars (the user has more than one calendar per email)
 
-Today the config's `[[calendars]]` block effectively addresses **only the primary calendar** for a given Google account. The resolution path in `internal/config/canonicalize.go` calls `gws calendar calendarList get` and matches by email - which returns the primary. There's no way to say "sync the calendar named TripIt under tsaleh@coreweave.com" or "sync the secondary calendar with id `c_abc123@group.calendar.google.com`."
+Today: passing a group calendar ID (`c_<hash>@group.calendar.google.com`) directly in `source` / `target` works - `internal/config/canonicalize.go` passes the literal string to `gws calendar calendarList get` and Google resolves it. The E2E harness exercises this path. What's NOT supported is calling out a calendar by display summary; the user has to look up the cryptic ID themselves.
 
-The user wants to be able to sync any calendar visible in `gws calendar calendarList get` output, not just the primary.
+The user wants to be able to sync any calendar visible in `gws calendar calendarList list` output by name.
 
 #### Design surface
 

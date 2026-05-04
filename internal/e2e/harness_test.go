@@ -368,6 +368,15 @@ func (res RunResult) AssertNoOutcomeForSource(t *testing.T, sourceEventID string
 // Use this when a single source event should produce multiple
 // outcomes (e.g. a recurring source produces one parent outcome + one
 // per instance override) and you want to pin the full set.
+//
+// Caller contract: matchers are claimed greedily in the order given,
+// each matcher to the first unclaimed matching outcome. If two
+// matchers can both match the same outcome but one is more specific,
+// list the more specific matcher first - otherwise the broader matcher
+// will steal the outcome and the specific one will fail to match. For
+// the current scenario set this isn't a concern (matchers are pinned
+// by distinct (action, reason) pairs); document the contract so a
+// future caller using overlapping matchers gets a predictable result.
 func (res RunResult) AssertOutcomesForSource(t *testing.T, sourceEventID string, want []OutcomeMatch) {
 	t.Helper()
 	var got []Outcome

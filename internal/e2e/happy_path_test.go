@@ -192,15 +192,12 @@ func TestE2E_SourceModified_PatchMirror(t *testing.T) {
 
 	res2 := h.Run(ctx)
 	res2.AssertSuccess(t)
-	patchOut := res2.AssertOutcome(t, OutcomeMatch{
+	res2.AssertOutcome(t, OutcomeMatch{
 		Action:      string(mirror.ActionPatch),
 		Reason:      string(mirror.ReasonSourceUpdated),
 		SourceEvent: source.ID,
 		TargetEvent: mirrorID,
 	})
-	if patchOut.TargetEvent != mirrorID {
-		t.Errorf("patch outcome target_event = %q, want %q", patchOut.TargetEvent, mirrorID)
-	}
 
 	postMirror, err := h.GWS.EventsGet(ctx, h.TargetCalID, mirrorID)
 	if err != nil {

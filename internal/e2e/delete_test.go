@@ -62,15 +62,12 @@ func TestE2E_SourceDeleted_DeleteMirror(t *testing.T) {
 	// sync.ReasonSourceCancelled). Pinning the literal SPEC string here
 	// keeps the e2e package free of implementation-layer imports - the
 	// wire shape is the contract.
-	deleteOut := res2.AssertOutcome(t, OutcomeMatch{
+	res2.AssertOutcome(t, OutcomeMatch{
 		Action:      string(mirror.ActionDelete),
 		Reason:      reasonSourceCancelled,
 		SourceEvent: source.ID,
 		TargetEvent: mirrorID,
 	})
-	if deleteOut.TargetEvent != mirrorID {
-		t.Errorf("delete outcome target_event = %q, want %q", deleteOut.TargetEvent, mirrorID)
-	}
 
 	// Confirm the mirror is now cancelled. events.get on a cancelled
 	// event commonly 410s; fall back to a showDeleted-true list and
@@ -94,8 +91,15 @@ func TestE2E_SourceDeleted_DeleteMirror(t *testing.T) {
 // resource.
 func findTombstone(t *testing.T, h *Harness, ctx context.Context, eventID string) *gws.Event {
 	t.Helper()
+	// TimeMin one week in the past covers tombstones for the test
+	// suite's events, which are always future-dated via futureDateTime.
+	// Without TimeMin, Calendar API defaults the lower bound near "now"
+	// for dateTime events; a future-test that ever uses past dates
+	// would silently miss tombstones here.
+	timeMin := time.Now().UTC().Add(-7 * 24 * time.Hour).Format(time.RFC3339)
 	events, _, err := h.GWS.EventsList(ctx, gws.EventsListParams{
 		CalendarID:  h.TargetCalID,
+		TimeMin:     timeMin,
 		ShowDeleted: true,
 		MaxResults:  2500,
 	})

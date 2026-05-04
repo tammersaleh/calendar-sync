@@ -10,24 +10,24 @@ import (
 	"github.com/tammersaleh/calendar-sync/internal/gws"
 )
 
-// wipeCalendar removes every event on calendarID, both alive and
-// tombstoned. The tombstone case matters: calendar-sync's source list
-// passes `ShowDeleted=true` and treats `status=cancelled` events as
-// classification inputs (they fire `skip(cancelled)` outcomes). A wipe
-// that ignored tombstones would let test A's deleted event leak into
-// test B's run output as `skip(cancelled)`, contaminating outcome
-// assertions and growing wall-clock as the calendar accumulates dead
-// history.
+// wipeCalendar moves every alive event on calendarID to cancelled.
+// Already-cancelled events are skipped (a redundant delete would 410).
+// 404/410 from the delete (the event vanished between list and delete -
+// common when a recurring parent's delete cascades through its
+// instances) is treated as already-deleted.
 //
-// Already-cancelled events come back from EventsList with
-// status=cancelled; they're skipped because they're already in the
-// state we want and a redundant delete would 410. A 410 Gone or 404
-// Not Found on delete (the event vanished between list and delete -
-// common when a recurring parent's delete cascades during the loop)
-// is treated as already-deleted.
+// Wholesale because the harness owns the entire calendar.
 //
-// Wholesale because the harness owns the entire calendar; no need to
-// be surgical.
+// Important: this DOES NOT remove tombstones. Calendar API retains
+// cancelled events for a window (typically ~30 days) and surfaces them
+// on `EventsList(ShowDeleted=true)`, which is what calendar-sync's
+// source list uses. So test A's deleted source event continues to
+// appear in test B's run output as `skip(cancelled)`.
+//
+// Tests must filter outcome assertions by SourceEvent ID
+// (OutcomeMatch.SourceEvent or AssertNoOutcomeForSource) to ignore
+// tombstones from prior tests. Asserting total outcome counts or
+// `_meta.skips` would false-fail as the calendar accumulates history.
 func wipeCalendar(ctx context.Context, c *gws.Client, calendarID string) error {
 	events, _, err := c.EventsList(ctx, gws.EventsListParams{
 		CalendarID:  calendarID,

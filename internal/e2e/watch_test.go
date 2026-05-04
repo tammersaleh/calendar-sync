@@ -30,7 +30,13 @@ import (
 // cycle costs ~30s of wall-clock plus startup overhead.
 func TestE2E_Watch_TickPropagatesSourceEdit(t *testing.T) {
 	h := Setup(t, SetupOptions{})
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	// 240s outer budget covers: ~5s daemon startup + up to 60s startup
+	// outcome wait + a few EventsGet/Patch round trips + up to 60s tick
+	// outcome wait + 10s graceful SIGTERM. Per-call timeouts inside
+	// waitForOutcome cap individual blocking points; this outer ctx is
+	// only a safety net for the test's API operations and does NOT
+	// govern the watch subprocess (see startWatch comment).
+	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
 	defer cancel()
 
 	// Insert source BEFORE starting the daemon so the startup FullSync
@@ -44,7 +50,7 @@ func TestE2E_Watch_TickPropagatesSourceEdit(t *testing.T) {
 		End:     futureDateTime(1 * time.Hour),
 	})
 
-	w := startWatch(t, ctx, h)
+	w := startWatch(t, h)
 
 	// Startup FullSync: expect the insert outcome filtered to our source.
 	insertOut := w.waitForOutcome(t, 60*time.Second, func(o Outcome) bool {
@@ -110,15 +116,31 @@ type watchProc struct {
 	// goroutine reads.
 	stderrMu  sync.Mutex
 	stderrBuf bytes.Buffer
+
+	// shutdown ensures the SIGTERM-then-SIGKILL-then-Wait sequence runs
+	// exactly once. Both stop() (the test's explicit shutdown) and the
+	// t.Cleanup safety net dispatch through it; the Once collapses
+	// duplicate calls so we don't double-Wait or signal a dead process.
+	shutdownOnce sync.Once
+	shutdownErr  error
 }
 
 // startWatch launches `calendar-sync watch --config <h.ConfigPath>` from
 // h.Sandbox so any stray writes (e.g. a `download.html` from a gws
 // subprocess) land inside the per-test sandbox. Registers a t.Cleanup
-// that SIGKILLs the process if the test forgot to call stop().
-func startWatch(t *testing.T, ctx context.Context, h *Harness) *watchProc {
+// that runs the unified shutdown so the child is always reaped, even
+// on a test panic or early-return path.
+//
+// Note: the subprocess is NOT bound to ctx via exec.CommandContext.
+// ctx governs the TEST's API calls (which have their own per-call
+// timeouts); the daemon subprocess's lifetime is owned by watchProc.
+// Binding to ctx would let an outer-test-context expiry kill the
+// subprocess via SIGKILL, defeating the graceful-shutdown assertion
+// in stop(). The cleanup safety net guarantees the child cannot
+// outlive the test regardless.
+func startWatch(t *testing.T, h *Harness) *watchProc {
 	t.Helper()
-	cmd := exec.CommandContext(ctx, h.Binary, "watch", "--config", h.ConfigPath)
+	cmd := exec.Command(h.Binary, "watch", "--config", h.ConfigPath)
 	cmd.Dir = h.Sandbox
 
 	stdout, err := cmd.StdoutPipe()
@@ -181,13 +203,11 @@ func startWatch(t *testing.T, ctx context.Context, h *Harness) *watchProc {
 		}
 	}()
 
-	// Belt-and-suspenders cleanup: if the test panics or returns without
-	// calling stop, kill the process so it doesn't outlive the test.
-	t.Cleanup(func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-	})
+	// Belt-and-suspenders cleanup. If the test panics or returns
+	// without calling stop(), the unified shutdown still runs and
+	// reaps the child. The Once collapses double-shutdown when stop()
+	// also fires.
+	t.Cleanup(func() { w.shutdown(false, nil) })
 
 	return w
 }
@@ -220,33 +240,57 @@ func (w *watchProc) waitForOutcome(t *testing.T, timeout time.Duration, predicat
 }
 
 // stop sends SIGTERM and waits up to 10s for the daemon to exit cleanly.
-// SPEC §"IPC socket" daemon-side: SIGTERM unbinds the socket and returns.
-// A wedged daemon fails the test rather than leaking the process.
+// SPEC §"IPC socket" daemon-side: SIGTERM unbinds the socket and
+// returns. A wedged daemon fails the test rather than leaking the
+// process. Routes through shutdown so the cleanup safety net is a
+// no-op once stop() succeeds.
 func (w *watchProc) stop(t *testing.T) {
 	t.Helper()
-	if err := w.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatalf("send SIGTERM to watch: %v", err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- w.cmd.Wait() }()
-	select {
-	case err := <-done:
-		// Exit codes from a SIGTERM-killed Go process: 0 (signal handled
-		// cleanly via signal.NotifyContext) is what the daemon does.
-		// Anything else is a clean shutdown failure.
-		if err != nil {
+	w.shutdown(true, t)
+}
+
+// shutdown is the unified subprocess teardown: SIGTERM, wait up to 10s,
+// SIGKILL if needed, always Wait() so the child is reaped. Idempotent
+// via sync.Once.
+//
+// expectClean=true means the caller (stop) requires a zero-exit clean
+// shutdown; failure fatals on t. expectClean=false (cleanup safety
+// net) means the caller doesn't care about the exit status, just
+// wants the child reaped.
+func (w *watchProc) shutdown(expectClean bool, t *testing.T) {
+	w.shutdownOnce.Do(func() {
+		if w.cmd.Process == nil {
+			return
+		}
+		// SIGTERM. signal.NotifyContext in the daemon translates this
+		// into a context cancellation that returns nil from Run.
+		_ = w.cmd.Process.Signal(syscall.SIGTERM)
+
+		done := make(chan error, 1)
+		go func() { done <- w.cmd.Wait() }()
+
+		select {
+		case w.shutdownErr = <-done:
+		case <-time.After(10 * time.Second):
+			_ = w.cmd.Process.Kill()
+			w.shutdownErr = <-done
+			if expectClean && t != nil {
+				t.Helper()
+				t.Fatal("watch did not exit within 10s of SIGTERM")
+			}
+			return
+		}
+
+		if expectClean && t != nil && w.shutdownErr != nil {
+			t.Helper()
 			var ee *exec.ExitError
-			if errors.As(err, &ee) {
+			if errors.As(w.shutdownErr, &ee) {
 				w.stderrMu.Lock()
 				stderr := w.stderrBuf.String()
 				w.stderrMu.Unlock()
 				t.Fatalf("watch exited %d; stderr:\n%s", ee.ExitCode(), stderr)
 			}
-			t.Fatalf("watch wait: %v", err)
+			t.Fatalf("watch wait: %v", w.shutdownErr)
 		}
-	case <-time.After(10 * time.Second):
-		_ = w.cmd.Process.Kill()
-		<-done
-		t.Fatal("watch did not exit within 10s of SIGTERM")
-	}
+	})
 }

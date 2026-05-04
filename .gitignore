@@ -28,3 +28,7 @@ CLAUDE.local.md
 state.json
 state.json.lock
 .crit/
+
+# Local mise config (per-machine env vars, e.g. E2E test calendar IDs)
+.mise.local.toml
+mise.local.toml

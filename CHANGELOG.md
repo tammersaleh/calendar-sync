@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.7](https://github.com/tammersaleh/calendar-sync/compare/v2.1.6...v2.1.7) (2026-05-04)
+
+
+### Bug Fixes
+
+* revive cancelled mirror when source is syncable ([433b0b4](https://github.com/tammersaleh/calendar-sync/commit/433b0b4a712b277411733902dc8d0d37a06ef2c2))
+
 ## [2.1.6](https://github.com/tammersaleh/calendar-sync/compare/v2.1.5...v2.1.6) (2026-05-04)
 
 

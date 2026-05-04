@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.9](https://github.com/tammersaleh/calendar-sync/compare/v2.1.8...v2.1.9) (2026-05-04)
+
+
+### Bug Fixes
+
+* preserve post-write mirror parent across recurring-handler errors ([3f4a28f](https://github.com/tammersaleh/calendar-sync/commit/3f4a28fec32d36b6717a0e1e4b1a1860bad47766))
+
 ## [2.1.8](https://github.com/tammersaleh/calendar-sync/compare/v2.1.7...v2.1.8) (2026-05-04)
 
 

@@ -254,8 +254,17 @@ func (c *Classifier) deleteOrSkip(ctx context.Context, source *gws.Event, foundR
 		return nil
 	}
 
+	// HTTP 404 / 410 on events.delete mean "the mirror is already gone
+	// server-side" - the operation's user-facing intent (mirror absent) is
+	// satisfied. Carry on with inventory cleanup and the delete outcome
+	// rather than failing the pdir. Mirrors the orphan walker's B14 fix
+	// in internal/sync/orphan.go:358; both code paths face the same
+	// already-deleted-mirror shape (cascade from a parent delete, a
+	// concurrent delete from another tool, etc.).
 	if err := c.API.EventsDelete(ctx, c.TargetCalendarID, mirrorEvent.ID); err != nil {
-		return fmt.Errorf("delete mirror %s/%s: %w", c.TargetCalendarID, mirrorEvent.ID, err)
+		if !errors.Is(err, gws.ErrAPINotFound) && !errors.Is(err, gws.ErrAPIGone) {
+			return fmt.Errorf("delete mirror %s/%s: %w", c.TargetCalendarID, mirrorEvent.ID, err)
+		}
 	}
 	c.Inventory.Delete(tuple)
 

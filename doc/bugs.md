@@ -110,6 +110,20 @@ Fix sketch: switch to `html/template` (handles XML-class escaping for content), 
 
 ## Fixed
 
+### B22 - HTTP 410/404 on classify-path events.delete fails the pdir every tick
+
+Surfaced 2026-05-04 during B18 monitoring. The work-personal pair was failing every tick with:
+
+```
+delete mirror me@tammersaleh.com/cs23qvnk...: api_gone during events.delete (HTTP 410): Resource has been deleted
+```
+
+Root cause: `internal/sync/classify.go`'s `deleteOrSkip` issues `events.delete` against a mirror that was already deleted server-side - typically a cascade from a parent delete, a user-side manual delete that the daemon hadn't yet observed, or a mirror that was tombstoned by a prior cleanup. Calendar API returns HTTP 410 (`api_gone`) or HTTP 404 (`api_not_found`) for these. The classify path bubbled both up as fatal errors, failing the pdir, gating the source's syncToken, and (with B18 in place) producing a steady stream of failed ticks rather than a fast-track FullSync loop.
+
+This is the same bug shape as B14 - which fixed the orphan walker's `events.delete` to carry on for both 404 and 410 - but the classify path's `deleteOrSkip` was never updated. SPEC's intent for the delete-or-skip cells (source_cancelled / declined / tentative / transparency_transparent / outside_horizon) is "the mirror should not exist after this operation"; if the mirror is already gone, the intent is satisfied.
+
+Fixed by mirroring B14's pattern in `classify.go:257`: catch `gws.ErrAPINotFound` and `gws.ErrAPIGone` from `EventsDelete`, prune the inventory entry, emit the standard delete Outcome. Test pin: `TestClassify_DeleteOrSkip_AlreadyGoneCarriesOn` (parameterized over both error shapes). Verified pre-fix the test fails with the exact error string the live daemon was logging.
+
 ### B18 - one flaky source event pins the syncToken, daemon falls into back-to-back FullSyncs
 
 A single recurring source event (TARS Office Hours) intermittently failed its horizon-eligibility lookup with HTTP 500 from `events.get`. Each tick: classify errored on that event, the pdir was marked failed, the conditional-advancement gate kept the source's syncToken pinned, the next tick saw an empty token and triggered `NeedsFullResync`, the scheduler ran a fast-track ~24-minute FullSync, the FullSync re-hit the same flake. The daemon ran 4 back-to-back FullSyncs in ~50 minutes with zero writes and zero data risk - just CPU and quota burn.

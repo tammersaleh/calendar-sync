@@ -510,6 +510,100 @@ func TestClassify_Step3_Cancelled_DeleteWhenMirrorPresent(t *testing.T) {
 	}
 }
 
+// TestClassify_DeleteOrSkip_AlreadyGoneCarriesOn pins B22: an
+// events.delete on a mirror that's already deleted server-side returns
+// HTTP 410 (api_gone) or HTTP 404 (api_not_found) per Calendar API
+// semantics. Both shapes mean "the operation's intent is already
+// satisfied" and must be treated as success - matching the orphan
+// walker's B14 fix at internal/sync/orphan.go:358.
+//
+// Without this, every tick where a source-cancelled (or declined /
+// tentative / transparent / outside-horizon) event maps to an
+// already-deleted mirror fails the pdir, gates token advancement, and
+// drives the daemon into back-to-back FullSyncs. Live-observed against
+// the work-personal pair where one mirror in inventory had already been
+// deleted on the target calendar (likely by a prior cascade).
+//
+// SPEC's deleteOrSkip semantics: if the source is no longer eligible
+// AND a mirror exists in inventory, delete it. If the deletion is a
+// no-op because the mirror is already gone, the inventory must still be
+// pruned and the Outcome must still emit so the caller sees a clean
+// pdir result.
+func TestClassify_DeleteOrSkip_AlreadyGoneCarriesOn(t *testing.T) {
+	// deleteOrSkip is the shared handler for SPEC steps 3-7 (source_cancelled,
+	// declined, tentative, transparency_transparent, outside_horizon). The
+	// fix lives in the shared function so all five paths benefit, but the
+	// test exercises a representative subset of cells × both error codes
+	// to pin that the carry-on truly is shared and not specific to one cell.
+	cells := []struct {
+		name       string
+		mutateSrc  func(*gws.Event)
+		wantReason mirror.Reason
+	}{
+		{
+			name: "source_cancelled",
+			mutateSrc: func(e *gws.Event) {
+				e.Status = gws.EventStatusCancelled
+			},
+			wantReason: ReasonSourceCancelled,
+		},
+		{
+			name: "transparency_transparent",
+			mutateSrc: func(e *gws.Event) {
+				e.Transparency = gws.TransparencyTransparent
+			},
+			wantReason: ReasonTransparencyTransparent,
+		},
+		{
+			name: "declined",
+			mutateSrc: func(e *gws.Event) {
+				e.Attendees = []gws.Attendee{{Self: true, ResponseStatus: gws.ResponseStatusDeclined}}
+			},
+			wantReason: ReasonDeclined,
+		},
+	}
+	errs := []struct {
+		name string
+		err  error
+	}{
+		{name: "410_gone", err: &gws.Error{Code: gws.CodeAPIGone, ExitCode: 1, Op: "events.delete"}},
+		{name: "404_not_found", err: &gws.Error{Code: gws.CodeAPINotFound, ExitCode: 1, Op: "events.delete"}},
+	}
+	for _, cell := range cells {
+		for _, e := range errs {
+			t.Run(cell.name+"/"+e.name, func(t *testing.T) {
+				api := newStubAPI()
+				inv := NewInventory("tgt-cal")
+				sink, captured := captureOutputs()
+
+				source := makeNonRecurringSource("src-evt", "2026-04-29T20:00:00Z", &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"})
+				cell.mutateSrc(source)
+
+				mirrorEv := makeCleanCurrentMirror("mi-1", "src-cal:src-evt",
+					"2026-04-29T20:00:00Z", "2026-04-29T20:00:00Z",
+					"Standup", source.Start, source.End)
+				tuple := mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt"}
+				inv.Set(tuple, mirrorEv)
+
+				api.deleteErrors = append(api.deleteErrors, e.err)
+
+				c := newClassifier(t, api, inv, sink, classifyOptions{sourceWritable: true})
+				if err := c.Classify(context.Background(), source); err != nil {
+					t.Fatalf("Classify must NOT fail on already-gone mirror; got %v", err)
+				}
+				got := firstOutcome(t, *captured)
+				if got.Action != mirror.ActionDelete || got.Reason != cell.wantReason {
+					t.Errorf("outcome = %s/%s, want delete/%s",
+						got.Action, got.Reason, cell.wantReason)
+				}
+				if _, ok := inv.Lookup(tuple); ok {
+					t.Errorf("inventory must be pruned even when delete returned %s", e.name)
+				}
+			})
+		}
+	}
+}
+
 func TestClassify_Step3_Cancelled_SkipWhenNoMirror(t *testing.T) {
 	api := newStubAPI()
 	inv := NewInventory("tgt-cal")

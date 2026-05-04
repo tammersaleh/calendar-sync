@@ -17,6 +17,11 @@ calendar-sync skill > ~/.claude/skills/calendar-sync/SKILL.md
 description = "Run all tests"
 run = "go test ./..."
 
+[tasks."test:e2e"]
+description = "Run E2E tests against real Google Calendar (slow, requires gws auth)"
+run = "go test -tags=e2e -timeout=15m -count=1 ./internal/e2e/..."
+env = { CALENDAR_SYNC_E2E = "1" }
+
 [tasks.lint]
 description = "Run golangci-lint"
 run = "golangci-lint run ./..."

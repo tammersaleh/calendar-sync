@@ -132,6 +132,132 @@ These are real Google Calendars but isolated from any personal/work data. Tests 
 - B20's stuck-cancelled mirrors: scenario "source flips transparent → opaque" leaves mirror cancelled forever. E2E test detects.
 - B16's parent-clobber: write a test that exercises the inherited-instance + propagate flow against real Google. The bug would have surfaced during the test setup, not at user runtime.
 
+## Queued AFTER the E2E system lands
+
+Two features the user wants the next session to tackle as soon as the E2E test infrastructure is in place. Both benefit hugely from being able to assert behavior against real Google calendars.
+
+### F1 - Sync non-primary calendars (the user has more than one calendar per email)
+
+Today the config's `[[calendars]]` block effectively addresses **only the primary calendar** for a given Google account. The resolution path in `internal/config/canonicalize.go` calls `gws calendar calendarList get` and matches by email - which returns the primary. There's no way to say "sync the calendar named TripIt under tsaleh@coreweave.com" or "sync the secondary calendar with id `c_abc123@group.calendar.google.com`."
+
+The user wants to be able to sync any calendar visible in `gws calendar calendarList get` output, not just the primary.
+
+#### Design surface
+
+Two reasonable shapes for the config:
+
+**Option A: explicit calendar ID.** TOML carries the canonical Google Calendar ID directly:
+
+```toml
+[[calendars]]
+name = "tripit"
+id = "c_abc123def@group.calendar.google.com"
+```
+
+Pros: unambiguous, no resolution step needed.
+Cons: user has to look up the cryptic ID. Most calendars don't have human-readable IDs.
+
+**Option B: name-based lookup within an account.** TOML names a calendar by its display summary, optionally scoped to an account email:
+
+```toml
+[[calendars]]
+name = "tripit"
+account = "tsaleh@coreweave.com"
+summary = "TripIt"
+```
+
+The canonicalize step calls `calendarList` for the account and finds the entry whose `summary` matches. Errors if zero or multiple match.
+
+Pros: human-friendly. Cons: brittle if user renames calendars; ambiguous if duplicate summaries.
+
+**Option C: hybrid.** Accept either an `id` (preferred) or a `summary` lookup with `account`. Validation rejects providing both.
+
+The user's preference matters here - ask them which they prefer, or implement Option C and let usage decide.
+
+#### Required changes (rough sketch)
+
+- `internal/config/types.go`: extend `Calendar` struct with optional `ID` / `Summary` / `Account` fields. Today it's just `Email string`.
+- `internal/config/canonicalize.go`: `resolveCalendar` updated to handle the new shapes. Today it resolves email → primary calendar ID via `CalendarList.Get(email)`. Need a new path that lists all calendars for the user and picks the one matching the supplied id/summary.
+- `internal/gws/calendarlist.go`: may need a `CalendarListList()` method (returns the full list) since today only `CalendarListGet(id)` exists.
+- `SPEC.md` §"Calendars and pdirs": document the new fields.
+- E2E test: create a non-primary calendar via gws, configure it, run sync, verify mirror lands on the right target.
+- Backwards compatibility: the existing `email = "..."` form must keep working unchanged. Adding `id` or `summary` is additive.
+
+#### Watch out for
+
+- **Read-only special calendars.** Google has built-in subscribed calendars (holidays, birthdays, weather, sports). They show up in calendarList but are read-only. The existing accessRole check in `config.AccessRoleAtLeast` should handle this, but verify.
+- **Subscribed calendars from other accounts.** A calendar can be shared with you but owned by someone else. accessRole tells you what you can do with it, but the calendar's `id` is opaque (`<owner>:<calendar_id>` shape). Make sure the resolution is consistent.
+- **TripIt-style read-only feeds.** Likely the canonical use case: TripIt publishes a public iCal feed which you've subscribed to. The resulting calendar is read-only, so calendar-sync can only mirror FROM it (one-way), not propagate edits. The existing `propagate_target_edits` gate should handle this naturally.
+
+### F2 - Single-command upgrade via `brew upgrade calendar-sync`
+
+Today the upgrade dance is:
+
+```bash
+brew upgrade calendar-sync   # binary updated at /opt/homebrew/bin/calendar-sync
+calendar-sync uninstall      # removes plist + unloads from launchd
+calendar-sync install        # installs new plist + loads new daemon
+```
+
+Steps 2-3 are necessary because launchd does NOT restart the daemon when the binary file is replaced. The running pid keeps executing the old binary code (cached by the kernel via mmap, even though the on-disk file is replaced).
+
+The user wants `brew upgrade calendar-sync` to "just work" - bouncing the daemon automatically.
+
+#### The mechanism: cask postflight hook
+
+Homebrew casks support a `postflight` Ruby block that runs after the cask install/upgrade. This is the natural hook for restarting the daemon. Sketch:
+
+```ruby
+cask "calendar-sync" do
+  # ... existing fields ...
+
+  postflight do
+    uid = Process.uid
+    label = "org.calendar-sync.agent"
+    # Only restart if the agent is currently loaded - skip the cold-install case.
+    print = system_command "/bin/launchctl",
+      args: ["print", "gui/#{uid}/#{label}"],
+      must_succeed: false
+    if print.success?
+      system_command "/bin/launchctl",
+        args: ["kickstart", "-k", "gui/#{uid}/#{label}"],
+        must_succeed: false
+    end
+  end
+end
+```
+
+`launchctl kickstart -k <service>` kills the running process and restarts it under launchd. The `-k` flag forces a clean restart even if KeepAlive would have allowed the running pid to continue.
+
+#### The release-tooling change
+
+The cask is generated by GoReleaser. The repo's `.goreleaser.yml` has a `casks:` block (or similar) that produces the formula in `tammersaleh/homebrew-tap`. To add the postflight, modify the GoReleaser config so each new release ships a cask with the postflight.
+
+Look in:
+- `.goreleaser.yml` or `.goreleaser.yaml` in this repo
+- The `tammersaleh/homebrew-tap` repo for the current cask file shape
+
+GoReleaser's docs: <https://goreleaser.com/customization/homebrew_casks/> - `custom_block` or similar lets you inject Ruby blocks into the generated cask.
+
+#### Edge cases
+
+- **Cold install.** First-time `brew install calendar-sync` runs the postflight, but no daemon is loaded yet. The `must_succeed: false` and the `print` check above handle this - kickstart only fires if launchctl print succeeds.
+- **Multiple users.** The cask runs as the installing user. `Process.uid` gives that user. If the user installs as themselves and the daemon runs as themselves, this is correct. Cross-user scenarios (admin install, regular user runs daemon) probably break - flag for the user.
+- **Failed restart.** `must_succeed: false` means a kickstart failure won't fail the brew upgrade. Trade-off: brew succeeds, daemon stays old. Better than blocking the upgrade. The next `calendar-sync status` would catch it.
+- **launchd debouncing.** If the user upgrades multiple casks at once, multiple kickstarts could fire. Idempotent - kickstart on an already-restarted daemon is fine.
+
+#### Required changes (rough sketch)
+
+- `.goreleaser.yml`: add a `custom_block` or `postflight` field to the `casks` block.
+- Test the generated cask locally: install a v2.1.X release, manually edit the cask file with the postflight, run `brew upgrade` and verify the daemon's `started_at` advances.
+- Document the upgrade flow in `doc/install.md` (if it exists) or `SPEC.md`.
+- E2E test? Hard - requires a real cask install. Probably skip and rely on manual verification.
+
+#### Out-of-scope alternatives considered
+
+- **calendar-sync self-detects stale binary.** The daemon could check at startup or periodically whether `/opt/homebrew/bin/calendar-sync` differs from its own running binary, and exit gracefully if so (letting KeepAlive respawn it). Adds complexity; the postflight approach is simpler and brew-native.
+- **launchd-managed `OnDemand` instead of KeepAlive.** Restructure so the daemon exits frequently and launchd respawns it. Major architecture change for marginal benefit.
+
 ## Other backlog (lower priority)
 
 ### B17 - target-syncToken for sub-tick target-edit propagation (`backlog/B17-target-syncToken.md`)
@@ -157,4 +283,4 @@ Queued. Catches anything the recent B15/B16/B18/B19/B20/B22/B23 fixes might have
 
 ## When this file becomes useless
 
-When the E2E test system is in place, B17 ships, and the daemon has run a quiet week, delete this file. The fix history will live in `doc/bugs.md`; design context in `SPEC.md` and `CLAUDE.md`.
+When the E2E test system is in place, F1 + F2 + B17 all ship, and the daemon has run a quiet week, delete this file. The fix history will live in `doc/bugs.md`; design context in `SPEC.md` and `CLAUDE.md`.

@@ -32,62 +32,6 @@ Pre-existing in `internal/config/loader.go:25-44`; not introduced by B7. Normal 
 
 Fix sketch: `filepath.Abs` the result of `config.FindPath` (or just inside the launchd plist generator path before stamping into WatchPaths). Add a unit test that drives FindPath with a relative `--config` and asserts the returned path is absolute.
 
-### B20 - cancelled mirror with confirmed source classifies as `unchanged` forever (CRITICAL)
-
-Surfaced 2026-05-03 when the user reported missing future "Lunch & Reading" instances on the work mirror. Investigation found 5 mirror instances (5/4 - 5/8) at `status=cancelled` while their source instances on the personal calendar were at `status=confirmed`. The daemon was emitting `reason: unchanged` for each instance every tick, never reviving them.
-
-Root cause: `Status` is not in `mirror.ManagedFields` (Description / End / Location / Recurrence / Start / Summary / Transparency / Visibility). The drift checksum hashes only managed fields, so a cancelled mirror with the same managed fields as its source produces the same checksum the daemon stored when the mirror was last written. Combined with `source.Updated == calendar-sync:source_updated`, the drift signal fires `source_changed=false && mirror_drifted=false` -> `mirror.Classify` returns `ActionSkip / ReasonUnchanged`.
-
-How a mirror gets stuck cancelled:
-
-1. Source had `transparency=transparent` OR `responseStatus=declined/tentative` OR `status=cancelled` at some past time.
-2. `recurring.Handler.cancelMirrorInstance` patched the mirror with `status=cancelled`. Per the function's intentional design, NO checksum follow-up runs ("the cancellation does not write a managed field, so the existing checksum remains accurate").
-3. Source flips back to a syncable state. Source's `updated` bumps.
-4. Daemon next reconcile: the patch path (`reconcileInstance` -> `applyDriftMatrix` -> `Classify` -> `ActionPatch`) writes managed fields, recomputes checksum, updates `source_updated`. **Status is never touched** because the patch body only carries managed fields.
-5. From now on: managed fields match stored checksum, source_updated matches source.Updated, drift signal says everything's clean. Mirror is cancelled forever.
-
-The same hole exists in non-recurring `reconcileNormal` -> `mirror.Classify` (no recurring handler involvement). A non-recurring source that flipped from transparent -> opaque would hit the same trap.
-
-### Fix sketch
-
-The cleanest fix is symmetric with `insert.go`'s `reviveCancelledMirror` for the post-409 case: detect "source eligible + mirror cancelled" and route to a revive path that patches `status=confirmed` plus the full managed-field payload, then runs the checksum follow-up.
-
-Two implementation options:
-
-#### Option A (preferred): explicit revive branch in classify
-
-Inside `recurring.Handler.applyDriftMatrix` (and `Classifier.reconcileNormal`), short-circuit before `Classify` if the mirror's `Status == "cancelled"` and the source is in a syncable state. Emit `Action: ActionPatch, Reason: ReasonSourceCancelled` (or a new `ReasonRevive`) and patch with `{status: confirmed, ...managed fields}` then checksum follow-up.
-
-Pros: small surgery, doesn't touch `ManagedFields` or break existing checksum semantics.
-Cons: adds another decision branch outside `Classify`. The four-way matrix doesn't become aware of Status.
-
-#### Option B: add Status to `ManagedFields`
-
-Add Status as a managed field. Drift detection would now naturally fire `mirror_drifted=true` when status flips. The patch path's body needs to include Status. The `cancelMirrorInstance` path needs to update the checksum because Status writes ARE now managed-field writes.
-
-Pros: principled - Status becomes a first-class managed field. Drift matrix handles all the cases uniformly.
-Cons: every existing v3 mirror's stored checksum is invalid the moment the schema bumps to v4 (or the code lands without a schema bump). Forces a migration pass. Schema-version-migration cell is the right home for this, but the migration would touch every mirror.
-
-Lean: Option A. Smaller blast radius, avoids forcing a re-checksum across the entire mirror inventory.
-
-### Test plan
-
-In `internal/recurring/handler_test.go`:
-
-1. `TestReconcileInstance_ConfirmedSourceCancelledMirror_Revives`: source confirmed, mirror status=cancelled, managed fields match. Expect: `ActionPatch` with `status=confirmed` body, checksum follow-up runs, mirror's stored Status is now confirmed.
-2. `TestReconcileInstance_TransparentSource_StaysCancelled`: source transparency=transparent, mirror cancelled. Expect: no revive (cancelMirrorInstance's "already cancelled" no-op fires, mirror stays cancelled).
-3. `TestReconcileInstance_DeclinedSource_StaysCancelled`: same idea for declined source.
-
-In `internal/sync/classify_test.go` (or `reconcile_test.go`):
-
-4. `TestReconcileNormal_ConfirmedSourceCancelledMirror_Revives`: same shape as #1 for non-recurring events.
-
-Manual operator workflow during deploy: list cancelled mirrors with confirmed sources, patch them. The daemon's revive on the next tick should be idempotent.
-
-### Side note: 5/11 drift
-
-While investigating B20, found a separate active drift on the same Lunch & Reading event: source 5/11 instance at 11:30, mirror 5/11 instance at 11:00, daemon reports `unchanged`. The mirror's stored checksum matches the 11:00 managed fields, source.updated matches stored source_updated, so the drift signal misses it. This may be a side-effect of B20 (a stale mirror state where source change was silently overwritten), or a separate issue around per-instance source pointers and the daemon's reconciliation order. Asked the user for the desired source-of-truth before deciding fix strategy.
-
 ### B23 - drift signal never compares source-now to mirror-now directly
 
 Surfaced 2026-05-04 during B20 investigation. The 5/11 Lunch & Reading instance sat in a stable state where source.start = 11:30, mirror.start = 11:00, and the daemon classified every tick as `reason: unchanged`.
@@ -170,6 +114,26 @@ Fix sketch: have `Handle` propagate `postWriteMirrorParent` even on a subsequent
 Fix sketch: switch to `html/template` (handles XML-class escaping for content), or wrap the path in `xml.EscapeText` before stamping. Test should generate a plist with `&`, `<`, `>` in the config path and verify the output parses as valid XML.
 
 ## Fixed
+
+### B20 - cancelled mirror with confirmed source classifies as `unchanged` forever (CRITICAL)
+
+Surfaced 2026-05-03 when the user reported missing future "Lunch & Reading" instances on the work mirror. Investigation found 5 mirror instances at `status=cancelled` while their source instances were `status=confirmed`. The daemon was emitting `reason: unchanged` for each instance every tick, never reviving them.
+
+Root cause: `Status` is not in `mirror.ManagedFields` (Description / End / Location / Recurrence / Start / Summary / Transparency / Visibility). The drift checksum hashes only managed fields, so a cancelled mirror with the same managed fields as its source produces the same checksum the daemon stored when the mirror was last written. Combined with `source.Updated == calendar-sync:source_updated`, the drift signal fires `source_changed=false && mirror_drifted=false` -> `mirror.Classify` returns `ActionSkip / ReasonUnchanged`. The same hole existed in both the recurring-instance handler and the non-recurring `reconcileNormal` path.
+
+How a mirror got stuck cancelled:
+
+1. Source had `transparency=transparent` OR `responseStatus=declined/tentative` OR `status=cancelled` at some past time.
+2. `recurring.Handler.cancelMirrorInstance` patched the mirror with `status=cancelled`. Per the function's intentional design, NO checksum follow-up ran ("the cancellation does not write a managed field, so the existing checksum remains accurate").
+3. Source flipped back to a syncable state. Source's `updated` bumped.
+4. Daemon's next reconcile fired the patch path which writes managed fields, recomputes checksum, updates `source_updated`. Status was never touched because the patch body only carried managed fields.
+5. From there on: managed fields matched stored checksum, source_updated matched source.Updated, drift signal said everything was clean. Mirror was cancelled forever.
+
+Fixed by adding an explicit revive cell ahead of the four-way drift matrix in both `recurring.Handler.applyDriftMatrix` and `sync.Classifier.reconcileNormal`: when `mirrorInstance.Status == EventStatusCancelled` (recurring) or `mirrorEvent.Status == EventStatusCancelled` (non-recurring) and the source has reached classify - meaning steps 3-7 already cleared it as syncable - patch with the full managed-field payload plus `status=confirmed`, then run the standard checksum follow-up. Outcome: `Action=insert / Reason=source_updated`, symmetric with `insert.go`'s post-409 `reviveCancelledMirror`. Status stays out of `ManagedFields` (option B in the original sketch was rejected because it would force a checksum migration across every existing v3 mirror).
+
+SPEC §"Step 8 / Mirror exists, status=cancelled" documents the new cell. Tests in `internal/recurring/handler_test.go` (`TestHandle_Step3_ConfirmedSourceCancelledMirror_Revives`) and `internal/sync/classify_test.go` (`TestClassify_Step8_CancelledMirrorWithSyncableSource_Revives`) pin the revive shape and post-write inventory state. Existing tests for the cancellation cells (source-cancelled-with-cancelled-mirror returns skip-unchanged) still pass - the revive only fires when the source is syncable.
+
+The structural follow-up - making drift detection compare source's current managed fields to mirror's current managed fields directly, rather than relying on stored bookkeeping - is queued as B23. B20's fix handles the Status-specific symptom; B23 catches the same class of drift on any other field.
 
 ### B22 - HTTP 410/404 on classify-path events.delete fails the pdir every tick
 

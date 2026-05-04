@@ -25,6 +25,20 @@ func (c *Classifier) reconcileNormal(ctx context.Context, source *gws.Event) err
 		return c.doInsert(ctx, source)
 	}
 
+	// B20 revive cell: the source passed steps 3-7 (not cancelled, declined,
+	// tentative, transparent, or outside-horizon - it's syncable) but the
+	// mirror in inventory sits at status=cancelled. Status isn't a managed
+	// field, so the standard drift signal would emit skip(unchanged) and
+	// leave the mirror cancelled forever. Route to the same revive shape
+	// insert.go uses for the post-409 case.
+	if mirrorEvent.Status == gws.EventStatusCancelled {
+		c.debug("sync.reconcileNormal: cancelled mirror with syncable source -> revive",
+			"source_event", source.ID,
+			"mirror_event", mirrorEvent.ID,
+		)
+		return c.reviveCancelledMirror(ctx, source, mirrorEvent)
+	}
+
 	signal := mirror.ComputeDriftSignal(source, mirrorEvent)
 	desired := mirror.BuildPayload(c.SourceCalendarID, source)
 

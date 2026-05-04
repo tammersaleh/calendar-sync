@@ -804,6 +804,88 @@ func TestHandle_Step3_CancellationFamily(t *testing.T) {
 	}
 }
 
+// ---------- Step 3: revive cancelled mirror with confirmed source (B20) ----------
+
+// TestHandle_Step3_ConfirmedSourceCancelledMirror_Revives pins B20: when a
+// source recurring-instance exception is in a syncable state (not cancelled,
+// not declined, not tentative, not transparent) but its mirror is at
+// Status=cancelled with managed fields that still match the stored
+// checksum, the daemon must patch the mirror back to confirmed rather
+// than emitting skip(unchanged) and leaving the user without a mirror.
+//
+// Without the fix, ComputeDriftSignal returns source_changed=false (timestamps
+// match) and mirror_drifted=false (managed fields hash to stored checksum
+// because Status isn't a managed field). mirror.Classify returns
+// skip(unchanged) and the mirror is cancelled forever even though the source
+// expects it to be visible.
+//
+// The revive path patches with the full managed-field payload plus
+// Status=confirmed, then the standard checksum follow-up. Outcome shape
+// matches insert.go's reviveCancelledMirror: ActionInsert + ReasonSourceUpdated
+// (the user-facing intent is "the mirror is back").
+func TestHandle_Step3_ConfirmedSourceCancelledMirror_Revives(t *testing.T) {
+	api := newStubAPI()
+	mirrorParent := makeMirrorParent("mp-1")
+	source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
+
+	// Mirror has the same managed fields as desired-from-source (so checksum
+	// still matches) but status=cancelled. This is the stuck state the daemon
+	// gets into when an earlier cancellation path (source was transparent /
+	// declined / tentative) wrote status=cancelled WITHOUT updating the
+	// checksum, then the source flipped back to syncable.
+	mi := makeCleanCurrentMirror("mi-1", source.Updated, source.Updated, managedFieldHints{
+		summary:     source.Summary,
+		description: source.Description + "\n\n---\nSource: " + source.HTMLLink,
+		start:       source.Start,
+		end:         source.End,
+	})
+	mi.Status = gws.EventStatusCancelled
+	api.queueInstances([]gws.Event{*mi})
+
+	// Two EventsPatch calls: main (full payload + status=confirmed) + checksum follow-up.
+	postMain := *mi
+	postMain.Status = gws.EventStatusConfirmed
+	postMain.Updated = "2026-04-29T20:00:01Z"
+	api.queuePatch(&postMain)
+	postChecksum := postMain
+	api.queuePatch(&postChecksum)
+
+	h := &Handler{
+		API:              api,
+		SourceCalendarID: "src-cal",
+		TargetCalendarID: "tgt-cal",
+		SourceWritable:   true,
+		LookupMirrorParent: func(_ mirror.SourceTuple) (*gws.Event, bool) {
+			return mirrorParent, true
+		},
+	}
+	got, err := h.Handle(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if got.Action != mirror.ActionInsert || got.Reason != mirror.ReasonSourceUpdated {
+		t.Errorf("revive outcome = %s/%s, want insert/source_updated", got.Action, got.Reason)
+	}
+
+	patches := api.callsByOp("EventsPatch")
+	if len(patches) != 2 {
+		t.Fatalf("expected 2 EventsPatch calls (main + checksum); got %d", len(patches))
+	}
+	mainBody := patches[0].Body
+	if mainBody == nil || mainBody.Status != gws.EventStatusConfirmed {
+		t.Errorf("main patch body must include status=confirmed; got %+v", mainBody)
+	}
+	if mainBody == nil || mainBody.Summary == "" {
+		t.Errorf("main patch body must carry full managed-field payload; got %+v", mainBody)
+	}
+	if got.PostWriteMirrorInstance == nil {
+		t.Errorf("PostWriteMirrorInstance must be set on revive path so the inventory updates")
+	}
+	if got.PostWriteMirrorInstance != nil && got.PostWriteMirrorInstance.Status == gws.EventStatusCancelled {
+		t.Errorf("post-write resource must be confirmed after revive; got cancelled")
+	}
+}
+
 // ---------- Step 3: drift matrix ----------
 
 func TestHandle_Step3_DriftNoChange(t *testing.T) {

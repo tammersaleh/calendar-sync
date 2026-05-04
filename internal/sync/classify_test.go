@@ -935,6 +935,121 @@ func TestClassify_Step8_InventoryMiss_Insert(t *testing.T) {
 	}
 }
 
+// TestClassify_Step8_CancelledMirrorWithSyncableSource_Revives pins B20
+// for the non-recurring path. By the time reconcileNormal runs (step 8),
+// the source has passed steps 3-7 - it's not cancelled, declined,
+// tentative, transparent, or outside-horizon. If the mirror in inventory
+// is nonetheless at Status=cancelled with managed fields matching the
+// stored checksum, the existing four-way drift matrix returns
+// skip(unchanged) because Status isn't a managed field. The mirror stays
+// cancelled forever.
+//
+// Symmetric with insert.go's reviveCancelledMirror (the post-409 path).
+// Outcome: ActionInsert + ReasonSourceUpdated. Two patches: main (status=
+// confirmed + full payload) and checksum follow-up.
+func TestClassify_Step8_CancelledMirrorWithSyncableSource_Revives(t *testing.T) {
+	api := newStubAPI()
+	inv := NewInventory("tgt-cal")
+	sink, captured := captureOutputs()
+
+	source := makeNonRecurringSource("src-evt", "2026-04-29T20:00:00Z", &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"})
+
+	// Mirror with managed fields matching source (so checksum still matches)
+	// but status=cancelled - the stuck state that drift detection misses.
+	mirrorEv := makeCleanCurrentMirror("mi-1", "src-cal:src-evt",
+		source.Updated, source.Updated,
+		source.Summary, source.Start, source.End)
+	mirrorEv.Status = gws.EventStatusCancelled
+	tuple := mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt"}
+	inv.Set(tuple, mirrorEv)
+
+	// Two EventsPatch calls expected: main (full payload + status=confirmed) +
+	// checksum follow-up.
+	postMain := *mirrorEv
+	postMain.Status = gws.EventStatusConfirmed
+	postMain.Updated = "2026-04-29T20:00:01Z"
+	api.queuePatch(&postMain)
+	postChecksum := postMain
+	api.queuePatch(&postChecksum)
+
+	c := newClassifier(t, api, inv, sink, classifyOptions{sourceWritable: true})
+	if err := c.Classify(context.Background(), source); err != nil {
+		t.Fatalf("Classify returned error: %v", err)
+	}
+
+	got := firstOutcome(t, *captured)
+	if got.Action != mirror.ActionInsert || got.Reason != mirror.ReasonSourceUpdated {
+		t.Errorf("revive outcome = %s/%s, want insert/source_updated", got.Action, got.Reason)
+	}
+
+	patches := api.callsByOp("EventsPatch")
+	if len(patches) != 2 {
+		t.Fatalf("expected 2 EventsPatch (main + checksum); got %d", len(patches))
+	}
+	if patches[0].Body == nil || patches[0].Body.Status != gws.EventStatusConfirmed {
+		t.Errorf("main patch must include status=confirmed; got %+v", patches[0].Body)
+	}
+	if patches[0].Body == nil || patches[0].Body.Summary == "" {
+		t.Errorf("main patch must carry full managed-field payload; got %+v", patches[0].Body)
+	}
+	// Inventory should hold the post-write (confirmed) mirror, not the cancelled stub.
+	updated, ok := inv.Lookup(tuple)
+	if !ok {
+		t.Fatal("inventory must still hold the mirror after revive")
+	}
+	if updated.Status == gws.EventStatusCancelled {
+		t.Errorf("inventory mirror must be confirmed after revive; got cancelled")
+	}
+}
+
+// TestClassify_Step8_CancelledLegacyMirror_RevivesAtCurrentSchema pins
+// the interaction between B20's revive cell and the schema-version-
+// migration path: a v1 mirror that's been cancelled is revived directly
+// via reviveCancelledMirror rather than routing through reconcileMigration.
+// The revive uses BuildPayload which writes the current SchemaVersion,
+// so the migration is implicit in the rewrite. Important boundary because
+// reconcileNormal's revive check is intentionally placed BEFORE the
+// NeedsMigration branch.
+func TestClassify_Step8_CancelledLegacyMirror_RevivesAtCurrentSchema(t *testing.T) {
+	api := newStubAPI()
+	inv := NewInventory("tgt-cal")
+	sink, captured := captureOutputs()
+
+	source := makeNonRecurringSource("src-evt", "2026-04-29T20:00:00Z", &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"})
+
+	// v1 mirror (no checksum), status=cancelled.
+	mirrorEv := makeV1Mirror("mi-1", "src-cal:src-evt",
+		source.Updated, source.Updated,
+		source.Summary, source.Start, source.End)
+	mirrorEv.Status = gws.EventStatusCancelled
+	tuple := mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt"}
+	inv.Set(tuple, mirrorEv)
+
+	// Revive expects 2 EventsPatch calls (main + checksum).
+	postMain := *mirrorEv
+	postMain.Status = gws.EventStatusConfirmed
+	if postMain.ExtendedProperties != nil && postMain.ExtendedProperties.Private != nil {
+		postMain.ExtendedProperties.Private[mirror.ExtKeyVersion] = mirror.SchemaVersion
+	}
+	api.queuePatch(&postMain)
+	postChecksum := postMain
+	api.queuePatch(&postChecksum)
+
+	c := newClassifier(t, api, inv, sink, classifyOptions{sourceWritable: true})
+	if err := c.Classify(context.Background(), source); err != nil {
+		t.Fatalf("Classify error: %v", err)
+	}
+
+	got := firstOutcome(t, *captured)
+	// The revive cell wins over migration: outcome is insert/source_updated,
+	// not patch/migration_upgrade. The fresh write at the current schema
+	// version is what the migration path would have done anyway, but the
+	// revive's reason better reflects user intent ("mirror is back").
+	if got.Action != mirror.ActionInsert || got.Reason != mirror.ReasonSourceUpdated {
+		t.Errorf("revive outcome = %s/%s, want insert/source_updated", got.Action, got.Reason)
+	}
+}
+
 func TestClassify_Step8_InventoryHit_Unchanged_Skip(t *testing.T) {
 	api := newStubAPI()
 	inv := NewInventory("tgt-cal")

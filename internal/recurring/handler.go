@@ -438,6 +438,18 @@ func (h *Handler) cancelMirrorInstance(ctx context.Context, mirrorInstance *gws.
 // through to mirror.Classify, where it correctly maps to ActionPatch /
 // ReasonSourceUpdated.
 func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *gws.Event) (Result, error) {
+	// B20 revive cell: source is in a syncable state (we passed reconcileInstance's
+	// cancelled / declined / tentative / transparent guards) but the mirror is
+	// at status=cancelled. Status isn't a managed field, so the standard drift
+	// signal would emit skip(unchanged) and leave the mirror cancelled forever.
+	// Patch with the full managed-field payload plus status=confirmed, then run
+	// the standard checksum follow-up. Outcome shape mirrors insert.go's
+	// reviveCancelledMirror: ActionInsert + ReasonSourceUpdated, since the
+	// user-facing intent is "the mirror is back".
+	if mirrorInstance.Status == gws.EventStatusCancelled {
+		return h.reviveCancelledMirrorInstance(ctx, source, mirrorInstance)
+	}
+
 	signal := mirror.ComputeDriftSignal(source, mirrorInstance)
 	desired := mirror.BuildInstancePayload(h.SourceCalendarID, source)
 	// An auto-materialized recurring-instance mirror inherits the parent's
@@ -578,6 +590,28 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 
 	// Unreachable: mirror.Classify produces only the four actions above.
 	return Result{}, errors.New("recurring: unexpected outcome action " + string(outcome.Action))
+}
+
+// reviveCancelledMirrorInstance handles SPEC.md's B20 cell: a source
+// recurring-instance exception that's syncable (passed reconcileInstance's
+// guards) but whose mirror sits at status=cancelled. Patches the mirror
+// with the full managed-field payload from source plus status=confirmed,
+// then runs the standard checksum follow-up. Outcome shape matches
+// insert.go's reviveCancelledMirror (ActionInsert + ReasonSourceUpdated):
+// from the user's POV the mirror reappears.
+func (h *Handler) reviveCancelledMirrorInstance(ctx context.Context, source, mirrorInstance *gws.Event) (Result, error) {
+	desired := mirror.BuildInstancePayload(h.SourceCalendarID, source)
+	desired.ID = ""
+	desired.Status = gws.EventStatusConfirmed
+	post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, desired)
+	if err != nil {
+		return Result{}, err
+	}
+	return Result{
+		Action:                  mirror.ActionInsert,
+		Reason:                  mirror.ReasonSourceUpdated,
+		PostWriteMirrorInstance: post,
+	}, nil
 }
 
 // patchMirrorWithChecksum runs SPEC.md "Computing the checksum from the

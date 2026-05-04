@@ -38,11 +38,19 @@ func captureOutputs() (Output, *[]Outcome) {
 }
 
 // makeNonRecurringSource builds a typical non-recurring source event.
+//
+// Description is set to the summary so that BuildPayload's
+// `source.Description + trailerPrefix + source.HTMLLink` produces the
+// same string makeCleanCurrentMirror writes for the mirror's body. This
+// alignment matters for B23's FieldsDisagree signal: a source/mirror
+// pair whose actual managed fields disagree is treated as drift, even
+// when stored bookkeeping says clean.
 func makeNonRecurringSource(id, updated string, start *gws.EventDateTime) *gws.Event {
 	return &gws.Event{
 		ID:           id,
 		Status:       gws.EventStatusConfirmed,
 		Summary:      "Standup",
+		Description:  "Standup",
 		Start:        start,
 		End:          &gws.EventDateTime{DateTime: addHourToDateTime(start.DateTime)},
 		Updated:      updated,
@@ -935,6 +943,78 @@ func TestClassify_Step8_InventoryMiss_Insert(t *testing.T) {
 	}
 }
 
+// TestClassify_Step8_StaleBookkeeping_PatchesFromSource pins B23: a
+// mirror whose stored bookkeeping reports both signals clean (source
+// timestamp matches stored, checksum matches the mirror's current
+// managed fields) but whose actual managed fields disagree with the
+// source's must NOT silently skip. The new FieldsDisagree signal routes
+// this to ActionPatch / ReasonStaleBookkeeping. The patch rewrites the
+// mirror from source and runs the standard checksum follow-up.
+//
+// Concrete prior-art shape: 5/11 Lunch & Reading mirror sat at start=11:00
+// while source's instance override was at 11:30. Both daemon-stored
+// signals reported clean (because a prior managed-field-no-op write
+// recorded the latest source.Updated alongside the existing
+// 11:00-aligned checksum). Pre-B23 the daemon emitted skip(unchanged)
+// every tick. Post-B23 the new cell catches the divergence.
+func TestClassify_Step8_StaleBookkeeping_PatchesFromSource(t *testing.T) {
+	api := newStubAPI()
+	inv := NewInventory("tgt-cal")
+	sink, captured := captureOutputs()
+
+	source := makeNonRecurringSource("src-evt", "2026-04-29T20:00:00Z",
+		&gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"})
+
+	// Mirror has DIFFERENT start time than source (the divergence) but
+	// stored bookkeeping says clean. Build a mirror with start at 11:00
+	// while source is at 12:00, then pin the stored checksum to the
+	// mirror's current managed fields (so MirrorDrifted=false) and
+	// stored source_updated == source.Updated (so SourceChanged=false).
+	mirrorStart := &gws.EventDateTime{DateTime: "2026-05-01T11:00:00Z"}
+	mirrorEnd := &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"}
+	mirrorEv := makeCleanCurrentMirror("mi-1", "src-cal:src-evt",
+		source.Updated, source.Updated,
+		source.Summary, mirrorStart, mirrorEnd)
+	tuple := mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt"}
+	inv.Set(tuple, mirrorEv)
+
+	// Two EventsPatch calls expected: main (full payload from source) +
+	// checksum follow-up.
+	postMain := *mirrorEv
+	postMain.Start = source.Start
+	postMain.End = source.End
+	postMain.Updated = "2026-04-29T20:00:01Z"
+	api.queuePatch(&postMain)
+	postChecksum := postMain
+	api.queuePatch(&postChecksum)
+
+	c := newClassifier(t, api, inv, sink, classifyOptions{sourceWritable: true})
+	if err := c.Classify(context.Background(), source); err != nil {
+		t.Fatalf("Classify error: %v", err)
+	}
+
+	got := firstOutcome(t, *captured)
+	if got.Action != mirror.ActionPatch || got.Reason != mirror.ReasonStaleBookkeeping {
+		t.Errorf("outcome = %s/%s, want patch/stale_bookkeeping", got.Action, got.Reason)
+	}
+	if got.Conflict != mirror.ConflictNone {
+		t.Errorf("stale-bookkeeping cell must not emit a conflict; got %q", got.Conflict)
+	}
+
+	patches := api.callsByOp("EventsPatch")
+	if len(patches) != 2 {
+		t.Fatalf("expected 2 EventsPatch (main + checksum); got %d", len(patches))
+	}
+	// Inventory should hold the post-write resource.
+	updated, ok := inv.Lookup(tuple)
+	if !ok {
+		t.Fatal("inventory must still hold the mirror after stale-bookkeeping patch")
+	}
+	if updated.Start == nil || updated.Start.DateTime != source.Start.DateTime {
+		t.Errorf("inventory mirror's start should now match source; got %+v", updated.Start)
+	}
+}
+
 // TestClassify_Step8_CancelledMirrorWithSyncableSource_Revives pins B20
 // for the non-recurring path. By the time reconcileNormal runs (step 8),
 // the source has passed steps 3-7 - it's not cancelled, declined,
@@ -1403,6 +1483,60 @@ func TestClassify_Step8_V1Mirror_NoActualDrift_MigrationUpgrade(t *testing.T) {
 	}
 	if v := body.ExtendedProperties.Private[mirror.ExtKeyVersion]; v != mirror.SchemaVersion {
 		t.Errorf("main patch body version = %q, want %q", v, mirror.SchemaVersion)
+	}
+}
+
+// TestClassify_Step8_V1Mirror_FieldsDisagreeOnly_MigrationSourceWonNotStaleBookkeeping
+// pins the contract that the v1 migration path consumes its own drift
+// logic, not B23's stale_bookkeeping cell. A v1 mirror with SC=F and
+// FieldsDisagree=true must route through reconcileMigration's
+// MirrorDrifted-override branch and emit migration_source_won, NOT the
+// new stale_bookkeeping reason.
+//
+// Why this contract matters: ComputeDriftSignal computes FieldsDisagree
+// independently from MirrorDrifted. reconcileMigration overrides
+// MirrorDrifted via DriftedFieldNames (which has the same answer as
+// FieldsDisagree). After the override the migration cells handle their
+// own routing inline; they never call mirror.Classify with the
+// possibly-FD-true signal. A future refactor that re-orders the
+// migration switch or accidentally drops the override would let
+// FieldsDisagree leak through to Classify and the new stale_bookkeeping
+// cell would fire, masking what's actually a migration scenario. This
+// test locks the contract.
+func TestClassify_Step8_V1Mirror_FieldsDisagreeOnly_MigrationSourceWonNotStaleBookkeeping(t *testing.T) {
+	api := newStubAPI()
+	inv := NewInventory("tgt-cal")
+	sink, captured := captureOutputs()
+
+	// Stored source_updated == source.Updated -> SourceChanged=false.
+	// Live mirror managed fields differ from desired-from-source ->
+	// FieldsDisagree=true at ComputeDriftSignal. v1 mirror -> NeedsMigration=true.
+	source := makeNonRecurringSource("src-evt", "2026-04-29T20:00:00Z",
+		&gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"})
+
+	mirrorEv := makeV1Mirror("mi-1", "src-cal:src-evt",
+		source.Updated, source.Updated,
+		"User edit", source.Start, source.End)
+	inv.Set(mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt"}, mirrorEv)
+
+	postMain := *mirrorEv
+	postMain.Summary = source.Summary
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+
+	c := newClassifier(t, api, inv, sink, classifyOptions{sourceWritable: true})
+	if err := c.Classify(context.Background(), source); err != nil {
+		t.Fatalf("Classify error: %v", err)
+	}
+	got := firstOutcome(t, *captured)
+	if got.Reason == mirror.ReasonStaleBookkeeping {
+		t.Fatalf("v1 migration path must not route to stale_bookkeeping; got %s/%s", got.Action, got.Reason)
+	}
+	if got.Action != mirror.ActionPatch || got.Reason != mirror.ReasonSourceUpdated {
+		t.Errorf("got %s/%s, want patch/source_updated", got.Action, got.Reason)
+	}
+	if got.Conflict != mirror.ConflictMigrationSourceWon {
+		t.Errorf("Conflict = %q, want migration_source_won", got.Conflict)
 	}
 }
 

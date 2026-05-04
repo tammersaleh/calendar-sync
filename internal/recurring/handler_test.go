@@ -804,6 +804,70 @@ func TestHandle_Step3_CancellationFamily(t *testing.T) {
 	}
 }
 
+// ---------- Step 3: stale-bookkeeping (B23) ----------
+
+// TestHandle_Step3_StaleBookkeeping_PatchesFromSource pins B23 for the
+// recurring-instance handler. Same shape as the non-recurring version:
+// source and mirror managed fields disagree (mirror.start at 11:00 PT,
+// source.start at 12:00 UTC) but stored bookkeeping reports both
+// signals clean. The new FieldsDisagree signal routes to ActionPatch /
+// ReasonStaleBookkeeping inside applyDriftMatrix.
+//
+// Concretely the bug surfaced on a recurring-instance override (5/11
+// Lunch & Reading) whose mirror's checksum had been computed for the
+// 11:00-aligned managed fields and whose stored source_updated had been
+// bumped via a managed-field-no-op patch. Without B23 every tick said
+// skip(unchanged); with B23 the handler patches.
+func TestHandle_Step3_StaleBookkeeping_PatchesFromSource(t *testing.T) {
+	api := newStubAPI()
+	mirrorParent := makeMirrorParent("mp-1")
+	source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
+
+	// Mirror's managed fields disagree with source's: same summary/end but
+	// start moved an hour earlier on the mirror.
+	mirrorStart := &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z", TimeZone: "UTC"}
+	driftedStart := &gws.EventDateTime{DateTime: "2026-05-01T11:00:00Z", TimeZone: "UTC"}
+	_ = mirrorStart // sentinel against accidental reuse
+	mi := makeCleanCurrentMirror("mi-1", source.Updated, source.Updated, managedFieldHints{
+		summary:     source.Summary,
+		description: source.Description + "\n\n---\nSource: " + source.HTMLLink,
+		start:       driftedStart, // diverges from source.Start
+		end:         source.End,
+	})
+	api.queueInstances([]gws.Event{*mi})
+
+	// Two EventsPatch calls (main + checksum).
+	postMain := *mi
+	postMain.Start = source.Start
+	postMain.Updated = "2026-04-29T20:00:01Z"
+	api.queuePatch(&postMain)
+	postChecksum := postMain
+	api.queuePatch(&postChecksum)
+
+	h := &Handler{
+		API:              api,
+		SourceCalendarID: "src-cal",
+		TargetCalendarID: "tgt-cal",
+		SourceWritable:   true,
+		LookupMirrorParent: func(_ mirror.SourceTuple) (*gws.Event, bool) {
+			return mirrorParent, true
+		},
+	}
+	got, err := h.Handle(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if got.Action != mirror.ActionPatch || got.Reason != mirror.ReasonStaleBookkeeping {
+		t.Errorf("outcome = %s/%s, want patch/stale_bookkeeping", got.Action, got.Reason)
+	}
+	if got.Conflict != mirror.ConflictNone {
+		t.Errorf("stale-bookkeeping cell must not emit a conflict; got %q", got.Conflict)
+	}
+	if len(api.callsByOp("EventsPatch")) != 2 {
+		t.Errorf("expected 2 EventsPatch (main + checksum); got %d", len(api.callsByOp("EventsPatch")))
+	}
+}
+
 // ---------- Step 3: revive cancelled mirror with confirmed source (B20) ----------
 
 // TestHandle_Step3_ConfirmedSourceCancelledMirror_Revives pins B20: when a

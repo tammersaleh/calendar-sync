@@ -117,12 +117,26 @@ Together they give us an unambiguous classification of every mirror at reconcili
 
 | `source_changed` | `mirror_drifted` | Outcome                                                                                                            |
 |------------------|------------------|--------------------------------------------------------------------------------------------------------------------|
-| no               | no               | `skip(reason=unchanged)`                                                                                           |
+| no               | no               | `skip(reason=unchanged)` *unless `fields_disagree` (see below) - then* `patch(reason=stale_bookkeeping)`.            |
 | yes              | no               | `patch` mirror from source. Reason `source_updated`.                                                                |
 | no               | yes              | Drift handling. If source is writable: `propagate` mirror's edits to source. Else `revert` mirror to source values. Reason `target_edited`. |
 | yes              | yes              | Conflict. Newer-wins by Google's `updated` timestamps: compare `source.updated` vs `mirror.updated`. If source is newer (or equal), `patch` mirror from source (reason `source_updated`); a `warn` log records that user edits were overwritten. If mirror is newer, drift handling as in the previous row; a `warn` log records that source updates were overwritten. |
 
 Equal timestamps tiebreak to source. Google reports `updated` to milliseconds; concurrent edits within the same millisecond are vanishingly rare in practice.
+
+##### `fields_disagree`: stale-bookkeeping fallback
+
+`source_changed` and `mirror_drifted` answer the question "did either side change since our last write?" not "do source and mirror agree right now?" Those questions diverge if the daemon's last write was a managed-field no-op: stored `source_updated` got bumped to the current source.updated, and stored `checksum` got recomputed over the post-write event whose managed fields hadn't changed. Subsequent edits that don't bump source.updated past stored - or any prior path that left the mirror in an aligned-with-stored-but-out-of-sync-with-source state - then go undetected by the standard signals.
+
+`fields_disagree` is a third signal that compares the source's current managed fields to the mirror's current managed fields directly. The check uses `mirror.DriftedFieldNames(mirror, desired)` which already implements the canonical-form rules used by the checksum (trailer stripping on description, order-insensitive recurrence). Computing it costs nothing on the wire - the daemon already builds `desired` from source for every reconciliation; reusing it for one extra equality check is free.
+
+`fields_disagree` only changes the `!source_changed && !mirror_drifted` cell. The other three cells already produce a write whose post-write resource and checksum follow-up bring stored bookkeeping back in sync, so adding a check there would be redundant. The new cell:
+
+| `source_changed` | `mirror_drifted` | `fields_disagree` | Outcome |
+|------------------|------------------|-------------------|---------|
+| no               | no               | yes               | `patch` mirror from source. Reason `stale_bookkeeping`. No `Conflict` label - the daemon doesn't have evidence of a user-edit conflict, just evidence of bookkeeping divergence. |
+
+The patch path is identical to the existing `source_changed && !mirror_drifted` cell: write the full managed-field payload, then run the standard `calendar-sync:checksum` follow-up. The new reason gives operators a machine-readable signal that something in the mirror's history left bookkeeping inconsistent (a B20-shaped cancellation flow, a manual edit cycle, a Google cascade, etc.) so they can investigate without having to reconstruct the audit trail from a `source_updated` log line.
 
 "Source is writable" in the table above means BOTH the source calendar's `accessRole >= writer` AND the pdir's effective `propagate_target_edits = true`. The effective value is `[[pairs]].propagate_target_edits` when set, otherwise `[settings].propagate_target_edits` (which itself defaults to false). A fresh install runs one-way (mirror edits revert) until the operator opts in. Per-pair scoping lets operators ramp two-way sync one direction at a time after validating the read path. A read-only source can never propagate regardless of the setting.
 
@@ -517,6 +531,7 @@ A given `reason` is paired with one of six `action` values: `insert`, `patch`, `
 | `instance_unmaterializable`| `skip`                      | Recurring-instance lookup returned zero results even after re-patching the mirror parent (rare; see "Zero-result instance lookup").       |
 | `source_updated`           | `insert` or `patch`         | `source_changed=true && mirror_drifted=false`, or no mirror exists yet (then `insert`). Also covers `source_changed && mirror_drifted` resolved to source-wins (see `conflict_source_won` below). |
 | `target_edited`            | `propagate` or `revert`     | `mirror_drifted=true && source_changed=false`, or `source_changed && mirror_drifted` resolved to mirror-wins. `propagate` if `pdir.source_writable`, else `revert`. |
+| `stale_bookkeeping`        | `patch`                     | `source_changed=false && mirror_drifted=false && fields_disagree=true` - stored bookkeeping reports both signals clean but the source's current managed fields differ from the mirror's. Repairs the divergence by rewriting the mirror from source. No conflict label; the daemon doesn't have evidence of a user-edit conflict, just bookkeeping divergence (see §"`fields_disagree`: stale-bookkeeping fallback"). |
 | `migration_upgrade`        | `patch`                     | A legacy mirror (v1 or v2) with no source change and no drift, re-written at the current `version` with a fresh `calendar-sync:checksum`. One-time per pre-existing mirror. |
 | `inherited_upgrade`        | `patch`                     | A recurring-instance mirror auto-materialized by Google from a parent we wrote, with no actual drift, re-written so the instance carries per-instance `calendar-sync:source` and `:checksum`. One-time per inherited instance. See "Inherited recurring-instance handling". |
 | `orphaned`                 | `delete`                    | Prune pass found a mirror whose source no longer exists.                                                                                 |

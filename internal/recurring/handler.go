@@ -450,8 +450,11 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 		return h.reviveCancelledMirrorInstance(ctx, source, mirrorInstance)
 	}
 
-	signal := mirror.ComputeDriftSignal(source, mirrorInstance)
+	// Build desired BEFORE computing the drift signal so ComputeDriftSignal
+	// can include the FieldsDisagree comparison (B23: live-vs-desired
+	// managed-field check that catches stale bookkeeping).
 	desired := mirror.BuildInstancePayload(h.SourceCalendarID, source)
+	signal := mirror.ComputeDriftSignal(source, mirrorInstance, desired)
 	// An auto-materialized recurring-instance mirror inherits the parent's
 	// extended properties, so its calendar-sync:source points at the source
 	// PARENT (no instance suffix). Detection lets us treat such instances as

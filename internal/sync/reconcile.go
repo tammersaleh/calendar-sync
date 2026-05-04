@@ -39,8 +39,11 @@ func (c *Classifier) reconcileNormal(ctx context.Context, source *gws.Event) err
 		return c.reviveCancelledMirror(ctx, source, mirrorEvent)
 	}
 
-	signal := mirror.ComputeDriftSignal(source, mirrorEvent)
+	// Build desired BEFORE computing the drift signal so ComputeDriftSignal
+	// can include the FieldsDisagree comparison (B23: live-vs-desired
+	// managed-field check that catches stale bookkeeping).
 	desired := mirror.BuildPayload(c.SourceCalendarID, source)
+	signal := mirror.ComputeDriftSignal(source, mirrorEvent, desired)
 
 	c.debug("sync.reconcileNormal: inventory hit",
 		"source_calendar", c.SourceCalendarID,

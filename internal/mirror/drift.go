@@ -34,6 +34,17 @@ const (
 	ReasonUnchanged     Reason = "unchanged"
 	ReasonSourceUpdated Reason = "source_updated"
 	ReasonTargetEdited  Reason = "target_edited"
+	// ReasonStaleBookkeeping fires when ComputeDriftSignal reports
+	// SourceChanged=false && MirrorDrifted=false but the source's current
+	// managed fields actually differ from the mirror's. Stored bookkeeping
+	// (the source_updated timestamp + the checksum) was either left in a
+	// state that no longer reflects reality (e.g. a managed-field-no-op
+	// patch that updated source_updated but not actual fields) or one side
+	// was edited in a way that didn't update the bookkeeping signal.
+	// Outcome is patch-from-source: rewrite the mirror to match. No
+	// conflict label; the daemon doesn't have evidence of a user-edit
+	// conflict, just evidence of bookkeeping divergence.
+	ReasonStaleBookkeeping Reason = "stale_bookkeeping"
 )
 
 // Conflict is the warning category SPEC.md emits on stderr when both drift
@@ -73,9 +84,17 @@ type Outcome struct {
 // drift check (compare live managed fields to desired-from-source) which
 // the sync layer performs itself. Callers MUST branch on NeedsMigration
 // before consuming MirrorDrifted.
+//
+// FieldsDisagree is the live-vs-desired managed-field comparison
+// (per SPEC §"Drift detection model" / "Stale-bookkeeping cell"). It
+// catches the case where stored bookkeeping reports both signals clean
+// but the source's and mirror's CURRENT managed fields actually differ.
+// Defaults to false when the caller passes nil for desired in
+// ComputeDriftSignal.
 type DriftSignal struct {
 	SourceChanged  bool
 	MirrorDrifted  bool
+	FieldsDisagree bool
 	NeedsMigration bool
 }
 
@@ -89,11 +108,18 @@ type DriftSignal struct {
 //     cause spurious mismatches.
 //   - mirror_drifted = sha256(canonical(mirror's managed fields)) !=
 //     mirror's stored checksum.
+//   - fields_disagree = the source's current managed fields differ from
+//     the mirror's current managed fields. Computed via DriftedFieldNames,
+//     which uses the same canonical-form rules as the checksum (trailer
+//     stripping on description, order-insensitive recurrence). When
+//     desired is nil the signal stays false; existing two-signal callers
+//     can pass nil while production callers (sync, recurring) pass the
+//     payload they were going to build anyway.
 //   - needs_migration = mirror's stored calendar-sync:version != current
 //     SchemaVersion. The sync layer routes these to the migration path
 //     per SPEC.md "Schema version migration" rather than the standard
-//     four-way matrix.
-func ComputeDriftSignal(source, mirror *gws.Event) DriftSignal {
+//     three-signal matrix.
+func ComputeDriftSignal(source, mirror, desired *gws.Event) DriftSignal {
 	storedSourceUpdated := extPropPrivate(mirror, ExtKeySourceUpdated)
 	storedChecksum := extPropPrivate(mirror, ExtKeyChecksum)
 	storedVersion := extPropPrivate(mirror, ExtKeyVersion)
@@ -101,9 +127,15 @@ func ComputeDriftSignal(source, mirror *gws.Event) DriftSignal {
 	sourceChanged := compareTimestamps(source.Updated, storedSourceUpdated) > 0
 	mirrorDrifted := Checksum(ManagedFieldsFromEvent(mirror)) != storedChecksum
 
+	fieldsDisagree := false
+	if desired != nil {
+		fieldsDisagree = len(DriftedFieldNames(mirror, desired)) > 0
+	}
+
 	return DriftSignal{
 		SourceChanged:  sourceChanged,
 		MirrorDrifted:  mirrorDrifted,
+		FieldsDisagree: fieldsDisagree,
 		NeedsMigration: storedVersion != SchemaVersion,
 	}
 }
@@ -171,40 +203,61 @@ func parseTimestamp(s string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// Classify implements SPEC.md "Drift detection model" four-way matrix.
+// Classify implements SPEC.md "Drift detection model" three-signal matrix.
 // The conflict tiebreak is newer-wins by source.updated vs mirror.updated;
 // equal-or-source-wins. sourceUpdated and mirrorUpdated are the live
 // timestamps from the two events (NOT the stored calendar-sync:source_updated
 // value used to compute SourceChanged).
 //
-//	!source_changed && !mirror_drifted -> skip(unchanged)
-//	source_changed && !mirror_drifted  -> patch(source_updated)
-//	!source_changed && mirror_drifted  -> propagate or revert (target_edited)
-//	source_changed && mirror_drifted   -> conflict; newer wins (source ties)
+// The branch order is intentional. !MirrorDrifted means stored bookkeeping
+// reports the mirror clean, so the daemon's authoritative answer comes
+// from SourceChanged and FieldsDisagree (in that priority order: a real
+// source bump trumps the bookkeeping-divergence inference). MirrorDrifted
+// means the mirror has been edited since the last write, which the
+// existing target_edited / newer-wins-conflict cells handle regardless of
+// FieldsDisagree.
+//
+//	!mirror_drifted:
+//	  source_changed   -> patch(source_updated)
+//	  fields_disagree  -> patch(stale_bookkeeping)  // B23
+//	  else             -> skip(unchanged)
+//
+//	mirror_drifted, !source_changed -> propagate or revert (target_edited)
+//
+//	mirror_drifted, source_changed  -> conflict; newer wins (source ties)
 //
 // sourceWritable=true routes the drift-only branch to propagate; false
 // routes to revert. SPEC's pdir.source_writable flag drives this.
 func Classify(signal DriftSignal, sourceWritable bool, sourceUpdated, mirrorUpdated string) Outcome {
-	switch {
-	case !signal.SourceChanged && !signal.MirrorDrifted:
-		return Outcome{Action: ActionSkip, Reason: ReasonUnchanged}
+	if !signal.MirrorDrifted {
+		switch {
+		case signal.SourceChanged:
+			return Outcome{Action: ActionPatch, Reason: ReasonSourceUpdated}
+		case signal.FieldsDisagree:
+			// B23: stored bookkeeping says clean, but live managed fields
+			// disagree with desired-from-source. Repair by rewriting the
+			// mirror from source. No conflict label - the daemon doesn't
+			// have evidence of a user-edit conflict, just evidence of
+			// bookkeeping divergence.
+			return Outcome{Action: ActionPatch, Reason: ReasonStaleBookkeeping}
+		default:
+			return Outcome{Action: ActionSkip, Reason: ReasonUnchanged}
+		}
+	}
 
-	case signal.SourceChanged && !signal.MirrorDrifted:
-		return Outcome{Action: ActionPatch, Reason: ReasonSourceUpdated}
-
-	case !signal.SourceChanged && signal.MirrorDrifted:
+	if !signal.SourceChanged {
 		if sourceWritable {
 			return Outcome{Action: ActionPropagate, Reason: ReasonTargetEdited}
 		}
 		return Outcome{Action: ActionRevert, Reason: ReasonTargetEdited}
-
-	default: // both true: conflict
-		if compareTimestamps(sourceUpdated, mirrorUpdated) >= 0 {
-			return Outcome{Action: ActionPatch, Reason: ReasonSourceUpdated, Conflict: ConflictSourceWon}
-		}
-		if sourceWritable {
-			return Outcome{Action: ActionPropagate, Reason: ReasonTargetEdited, Conflict: ConflictTargetWon}
-		}
-		return Outcome{Action: ActionRevert, Reason: ReasonTargetEdited, Conflict: ConflictTargetWon}
 	}
+
+	// both signals fired: conflict, newer-wins.
+	if compareTimestamps(sourceUpdated, mirrorUpdated) >= 0 {
+		return Outcome{Action: ActionPatch, Reason: ReasonSourceUpdated, Conflict: ConflictSourceWon}
+	}
+	if sourceWritable {
+		return Outcome{Action: ActionPropagate, Reason: ReasonTargetEdited, Conflict: ConflictTargetWon}
+	}
+	return Outcome{Action: ActionRevert, Reason: ReasonTargetEdited, Conflict: ConflictTargetWon}
 }

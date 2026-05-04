@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.5](https://github.com/tammersaleh/calendar-sync/compare/v2.1.4...v2.1.5) (2026-05-04)
+
+
+### Bug Fixes
+
+* tolerate transient per-event read errors in classify loop ([d66b12e](https://github.com/tammersaleh/calendar-sync/commit/d66b12e81da25550d4115a839a96a4d00dbd4a42))
+
 ## [2.1.4](https://github.com/tammersaleh/calendar-sync/compare/v2.1.3...v2.1.4) (2026-05-03)
 
 

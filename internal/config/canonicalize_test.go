@@ -689,6 +689,37 @@ func TestCanonicalize_SummaryRefAccountDisambiguates(t *testing.T) {
 	}
 }
 
+// TestCanonicalize_SummaryRefStillAmbiguousAfterAccountFilter: account
+// substring matches multiple candidates. The substring heuristic isn't
+// perfect (this is the edge case the SPEC's "Limitation" note calls out)
+// and the ErrInvalid must explicitly say "still ambiguous" so the user
+// knows to fall back to a bare ID ref instead of trying yet another
+// account suffix.
+func TestCanonicalize_SummaryRefStillAmbiguousAfterAccountFilter(t *testing.T) {
+	c := baseConfig()
+	c.Pairs = []config.Pair{{
+		Name:   "p",
+		Source: config.CalendarRef{Summary: "Family", Account: "example.com"},
+		Target: config.CalendarRef{ID: "primary"},
+	}}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"primary": {ID: "personal@example.org", AccessRole: "owner"},
+		},
+		listResponses: []gws.CalendarListEntry{
+			{ID: "alice@example.com", Summary: "Family", AccessRole: "owner"},
+			{ID: "bob@example.com", Summary: "Family", AccessRole: "writer"},
+		},
+	}
+	_, err := c.Canonicalize(context.Background(), lister)
+	if !errors.Is(err, config.ErrInvalid) {
+		t.Fatalf("err = %v; want ErrInvalid", err)
+	}
+	if !strings.Contains(err.Error(), "still ambiguous") {
+		t.Errorf("err message %q should say 'still ambiguous'", err.Error())
+	}
+}
+
 // TestCanonicalize_SummaryRefAccountNoMatch: ambiguous summary, account
 // is set but no calendar's ID contains it. Must reject with a clear error
 // listing the matches so the user can correct the typo.

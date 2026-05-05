@@ -662,6 +662,37 @@ func TestCanonicalize_SummaryRefAmbiguousNoAccount(t *testing.T) {
 	}
 }
 
+// TestCanonicalize_SummaryRefSingleMatchHonorsAccount pins that an
+// `account = ...` is enforced even when only one calendar matches the
+// summary. The user's intent in supplying account is "this specific
+// owner"; silently returning a single match owned by someone else
+// would violate that constraint.
+func TestCanonicalize_SummaryRefSingleMatchHonorsAccount(t *testing.T) {
+	c := baseConfig()
+	c.Pairs = []config.Pair{{
+		Name:   "p",
+		Source: config.CalendarRef{Summary: "CoreWeave", Account: "bob@example.com"},
+		Target: config.CalendarRef{ID: "primary"},
+	}}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"primary": {ID: "personal@example.org", AccessRole: "owner"},
+		},
+		// Only one CoreWeave calendar exists, owned by alice. The user
+		// asked for bob's. We must NOT silently return alice's.
+		listResponses: []gws.CalendarListEntry{
+			{ID: "c_aaa@group.calendar.google.com", Summary: "CoreWeave", DataOwner: "alice@example.com", AccessRole: "owner"},
+		},
+	}
+	_, err := c.Canonicalize(context.Background(), lister)
+	if err == nil {
+		t.Fatal("expected error for single-match-with-mismatched-account, got nil")
+	}
+	if !strings.Contains(err.Error(), "bob@example.com") {
+		t.Errorf("error should reference the requested account; got: %v", err)
+	}
+}
+
 // TestCanonicalize_SummaryRefAccountDisambiguatesByDataOwner pins the
 // preferred two-step match: DataOwner equality wins over the ID-substring
 // heuristic. Two entries share a summary; the user-typed account picks

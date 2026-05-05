@@ -299,37 +299,42 @@ func resolveSummaryRef(
 		return nil, fmt.Errorf("%w: no calendar with summary %q visible to this account",
 			ErrInvalid, ref.Summary)
 	}
+
+	// When account is set, the user's intent is "pick the calendar owned
+	// by this account". Honor it even when only one calendar matches the
+	// summary - returning a single match owned by someone else would
+	// silently violate the user's stated constraint.
+	if ref.Account != "" {
+		accountLower := strings.ToLower(ref.Account)
+		var filtered []gws.CalendarListEntry
+		for _, e := range matches {
+			if matchesAccount(e, ref.Account, accountLower) {
+				filtered = append(filtered, e)
+			}
+		}
+		switch len(filtered) {
+		case 0:
+			return nil, fmt.Errorf(
+				"%w: summary %q matches %d calendars but none has DataOwner or ID matching account %q; matches were: %s",
+				ErrInvalid, ref.Summary, len(matches), ref.Account, formatMatchIDs(matches))
+		case 1:
+			entry := filtered[0]
+			return &entry, nil
+		default:
+			return nil, fmt.Errorf(
+				"%w: summary %q with account %q is still ambiguous: %s",
+				ErrInvalid, ref.Summary, ref.Account, formatMatchIDs(filtered))
+		}
+	}
+
 	if len(matches) == 1 {
 		entry := matches[0]
 		return &entry, nil
 	}
 
-	if ref.Account == "" {
-		return nil, fmt.Errorf(
-			"%w: summary %q matches %d calendars: %s; add account = \"...\" to disambiguate",
-			ErrInvalid, ref.Summary, len(matches), formatMatchIDs(matches))
-	}
-
-	accountLower := strings.ToLower(ref.Account)
-	var filtered []gws.CalendarListEntry
-	for _, e := range matches {
-		if matchesAccount(e, ref.Account, accountLower) {
-			filtered = append(filtered, e)
-		}
-	}
-	switch len(filtered) {
-	case 0:
-		return nil, fmt.Errorf(
-			"%w: summary %q matches %d calendars but none has DataOwner or ID matching account %q; matches were: %s",
-			ErrInvalid, ref.Summary, len(matches), ref.Account, formatMatchIDs(matches))
-	case 1:
-		entry := filtered[0]
-		return &entry, nil
-	default:
-		return nil, fmt.Errorf(
-			"%w: summary %q with account %q is still ambiguous: %s",
-			ErrInvalid, ref.Summary, ref.Account, formatMatchIDs(filtered))
-	}
+	return nil, fmt.Errorf(
+		"%w: summary %q matches %d calendars: %s; add account = \"...\" to disambiguate",
+		ErrInvalid, ref.Summary, len(matches), formatMatchIDs(matches))
 }
 
 // matchesAccount applies the two-step disambiguation match: prefer

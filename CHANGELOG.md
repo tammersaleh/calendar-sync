@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.4.0](https://github.com/tammersaleh/calendar-sync/compare/v2.3.0...v2.4.0) (2026-05-05)
+
+
+### Features
+
+* B17 target-syncToken for sub-tick target-edit propagation ([547032b](https://github.com/tammersaleh/calendar-sync/commit/547032b414c39e6bffdf423253d977d97c15cd4b))
+
+
+### Bug Fixes
+
+* don't advance target syncToken when inventory is missing ([4353e8d](https://github.com/tammersaleh/calendar-sync/commit/4353e8d7c29c5705ac2e35f1835129f19e563ed9))
+* don't shadow recurring parent in inventory on inherited target-delta ([792ea07](https://github.com/tammersaleh/calendar-sync/commit/792ea078ddbeaacb51462f573b8d4494ea9a41c3))
+* emit skip(source_orphan) for non-recurring target-delta 404 ([5853c8b](https://github.com/tammersaleh/calendar-sync/commit/5853c8b616e8adf31a5d04a0013b9722d89d3ac8))
+* tolerate transient read errors in target-delta classify ([a25544f](https://github.com/tammersaleh/calendar-sync/commit/a25544f6e152af4359961dee7bff761f1ec15de5))
+* trigger fast-track FullSync on target-token 410 GONE ([8868a25](https://github.com/tammersaleh/calendar-sync/commit/8868a25751a1ae87293bab997046b178d2c84a5f))
+
 ## [2.3.0](https://github.com/tammersaleh/calendar-sync/compare/v2.2.0...v2.3.0) (2026-05-05)
 
 

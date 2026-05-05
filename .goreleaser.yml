@@ -42,4 +42,26 @@ homebrew_casks:
         install: |
           if OS.mac?
             system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/calendar-sync"]
+
+            # Restart the launchd agent if it's currently loaded so
+            # `brew upgrade calendar-sync` picks up the new binary
+            # automatically. Without this, the running daemon keeps
+            # executing the prior binary's mmap'd code (kernel caches
+            # the file, on-disk replacement doesn't bounce the process)
+            # and the user has to run `calendar-sync uninstall &&
+            # calendar-sync install` by hand. Cold install: launchctl
+            # print fails (agent not loaded), the kickstart skips, and
+            # the user runs `calendar-sync install` to load it the first
+            # time. must_succeed: false keeps brew from failing the
+            # upgrade if launchctl misbehaves.
+            uid = Process.uid
+            label = "org.calendar-sync.agent"
+            loaded = system_command "/bin/launchctl",
+              args: ["print", "gui/#{uid}/#{label}"],
+              must_succeed: false
+            if loaded.success?
+              system_command "/bin/launchctl",
+                args: ["kickstart", "-k", "gui/#{uid}/#{label}"],
+                must_succeed: false
+            end
           end

@@ -884,6 +884,10 @@ The plist generated:
 
 `KeepAlive=true` makes launchd restart the daemon if it crashes (with launchd's standard exponential-backoff between restarts). `RunAtLoad=true` starts it at user login. `ProcessType=Interactive` signals to launchd that the process behaves like an interactive (foreground) program rather than a long-running background service - this affects launchd's resource scheduling but does not prevent the OS from suspending the process during system sleep. (Sleep behavior is documented in "Sleep and wake" within the Sync Algorithm section.) There is no `StartInterval`; the daemon's own internal scheduler drives the polling cadence (see `settings.poll_interval`).
 
+#### Upgrades via Homebrew
+
+`brew upgrade calendar-sync` replaces the on-disk binary at `/opt/homebrew/bin/calendar-sync`, but launchd does NOT bounce the daemon when the binary file is replaced - the running process keeps executing the prior binary's mmap'd code. The Homebrew cask's `postflight` hook bridges the gap: it runs `launchctl kickstart -k gui/<uid>/org.calendar-sync.agent` whenever the agent is currently loaded, restarting the daemon against the new binary. Cold installs (no agent loaded yet) skip the kickstart so a first-time `brew install` doesn't fail; the user runs `calendar-sync install` once after install to load the agent for the first time. `kickstart` failures are non-fatal (`must_succeed: false`) so a transient launchctl issue won't block the upgrade itself - the user's next `calendar-sync status` will surface a stale binary if anything went wrong.
+
 #### Errors
 
 | Error code               | Exit | When                                                              |

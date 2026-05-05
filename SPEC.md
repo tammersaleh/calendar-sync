@@ -484,7 +484,7 @@ Errors that prevent a command from running go to stderr as a single JSON object:
 | 0    | Success              | Command ran to completion.                                                                    |
 | 1    | General error        | Config invalid, gws subprocess failed for non-auth reasons, partial sync failure.             |
 | 2    | Auth error           | `gws auth status` reports unauthenticated, or 401 returned from a Calendar API call.          |
-| 3    | Rate limited         | Hit retry ceiling (5 retries, exponential backoff with jitter, respects `Retry-After`).       |
+| 3    | Rate limited         | Hit retry ceiling (5 retries, exponential backoff with jitter; see Retry policy).             |
 | 4    | Network error        | DNS failure, connection refused, TLS error.                                                   |
 | 5    | Daemon already running | `calendar-sync run` was invoked while `calendar-sync watch` is reachable on its IPC socket. |
 | 64   | Usage error          | Unknown command, missing required flag, invalid flag value.                                   |
@@ -1392,7 +1392,7 @@ Complete list of error codes:
 
 ### Retry policy
 
-The API layer retries on these statuses with exponential backoff (1s, 2s, 4s, 8s, 16s, capped by `Retry-After` if present), 5 attempts max, with jitter:
+The API layer retries on these statuses with exponential backoff (1s, 2s, 4s, 8s, 16s), 5 attempts max, with jitter. `Retry-After` honoring is on the roadmap but not yet implemented: gws does not currently expose the header in its error envelope, so calendar-sync's retry layer cannot consult it. The fixed exponential schedule applies regardless.
 
 - **429** (any reason).
 - **403** with reason `rateLimitExceeded` or `userRateLimitExceeded` (Google sometimes returns 403 instead of 429 for per-user quotas).

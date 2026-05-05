@@ -59,7 +59,7 @@ func (c *Classifier) doPropagate(
 	// pulled from patchedSource.Updated). Convert via BuildPatchPayload so
 	// every managed field is set explicitly (clear-intent on whatever the
 	// post-patch source has cleared).
-	rewritten := mirror.BuildPayload(c.SourceCalendarID, patchedSource)
+	rewritten := mirror.BuildPayloadWithTimeZone(c.SourceCalendarID, patchedSource, c.TimeZone)
 
 	post, err := c.patchMirrorWithChecksum(ctx, c.TargetCalendarID, mirrorEvent.ID, mirror.BuildPatchPayload(rewritten))
 	if err != nil {

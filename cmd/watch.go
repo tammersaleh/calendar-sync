@@ -25,18 +25,20 @@ func (c *WatchCmd) Run(rt *Runtime) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
-	canonical, err := cfg.Canonicalize(rt.Ctx, rt.gwsClient())
+
+	// SPEC line 488: --timeout is the "wall-clock cap for any single
+	// source-list or mirror-list call." Wrap the gws client so every
+	// gws subprocess invocation gets bounded at the call boundary,
+	// INCLUDING the calendarList resolution Canonicalize calls. A
+	// wedged gws subprocess (network blip, hung helper) returns
+	// context.DeadlineExceeded after timeout instead of hanging the
+	// daemon's startup or any subsequent pass.
+	api := newCallTimeoutAPI(rt.gwsClient(), c.Timeout)
+	canonical, err := cfg.Canonicalize(rt.Ctx, api)
 	if err != nil {
 		return err
 	}
 
-	// SPEC line 488: --timeout is the "wall-clock cap for any single
-	// source-list or mirror-list call." Wrap the gws client so every
-	// gws subprocess invocation gets bounded at the call boundary; a
-	// wedged gws subprocess (network blip, hung helper) returns
-	// context.DeadlineExceeded after timeout instead of hanging the
-	// daemon's entire pass.
-	api := newCallTimeoutAPI(rt.gwsClient(), c.Timeout)
 	// SPEC line 253: `[settings].dry_run = true` must suppress writes. The
 	// daemon has no `--dry-run` flag (long-running by design), so settings
 	// is the only way to flip the wrapper for `watch`.

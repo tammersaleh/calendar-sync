@@ -572,6 +572,8 @@ A given `reason` is paired with one of six `action` values: `insert`, `patch`, `
 | `migration_upgrade`        | `patch`                     | A legacy mirror (v1 or v2) with no source change and no drift, re-written at the current `version` with a fresh `calendar-sync:checksum`. One-time per pre-existing mirror. |
 | `inherited_upgrade`        | `patch`                     | A recurring-instance mirror auto-materialized by Google from a parent we wrote, with no actual drift, re-written so the instance carries per-instance `calendar-sync:source` and `:checksum`. One-time per inherited instance. See "Inherited recurring-instance handling". |
 | `orphaned`                 | `delete`                    | Prune pass found a mirror whose source no longer exists.                                                                                 |
+| `mirror_only_override`     | `skip`                      | Target-delta saw a recurring instance whose source has no override at that occurrence. Phase 1 limitation; SPEC §"Limitation: mirror-only recurring instance overrides" + B17 Phase 2 follow-up. |
+| `source_orphan`            | `skip`                      | Target-delta event references a source that no longer exists. The orphan-walk's existing prune pass cleans the mirror; target-delta's job is just to surface the observation. |
 
 Server-side `eventTypes` filtering means events of excluded types (`birthday`, `fromGmail`, `workingLocation`) never appear on the wire and so don't produce a `skip` event.
 

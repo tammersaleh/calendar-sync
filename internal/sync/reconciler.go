@@ -64,10 +64,18 @@ type Reconciler struct {
 
 	// In-memory state. SPEC §"In-memory state" lists these as the only
 	// pieces that survive across ticks. A cold start (daemon restart, system
-	// reboot) starts with all three empty and re-derives them via FullSync.
+	// reboot) starts with all four empty and re-derives them via FullSync.
 	syncTokens   map[string]string     // canonical source -> latest token
 	inventories  map[string]*Inventory // canonical target -> live inventory
 	lastFullSync map[string]time.Time  // canonical source -> last full-sync ts
+
+	// targetSyncTokens drives B17's per-target delta phase. Only populated
+	// for targets that have at least one writable-source pdir with the
+	// propagate gate enabled (uniqueWritableTargets). Idle targets that
+	// can't propagate target edits never list. Seeded by FullSync BEFORE
+	// rebuildInventories runs so an edit landing in the gap between seed
+	// and inventory snapshot is visible to the next tick's target-delta.
+	targetSyncTokens map[string]string // canonical target -> latest token
 }
 
 // debug is a nil-safe wrapper around r.Log.Debug. Centralizing the nil
@@ -122,11 +130,12 @@ func WithLogger(l Logger) Option {
 // field access (the Reconciler is exported; both styles are supported).
 func New(api API, canonical *config.Canonical, opts ...Option) *Reconciler {
 	r := &Reconciler{
-		API:          api,
-		Canonical:    canonical,
-		syncTokens:   map[string]string{},
-		inventories:  map[string]*Inventory{},
-		lastFullSync: map[string]time.Time{},
+		API:              api,
+		Canonical:        canonical,
+		syncTokens:       map[string]string{},
+		inventories:      map[string]*Inventory{},
+		lastFullSync:     map[string]time.Time{},
+		targetSyncTokens: map[string]string{},
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -218,11 +227,26 @@ type FullSyncResult struct {
 // TickResult is what Tick returns. Same shape as FullSyncResult; the orphan
 // walk doesn't run on per-tick (SPEC §"per-tick reconciliation" lines 917-
 // 936 don't include it).
+//
+// PerTarget carries B17's per-target delta status. NeedsFullResync there
+// signals a 410 GONE on the target-syncToken stream; a fresh seed needs
+// to run on the next FullSync. PerTarget is populated only for targets
+// the target-delta phase actually visited (uniqueWritableTargets).
 type TickResult struct {
-	PDirs      []PDirResult
-	PerSource  map[string]SourceStatus
-	DurationMS int64
-	Aggregated Counts
+	PDirs       []PDirResult
+	PerSource   map[string]SourceStatus
+	PerTarget   map[string]TargetStatus
+	TargetDelta Counts
+	DurationMS  int64
+	Aggregated  Counts
+}
+
+// TargetStatus is the per-target bookkeeping the daemon needs after a
+// target-delta phase. NeedsFullResync is true iff a 410 GONE was received
+// on the target-syncToken stream (the seed token was invalidated).
+type TargetStatus struct {
+	SyncTokenChanged bool
+	NeedsFullResync  bool
 }
 
 // InventorySize returns the current number of mirrors in the in-memory
@@ -292,6 +316,27 @@ func (r *Reconciler) uniqueTargets() []string {
 	return out
 }
 
+// uniqueWritableTargets returns the canonical target IDs that have at
+// least one pdir with the effective two-way-sync gate open
+// (pd.SourceWritable && pd.PropagateTargetEdits). Sorted alphabetically
+// for stable iteration. Powers B17's target-delta phase: targets without
+// any writable-source pdir never list, since target edits there can't
+// propagate anywhere.
+func (r *Reconciler) uniqueWritableTargets() []string {
+	seen := map[string]struct{}{}
+	for _, pd := range r.Canonical.PDirs {
+		if pd.SourceWritable && pd.PropagateTargetEdits {
+			seen[pd.TargetCalendar] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for t := range seen {
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // now returns the configured clock or time.Now. Mirrors Classifier.now /
 // OrphanWalker.now for consistency.
 func (r *Reconciler) now() time.Time {
@@ -329,6 +374,14 @@ func (r *Reconciler) FullSync(ctx context.Context) (FullSyncResult, error) {
 
 	// 1. Full source-list per unique source.
 	stagedEvents, stagedTokens, sourceErrs := r.fullListSources(ctx)
+
+	// 1.5. B17: seed per-target syncTokens BEFORE rebuilding inventories.
+	//      If we seeded after, an edit landing in the gap is invisible to
+	//      both inventory (already snapshotted) and the seeded token (which
+	//      starts after the edit). The errors are tolerated - a single
+	//      target that can't seed will simply re-seed on the next FullSync;
+	//      it doesn't block the rest of the pass.
+	r.seedTargetSyncTokens(ctx)
 
 	// 2. Inventory rebuild per unique target. Errors are tracked per target
 	//    so we can mark dependent pdirs as failed and skip token advancement
@@ -400,7 +453,14 @@ func (r *Reconciler) Tick(ctx context.Context) (TickResult, error) {
 
 	res := TickResult{
 		PerSource: map[string]SourceStatus{},
+		PerTarget: map[string]TargetStatus{},
 	}
+
+	// B17 phase 1: target-delta MUST run before source-delta. Otherwise
+	// source-driven mirror rewrites in the source-delta phase can clobber
+	// target edits before target-delta lists them. Pinned by
+	// TestTickPhaseOrdering_TargetBeforeSource.
+	r.runTargetDeltaPhase(ctx, &res)
 
 	stagedEvents, stagedTokens, sourceErrs := r.incrementalListSources(ctx, res.PerSource)
 
@@ -411,6 +471,11 @@ func (r *Reconciler) Tick(ctx context.Context) (TickResult, error) {
 	}
 
 	r.advanceTokens(stagedTokens, res.PDirs, res.PerSource)
+
+	// Fold target-delta counts into Aggregated so the daemon's _meta
+	// trailer reflects the full tick's work. The detail breakdown lives in
+	// res.TargetDelta for callers that want per-phase visibility.
+	res.Aggregated.add(res.TargetDelta)
 
 	res.DurationMS = r.now().Sub(start).Milliseconds()
 	return res, nil
@@ -464,6 +529,54 @@ func (r *Reconciler) fullListSources(ctx context.Context) (
 		tokens[source] = token
 	}
 	return events, tokens, errs
+}
+
+// seedTargetSyncTokens runs B17's pre-inventory-rebuild seeding pass: for
+// each writable-source target, issue an empty-syncToken events.list and
+// capture nextSyncToken into r.targetSyncTokens. The next Tick uses these
+// tokens to detect target-side edits (which the source-syncToken stream
+// can't see, since target-only edits don't change anything on source).
+//
+// Errors are returned per-target so the caller can log them; a single
+// failed seed leaves r.targetSyncTokens[T] unset, and the next FullSync
+// will re-attempt. Phase ordering matters: this must run BEFORE
+// rebuildInventories so an edit landing in the gap between seed and
+// inventory snapshot is visible to the next tick's target-delta. See the
+// design's "Token seeding before inventory rebuild" must-fix.
+//
+// Targets without any writable-source pdir are skipped silently
+// (uniqueWritableTargets filters them out): there's no path for a target
+// edit there to propagate, so listing the delta would be wasted work.
+func (r *Reconciler) seedTargetSyncTokens(ctx context.Context) map[string]error {
+	errs := map[string]error{}
+	for _, target := range r.uniqueWritableTargets() {
+		// SPEC's source-list shape is reused for the seed: ShowDeleted=true
+		// + EventTypes filter. SingleEvents stays false so recurring parents
+		// come back as parents (the target-delta dispatcher distinguishes
+		// parents from instances via the response's recurringEventId).
+		params := gws.EventsListParams{
+			CalendarID:   target,
+			ShowDeleted:  true,
+			SingleEvents: false,
+			EventTypes:   sourceListEventTypes,
+			MaxResults:   MaxResultsPerPage,
+		}
+		_, token, err := r.API.EventsList(ctx, params)
+		if err != nil {
+			errs[target] = err
+			r.warn("sync.seedTargetSyncTokens: seed failed",
+				"target", target,
+				"error", err.Error(),
+			)
+			continue
+		}
+		r.targetSyncTokens[target] = token
+		r.debug("sync.seedTargetSyncTokens: seeded",
+			"target", target,
+			"token_present", token != "",
+		)
+	}
+	return errs
 }
 
 // incrementalListSources runs SPEC §"per-tick reconciliation" step 1: an

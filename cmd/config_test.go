@@ -48,6 +48,21 @@ func (s *stubGws) CalendarListGet(_ context.Context, id string) (*gws.CalendarLi
 	return &gws.CalendarListEntry{ID: id, AccessRole: "owner"}, nil
 }
 
+// CalendarListList returns the calendars map flattened to a slice. Unused
+// in the existing cmd-level fixtures (which all use ID-form refs and
+// route through CalendarListGet); keeps the GwsClient interface satisfied
+// after F1 widened it.
+func (s *stubGws) CalendarListList(context.Context) ([]gws.CalendarListEntry, error) {
+	if s.calendars == nil {
+		return nil, nil
+	}
+	out := make([]gws.CalendarListEntry, 0, len(s.calendars))
+	for _, e := range s.calendars {
+		out = append(out, *e)
+	}
+	return out, nil
+}
+
 func (s *stubGws) EventsList(context.Context, gws.EventsListParams) ([]gws.Event, string, error) {
 	return nil, "", nil
 }

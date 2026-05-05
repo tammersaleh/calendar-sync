@@ -298,6 +298,10 @@ func (d *dryRunAPI) CalendarListGet(ctx context.Context, id string) (*gws.Calend
 	return d.inner.CalendarListGet(ctx, id)
 }
 
+func (d *dryRunAPI) CalendarListList(ctx context.Context) ([]gws.CalendarListEntry, error) {
+	return d.inner.CalendarListList(ctx)
+}
+
 func (d *dryRunAPI) EventsList(ctx context.Context, params gws.EventsListParams) ([]gws.Event, string, error) {
 	return d.inner.EventsList(ctx, params)
 }

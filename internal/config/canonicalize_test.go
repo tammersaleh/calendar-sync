@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,11 +15,20 @@ import (
 // stubLister is the in-process CalendarLister used by canonicalize tests.
 // Each entry is a canned response keyed by the literal calendar reference
 // the caller passes in (matches the TOML field). Tests that need a
-// failure case set Err.
+// failure case set err / listErr.
+//
+// listResponses backs CalendarListList, used by F1 summary lookups. Tests
+// covering only ID-form refs leave it nil; canonicalize skips the list
+// call entirely in that case so the field is unused. Tests that DO trigger
+// the call (any enabled pair with a summary ref) populate listResponses
+// to drive the summary->entries index.
 type stubLister struct {
-	responses map[string]*gws.CalendarListEntry
-	err       error
-	calls     []string
+	responses     map[string]*gws.CalendarListEntry
+	listResponses []gws.CalendarListEntry
+	err           error
+	listErr       error
+	calls         []string
+	listCalls     int
 }
 
 func (s *stubLister) CalendarListGet(ctx context.Context, calendarID string) (*gws.CalendarListEntry, error) {
@@ -31,6 +41,14 @@ func (s *stubLister) CalendarListGet(ctx context.Context, calendarID string) (*g
 		return nil, fmt.Errorf("stubLister: no response for %q", calendarID)
 	}
 	return entry, nil
+}
+
+func (s *stubLister) CalendarListList(ctx context.Context) ([]gws.CalendarListEntry, error) {
+	s.listCalls++
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	return s.listResponses, nil
 }
 
 func enabled(b bool) *bool { return &b }
@@ -547,5 +565,356 @@ func TestCanonicalize_PropagatesValidationFailure(t *testing.T) {
 	}
 	if len(lister.calls) != 0 {
 		t.Errorf("Canonicalize made %d gws calls before validation; want 0", len(lister.calls))
+	}
+}
+
+// TestCanonicalize_SummaryRefResolves pins the F1 happy path: a single
+// summary-form source resolves against the CalendarListList result and
+// flows through the rest of canonicalization unchanged.
+func TestCanonicalize_SummaryRefResolves(t *testing.T) {
+	c := baseConfig()
+	c.Pairs = []config.Pair{{
+		Name:   "p",
+		Source: config.CalendarRef{Summary: "TripIt"},
+		Target: config.CalendarRef{ID: "primary"},
+	}}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"primary": {ID: "alice@example.com", AccessRole: "owner"},
+		},
+		listResponses: []gws.CalendarListEntry{
+			{ID: "tripit-abc@import.calendar.google.com", Summary: "TripIt", AccessRole: "reader"},
+			{ID: "alice@example.com", Summary: "alice@example.com", AccessRole: "owner"},
+		},
+	}
+	can, err := c.Canonicalize(context.Background(), lister)
+	if err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	if got, want := can.PDirs[0].SourceCalendar, "tripit-abc@import.calendar.google.com"; got != want {
+		t.Errorf("SourceCalendar = %q, want %q", got, want)
+	}
+	if lister.listCalls != 1 {
+		t.Errorf("listCalls = %d, want 1 (summary lookup must use one CalendarListList call)", lister.listCalls)
+	}
+}
+
+// TestCanonicalize_SummaryRefCaseInsensitive: Google's UI shows a fixed-
+// case summary but a user might type any casing; the lookup must match
+// case-insensitively. Pinned because exact-case would silently 404 the
+// user's pair.
+func TestCanonicalize_SummaryRefCaseInsensitive(t *testing.T) {
+	c := baseConfig()
+	c.Pairs = []config.Pair{{
+		Name:   "p",
+		Source: config.CalendarRef{Summary: "tripit"}, // lowercase user input
+		Target: config.CalendarRef{ID: "primary"},
+	}}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"primary": {ID: "alice@example.com", AccessRole: "owner"},
+		},
+		listResponses: []gws.CalendarListEntry{
+			{ID: "tripit-abc@import.calendar.google.com", Summary: "TripIt", AccessRole: "reader"},
+		},
+	}
+	can, err := c.Canonicalize(context.Background(), lister)
+	if err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	if got, want := can.PDirs[0].SourceCalendar, "tripit-abc@import.calendar.google.com"; got != want {
+		t.Errorf("SourceCalendar = %q, want %q (case-insensitive summary lookup)", got, want)
+	}
+}
+
+// TestCanonicalize_SummaryRefAmbiguousNoAccount: two calendars share a
+// summary and the pair didn't add `account = "..."` to disambiguate.
+// Must reject with ErrInvalid plus a hint listing every match.
+func TestCanonicalize_SummaryRefAmbiguousNoAccount(t *testing.T) {
+	c := baseConfig()
+	c.Pairs = []config.Pair{{
+		Name:   "p",
+		Source: config.CalendarRef{Summary: "Family"},
+		Target: config.CalendarRef{ID: "primary"},
+	}}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"primary": {ID: "alice@example.com", AccessRole: "owner"},
+		},
+		listResponses: []gws.CalendarListEntry{
+			{ID: "family-1@group.calendar.google.com", Summary: "Family", AccessRole: "reader"},
+			{ID: "family-2@group.calendar.google.com", Summary: "Family", AccessRole: "reader"},
+		},
+	}
+	_, err := c.Canonicalize(context.Background(), lister)
+	if !errors.Is(err, config.ErrInvalid) {
+		t.Fatalf("err = %v; want ErrInvalid", err)
+	}
+	if !strings.Contains(err.Error(), "matches 2 calendars") {
+		t.Errorf("err message %q should report the match count", err.Error())
+	}
+	if !strings.Contains(err.Error(), "family-1@group.calendar.google.com") ||
+		!strings.Contains(err.Error(), "family-2@group.calendar.google.com") {
+		t.Errorf("err message %q should list every match's ID for disambiguation", err.Error())
+	}
+	if !strings.Contains(err.Error(), "account") {
+		t.Errorf("err message %q should hint at the account disambiguator", err.Error())
+	}
+}
+
+// TestCanonicalize_SummaryRefAccountDisambiguates: ambiguous summary +
+// account substring filters down to exactly one match.
+func TestCanonicalize_SummaryRefAccountDisambiguates(t *testing.T) {
+	c := baseConfig()
+	c.Pairs = []config.Pair{{
+		Name:   "p",
+		Source: config.CalendarRef{Summary: "CoreWeave", Account: "alice@example.com"},
+		Target: config.CalendarRef{ID: "primary"},
+	}}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"primary": {ID: "personal@example.org", AccessRole: "owner"},
+		},
+		listResponses: []gws.CalendarListEntry{
+			{ID: "alice@example.com", Summary: "CoreWeave", AccessRole: "owner"},
+			{ID: "bob@example.com", Summary: "CoreWeave", AccessRole: "reader"},
+		},
+	}
+	can, err := c.Canonicalize(context.Background(), lister)
+	if err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	if got, want := can.PDirs[0].SourceCalendar, "alice@example.com"; got != want {
+		t.Errorf("SourceCalendar = %q, want %q (account substring disambiguation)", got, want)
+	}
+}
+
+// TestCanonicalize_SummaryRefAccountNoMatch: ambiguous summary, account
+// is set but no calendar's ID contains it. Must reject with a clear error
+// listing the matches so the user can correct the typo.
+func TestCanonicalize_SummaryRefAccountNoMatch(t *testing.T) {
+	c := baseConfig()
+	c.Pairs = []config.Pair{{
+		Name:   "p",
+		Source: config.CalendarRef{Summary: "CoreWeave", Account: "carol@nope.invalid"},
+		Target: config.CalendarRef{ID: "primary"},
+	}}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"primary": {ID: "alice@example.com", AccessRole: "owner"},
+		},
+		listResponses: []gws.CalendarListEntry{
+			{ID: "alice@example.com", Summary: "CoreWeave", AccessRole: "owner"},
+			{ID: "bob@example.com", Summary: "CoreWeave", AccessRole: "reader"},
+		},
+	}
+	_, err := c.Canonicalize(context.Background(), lister)
+	if !errors.Is(err, config.ErrInvalid) {
+		t.Fatalf("err = %v; want ErrInvalid", err)
+	}
+	if !strings.Contains(err.Error(), "carol@nope.invalid") {
+		t.Errorf("err message %q should mention the account that didn't match", err.Error())
+	}
+	if !strings.Contains(err.Error(), "alice@example.com") {
+		t.Errorf("err message %q should list candidates so the user can pick the correct account", err.Error())
+	}
+}
+
+// TestCanonicalize_SummaryRefNotFound covers the "user typo'd a name that
+// doesn't exist" case: zero matches must produce a clear ErrInvalid.
+func TestCanonicalize_SummaryRefNotFound(t *testing.T) {
+	c := baseConfig()
+	c.Pairs = []config.Pair{{
+		Name:   "p",
+		Source: config.CalendarRef{Summary: "nonexistent calendar"},
+		Target: config.CalendarRef{ID: "primary"},
+	}}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"primary": {ID: "alice@example.com", AccessRole: "owner"},
+		},
+		listResponses: []gws.CalendarListEntry{
+			{ID: "tripit-abc@import.calendar.google.com", Summary: "TripIt", AccessRole: "reader"},
+		},
+	}
+	_, err := c.Canonicalize(context.Background(), lister)
+	if !errors.Is(err, config.ErrInvalid) {
+		t.Fatalf("err = %v; want ErrInvalid", err)
+	}
+	if !strings.Contains(err.Error(), "nonexistent calendar") {
+		t.Errorf("err message %q should mention the missing summary", err.Error())
+	}
+}
+
+// TestCanonicalize_AllIDRefsSkipListCall: configs with only ID-form refs
+// (every existing user config) must NOT make a CalendarListList call.
+// Pre-F1 configs keep their pre-F1 cost profile.
+func TestCanonicalize_AllIDRefsSkipListCall(t *testing.T) {
+	c := baseConfig()
+	c.Pairs = []config.Pair{{
+		Name:   "p",
+		Source: config.CalendarRef{ID: "a@example.com"},
+		Target: config.CalendarRef{ID: "b@example.com"},
+	}}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"a@example.com": {ID: "a@example.com", AccessRole: "owner"},
+			"b@example.com": {ID: "b@example.com", AccessRole: "owner"},
+		},
+		// Sentinel error: if canonicalize accidentally calls
+		// CalendarListList for an ID-only config, the test fails noisily.
+		listErr: errors.New("CalendarListList must not be called for ID-only configs"),
+	}
+	if _, err := c.Canonicalize(context.Background(), lister); err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	if lister.listCalls != 0 {
+		t.Errorf("listCalls = %d, want 0", lister.listCalls)
+	}
+}
+
+// TestCanonicalize_TwoSummaryRefsShareOneListCall: two enabled pairs
+// each with a summary-form ref must share a single CalendarListList
+// call. Pinned because the pre-fetch lives at canonicalize-time, not
+// per-ref; a regression that fires the list call inside resolveOne
+// would scale linearly with pair count.
+func TestCanonicalize_TwoSummaryRefsShareOneListCall(t *testing.T) {
+	c := baseConfig()
+	c.Pairs = []config.Pair{
+		{
+			Name:   "p1",
+			Source: config.CalendarRef{Summary: "TripIt"},
+			Target: config.CalendarRef{ID: "primary"},
+		},
+		{
+			Name:   "p2",
+			Source: config.CalendarRef{Summary: "Holidays"},
+			Target: config.CalendarRef{ID: "primary"},
+		},
+	}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"primary": {ID: "alice@example.com", AccessRole: "owner"},
+		},
+		listResponses: []gws.CalendarListEntry{
+			{ID: "tripit-1@import.calendar.google.com", Summary: "TripIt", AccessRole: "reader"},
+			{ID: "holidays-1@group.calendar.google.com", Summary: "Holidays", AccessRole: "reader"},
+		},
+	}
+	if _, err := c.Canonicalize(context.Background(), lister); err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	if lister.listCalls != 1 {
+		t.Errorf("listCalls = %d, want 1 (both summary refs must share one CalendarListList call)", lister.listCalls)
+	}
+}
+
+// TestCanonicalize_DisabledPairWithSummaryRefSkipsListCall: a disabled
+// pair carrying a summary-form ref must NOT trigger a CalendarListList
+// call. SPEC's "disabled pair = skipped entirely" rule applies to F1
+// summary lookups too.
+func TestCanonicalize_DisabledPairWithSummaryRefSkipsListCall(t *testing.T) {
+	c := baseConfig()
+	c.Pairs = []config.Pair{
+		{
+			Name:   "active",
+			Source: config.CalendarRef{ID: "a@example.com"},
+			Target: config.CalendarRef{ID: "b@example.com"},
+		},
+		{
+			Name:    "off",
+			Source:  config.CalendarRef{Summary: "TripIt"},
+			Target:  config.CalendarRef{ID: "primary"},
+			Enabled: enabled(false),
+		},
+	}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"a@example.com": {ID: "a@example.com", AccessRole: "owner"},
+			"b@example.com": {ID: "b@example.com", AccessRole: "owner"},
+		},
+		listErr: errors.New("CalendarListList must not be called when only disabled pairs use summary refs"),
+	}
+	if _, err := c.Canonicalize(context.Background(), lister); err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	if lister.listCalls != 0 {
+		t.Errorf("listCalls = %d, want 0", lister.listCalls)
+	}
+}
+
+// TestCanonicalize_SummaryRefOnReaderSourceOK: a reader-only calendar is
+// fine on the source side; F1 doesn't change the access-role rules.
+// Pinned to confirm the typical TripIt subscription case (always reader)
+// works end-to-end via summary lookup.
+func TestCanonicalize_SummaryRefOnReaderSourceOK(t *testing.T) {
+	c := baseConfig()
+	c.Pairs = []config.Pair{{
+		Name:   "p",
+		Source: config.CalendarRef{Summary: "TripIt"},
+		Target: config.CalendarRef{ID: "primary"},
+	}}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"primary": {ID: "alice@example.com", AccessRole: "owner"},
+		},
+		listResponses: []gws.CalendarListEntry{
+			{ID: "tripit-abc@import.calendar.google.com", Summary: "TripIt", AccessRole: "reader"},
+		},
+	}
+	can, err := c.Canonicalize(context.Background(), lister)
+	if err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	if can.PDirs[0].SourceWritable {
+		t.Errorf("SourceWritable = true on reader-only TripIt source; want false")
+	}
+}
+
+// TestCanonicalize_SummaryRefOnReaderTargetRejected: target with reader-
+// only access fails the standard accessRole >= writer check via the
+// summary lookup path. Pin so a future bug that bypasses the rule for
+// summary-form refs surfaces as a test failure.
+func TestCanonicalize_SummaryRefOnReaderTargetRejected(t *testing.T) {
+	c := baseConfig()
+	c.Pairs = []config.Pair{{
+		Name:   "p",
+		Source: config.CalendarRef{ID: "primary"},
+		Target: config.CalendarRef{Summary: "TripIt"},
+	}}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"primary": {ID: "alice@example.com", AccessRole: "owner"},
+		},
+		listResponses: []gws.CalendarListEntry{
+			{ID: "tripit-abc@import.calendar.google.com", Summary: "TripIt", AccessRole: "reader"},
+		},
+	}
+	_, err := c.Canonicalize(context.Background(), lister)
+	if !errors.Is(err, config.ErrInvalid) {
+		t.Fatalf("err = %v; want ErrInvalid", err)
+	}
+	if !strings.Contains(err.Error(), "writer") {
+		t.Errorf("err message %q should mention the writer requirement", err.Error())
+	}
+}
+
+// TestCanonicalize_ListErrorPropagates: a CalendarListList failure must
+// surface unchanged so callers (run.go) can map the gws error code
+// through the standard exit path.
+func TestCanonicalize_ListErrorPropagates(t *testing.T) {
+	c := baseConfig()
+	c.Pairs = []config.Pair{{
+		Name:   "p",
+		Source: config.CalendarRef{Summary: "TripIt"},
+		Target: config.CalendarRef{ID: "primary"},
+	}}
+	wantErr := errors.New("simulated network blip")
+	lister := &stubLister{
+		listErr: wantErr,
+	}
+	_, err := c.Canonicalize(context.Background(), lister)
+	if !errors.Is(err, wantErr) {
+		t.Errorf("err = %v; want errors.Is to match the lister's error", err)
 	}
 }

@@ -72,10 +72,19 @@ type Canonical struct {
 
 // CalendarLister is the gws-subprocess capability Canonicalize needs.
 // Defined here so tests can provide a stub without spinning up the
-// fake-gws harness for unit-level coverage; the production caller passes
-// (*gws.Client).CalendarListGet directly.
+// fake-gws harness for unit-level coverage. *gws.Client implements both
+// methods natively; production callers pass it directly.
+//
+// CalendarListGet resolves a single calendar ID to its CalendarListEntry
+// (used for the pre-F1 ID-form refs and for the "primary" alias).
+//
+// CalendarListList returns every calendar visible to the gws-authenticated
+// account. Used to back F1 summary lookups: a single call suffices to
+// build the case-insensitive summary->entries index that resolves every
+// summary-form ref across all enabled pairs.
 type CalendarLister interface {
 	CalendarListGet(ctx context.Context, calendarID string) (*gws.CalendarListEntry, error)
+	CalendarListList(ctx context.Context) ([]gws.CalendarListEntry, error)
 }
 
 // Canonicalize resolves every calendar reference in c via lister, captures
@@ -124,6 +133,13 @@ func (c Config) Canonicalize(ctx context.Context, lister CalendarLister) (*Canon
 // expansion step can map a Pair's literal Source/Target back to a resolved
 // Calendar in O(1).
 //
+// ID-form refs route through CalendarListGet exactly as before. Summary-
+// form refs (F1) all share a single CalendarListList call that builds a
+// case-insensitive summary->entries index; each summary-form ref then
+// resolves against that index. The list call is skipped entirely when no
+// enabled pair carries a summary-form ref, preserving the pre-F1 cost
+// for existing configs.
+//
 // The first OriginalRef wins when multiple TOML references resolve to the
 // same canonical ID (e.g. one pair uses "primary" and another uses the
 // canonical email); subsequent references are recorded in the lookup map
@@ -138,27 +154,37 @@ func resolveCalendars(ctx context.Context, c Config, lister CalendarLister) (
 	resolved = make(map[string]Calendar, len(c.Pairs)*2)
 	refToCanonical = make(map[string]string, len(c.Pairs)*2)
 
+	// Pre-fetch the full list ONCE if any enabled pair has a summary ref.
+	// nil signals "no summary lookups needed" to the resolver below; the
+	// list call is skipped in that case so existing ID-only configs keep
+	// their pre-F1 cost profile.
+	var summaryIndex map[string][]gws.CalendarListEntry
+	if anyEnabledSummaryRef(c) {
+		entries, err := lister.CalendarListList(ctx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("calendarList.list: %w", err)
+		}
+		summaryIndex = buildSummaryIndex(entries)
+	}
+
 	resolve := func(ref CalendarRef) error {
 		key := refKey(ref)
 		if _, ok := refToCanonical[key]; ok {
 			return nil
 		}
-		// Summary-form refs are added in a follow-up commit; for now,
-		// every supported ref is ID-form and routes through CalendarListGet
-		// exactly as before.
-		entry, err := lister.CalendarListGet(ctx, ref.ID)
+		entry, err := resolveOne(ctx, ref, lister, summaryIndex)
 		if err != nil {
-			return fmt.Errorf("resolve %q: %w", ref.ID, err)
+			return err
 		}
 		if entry.ID == "" {
-			return fmt.Errorf("%w: gws calendarList.get(%q) returned an empty id",
-				ErrInvalid, ref.ID)
+			return fmt.Errorf("%w: gws returned empty id resolving %s",
+				ErrInvalid, refDescription(ref))
 		}
 		if _, exists := resolved[entry.ID]; !exists {
 			resolved[entry.ID] = Calendar{
 				CanonicalID: entry.ID,
 				AccessRole:  entry.AccessRole,
-				OriginalRef: ref.ID,
+				OriginalRef: originalRef(ref),
 			}
 		}
 		refToCanonical[key] = entry.ID
@@ -182,6 +208,121 @@ func resolveCalendars(ctx context.Context, c Config, lister CalendarLister) (
 		}
 	}
 	return resolved, refToCanonical, nil
+}
+
+// anyEnabledSummaryRef reports whether any enabled pair carries a summary-
+// form ref on either side. Used to skip the CalendarListList call entirely
+// for configs that only use ID-form refs.
+func anyEnabledSummaryRef(c Config) bool {
+	for _, p := range c.Pairs {
+		if !p.IsEnabled() {
+			continue
+		}
+		if p.Source.IsSummaryRef() || p.Target.IsSummaryRef() {
+			return true
+		}
+	}
+	return false
+}
+
+// buildSummaryIndex groups CalendarListList entries by their lowercased
+// summary so summary lookups can match case-insensitively. SPEC's
+// risk-section note: Google's UI shows "TripIt" but a user might type
+// "tripit"; exact-case would be a footgun.
+func buildSummaryIndex(entries []gws.CalendarListEntry) map[string][]gws.CalendarListEntry {
+	out := make(map[string][]gws.CalendarListEntry, len(entries))
+	for _, e := range entries {
+		key := strings.ToLower(e.Summary)
+		out[key] = append(out[key], e)
+	}
+	return out
+}
+
+// resolveOne resolves a single CalendarRef. ID-form routes through
+// CalendarListGet (same call shape as the pre-F1 path). Summary-form
+// looks up against the pre-built summaryIndex; ambiguity is disambiguated
+// via account-substring filtering, falling through to a clear ErrInvalid
+// when zero or many calendars match.
+func resolveOne(
+	ctx context.Context,
+	ref CalendarRef,
+	lister CalendarLister,
+	summaryIndex map[string][]gws.CalendarListEntry,
+) (*gws.CalendarListEntry, error) {
+	if !ref.IsSummaryRef() {
+		entry, err := lister.CalendarListGet(ctx, ref.ID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve %q: %w", ref.ID, err)
+		}
+		return entry, nil
+	}
+	return resolveSummaryRef(ref, summaryIndex)
+}
+
+// resolveSummaryRef performs the summary-lookup walk:
+//   - 0 matches: ErrInvalid - the user typed a name that doesn't exist
+//     under the gws-authenticated account.
+//   - 1 match: success.
+//   - N matches with no account: ErrInvalid listing every match so the
+//     user can see exactly what to disambiguate against.
+//   - N matches with account: filter by case-insensitive ID-substring.
+//     Yield 1: success. Yield 0 / 2+: ErrInvalid with the relevant detail.
+//
+// Account disambiguation by ID-substring is the design plan's heuristic:
+// it works for the typical case (an "alice@example.com" account vs a
+// shared calendar at the same domain) but is documented as not robust
+// for "<random>@import.calendar.google.com"-shaped IDs. Users with that
+// shape have to fall back to bare ID refs.
+func resolveSummaryRef(
+	ref CalendarRef,
+	summaryIndex map[string][]gws.CalendarListEntry,
+) (*gws.CalendarListEntry, error) {
+	matches := summaryIndex[strings.ToLower(ref.Summary)]
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("%w: no calendar with summary %q visible to this account",
+			ErrInvalid, ref.Summary)
+	}
+	if len(matches) == 1 {
+		entry := matches[0]
+		return &entry, nil
+	}
+
+	if ref.Account == "" {
+		return nil, fmt.Errorf(
+			"%w: summary %q matches %d calendars: %s; add account = \"...\" to disambiguate",
+			ErrInvalid, ref.Summary, len(matches), formatMatchIDs(matches))
+	}
+
+	accountLower := strings.ToLower(ref.Account)
+	var filtered []gws.CalendarListEntry
+	for _, e := range matches {
+		if strings.Contains(strings.ToLower(e.ID), accountLower) {
+			filtered = append(filtered, e)
+		}
+	}
+	switch len(filtered) {
+	case 0:
+		return nil, fmt.Errorf(
+			"%w: summary %q matches %d calendars but none has an ID containing account %q; matches were: %s",
+			ErrInvalid, ref.Summary, len(matches), ref.Account, formatMatchIDs(matches))
+	case 1:
+		entry := filtered[0]
+		return &entry, nil
+	default:
+		return nil, fmt.Errorf(
+			"%w: summary %q with account %q is still ambiguous: %s",
+			ErrInvalid, ref.Summary, ref.Account, formatMatchIDs(filtered))
+	}
+}
+
+// formatMatchIDs formats a list of CalendarListEntry IDs as a
+// `[id1, id2, id3]` string for error messages.
+func formatMatchIDs(entries []gws.CalendarListEntry) string {
+	ids := make([]string, len(entries))
+	for i, e := range entries {
+		ids[i] = e.ID
+	}
+	return "[" + strings.Join(ids, ", ") + "]"
 }
 
 // refKey returns a stable lookup key for a CalendarRef. ID-form refs key
@@ -208,6 +349,17 @@ func refDescription(r CalendarRef) string {
 		return fmt.Sprintf("{summary=%q}", r.Summary)
 	}
 	return fmt.Sprintf("%q", r.ID)
+}
+
+// originalRef returns the value to store in Calendar.OriginalRef so the
+// downstream "what did the user write?" lookup matches their TOML. ID-form
+// refs preserve the bare ID; summary-form refs use the descriptive form
+// since there's no single string that names what the user wrote.
+func originalRef(r CalendarRef) string {
+	if r.IsSummaryRef() {
+		return refDescription(r)
+	}
+	return r.ID
 }
 
 // expandPDirs walks the pair list and emits one PDir per enabled pair.

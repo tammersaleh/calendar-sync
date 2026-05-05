@@ -302,17 +302,31 @@ Duration strings follow Go's `time.ParseDuration` syntax (`30s`, `5m`, `24h`) pl
 
 #### `[[pairs]]`
 
-| Field                    | Type     | Required  | Description                                                                                                                                                  |
-|--------------------------|----------|-----------|--------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `name`                   | string   | yes       | Unique. Used in logs and as the human-facing identifier for `--pair` flags on `mirror list`/`mirror prune`. Must match `^[a-z0-9][a-z0-9-]{0,62}$`.          |
-| `source`                 | string   | yes       | Calendar ID for the source calendar. Events from here mirror onto target.                                                                                    |
-| `target`                 | string   | yes       | Calendar ID for the target calendar. Mirrors are written here.                                                                                               |
-| `enabled`                | bool     | no (true) | If false, the pair is skipped entirely.                                                                                                                      |
-| `time_zone`              | string   | no        | IANA name (e.g. `America/New_York`). Used as the `timeZone` on mirrored events when the source event is all-day. Defaults to the destination calendar's default. |
-| `horizon`                | duration | no        | Optional override of `[settings].horizon` for this pair. Same `1d`..`730d` bounds. Falls back to the settings value when unset.                              |
-| `propagate_target_edits` | bool     | no        | Optional override of `[settings].propagate_target_edits` for this pair. Falls back to the settings value when unset. Useful for ramping two-way sync one direction at a time. |
+| Field                    | Type                  | Required  | Description                                                                                                                                                  |
+|--------------------------|-----------------------|-----------|--------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `name`                   | string                | yes       | Unique. Used in logs and as the human-facing identifier for `--pair` flags on `mirror list`/`mirror prune`. Must match `^[a-z0-9][a-z0-9-]{0,62}$`.          |
+| `source`                 | string or inline table | yes      | Source calendar reference. See "Calendar references" below.                                                                                                  |
+| `target`                 | string or inline table | yes      | Target calendar reference. See "Calendar references" below.                                                                                                  |
+| `enabled`                | bool                  | no (true) | If false, the pair is skipped entirely.                                                                                                                      |
+| `time_zone`              | string                | no        | IANA name (e.g. `America/New_York`). Used as the `timeZone` on mirrored events when the source event is all-day. Defaults to the destination calendar's default. |
+| `horizon`                | duration              | no        | Optional override of `[settings].horizon` for this pair. Same `1d`..`730d` bounds. Falls back to the settings value when unset.                              |
+| `propagate_target_edits` | bool                  | no        | Optional override of `[settings].propagate_target_edits` for this pair. Falls back to the settings value when unset. Useful for ramping two-way sync one direction at a time. |
 
-Calendar IDs accepted: an email address (`alice@example.com`), the literal `primary` (which calendar-sync resolves to its canonical ID), or a group calendar ID (`<hash>@group.calendar.google.com`).
+##### Calendar references
+
+`source` and `target` accept two forms:
+
+- **String** - the calendar ID directly. Accepts an email address (`"alice@example.com"`), the literal `"primary"` (which calendar-sync resolves to its canonical ID), or a group calendar ID (`"<hash>@group.calendar.google.com"`).
+- **Inline table** - lookup by display summary. The `summary` key (required) is matched case-insensitively against the gws-authenticated account's calendar list. The optional `account` key disambiguates when multiple visible calendars share the same summary; matching is by case-insensitive substring of the calendar's ID. Useful for subscriptions whose IDs aren't memorable (`source = {summary = "TripIt"}` resolves to whatever `<random>@import.calendar.google.com` ID Google assigned).
+
+| Inline-table field | Type   | Required | Description                                                                                                  |
+|--------------------|--------|----------|--------------------------------------------------------------------------------------------------------------|
+| `summary`          | string | yes      | Display summary as it appears in Google Calendar. Matched case-insensitively.                                |
+| `account`          | string | no       | Disambiguator when multiple calendars share `summary`. Matched as a case-insensitive substring of each candidate's ID. |
+
+The inline-table form makes one `gws calendar calendarList list` call at canonicalize time and resolves every summary-form ref against the result, regardless of how many pairs use it. ID-form refs continue to use one `calendar calendarList get` per distinct ref.
+
+Limitation: `account` substring matching breaks for import/subscription calendars whose IDs look like `<random>@import.calendar.google.com` - the random hash carries no account information. If two such calendars share a summary and `account` can't disambiguate them, fall back to the bare ID-form ref. New calendars added in Google Calendar's UI after the daemon starts aren't visible until config reload (same behavior as the pre-F1 ID-form path).
 
 #### Validation rules
 
@@ -320,6 +334,9 @@ Run on every command that touches config. Failures exit with code 1 and a JSON e
 
 - `name` is unique across all pairs.
 - `direction` field on `[[pairs]]` is rejected if present. The field was removed in v2.0.0; validation fails with a migration hint pointing users at the two-pair pattern (declare two `[[pairs]]` entries with swapped source/target for bidirectional sync; remove the field for the new default of source-to-target).
+- `source` and `target` are required (an inline-table form with neither `summary` nor a string value is rejected).
+- An inline-table calendar ref with `account` but no `summary` is rejected; `account` is only meaningful as a summary-lookup disambiguator.
+- A summary-form ref that resolves to zero or to multiple calendars (after the optional `account` filter) is rejected with a detail listing the matches so the user can correct the ref.
 - After canonicalization, `source != target`. Mirroring a calendar to itself is rejected.
 - After canonicalization and pdir expansion, no two pdirs share the same `(canonical_source, canonical_target)` pair. Two pdirs writing identical mirrors to the same calendar is a configuration bug. (Direction is always `a_to_b` post-v2.0.0, so the prior triple collapses to a pair.)
 - `poll_interval >= 15s`.
@@ -376,6 +393,26 @@ name = "personal-to-family"
 source = "primary"
 target = "family@group.calendar.google.com"
 enabled = false
+```
+
+#### Mirror a TripIt subscription by summary
+
+The TripIt-generated calendar's ID is a random hash (`<hash>@import.calendar.google.com`) that's hard to type and changes if the user re-subscribes. The summary the user sees in Google Calendar's UI - "TripIt" - is stable, so the inline-table form is more useful here than the bare ID:
+
+```toml
+[[pairs]]
+name = "tripit-to-personal"
+source = {summary = "TripIt"}
+target = "primary"
+```
+
+If the user has shared multiple "TripIt"-summary calendars across accounts, `account` disambiguates by case-insensitive substring of the calendar's ID:
+
+```toml
+[[pairs]]
+name = "coreweave-to-personal"
+source = {summary = "CoreWeave", account = "alice@example.com"}
+target = "primary"
 ```
 
 ## Authentication

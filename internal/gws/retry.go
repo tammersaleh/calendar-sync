@@ -21,7 +21,9 @@ import (
 //
 // Retry-After is documented in SPEC but gws does not expose it in its
 // error envelope today, so the implementation has no path to honor it.
-// TODO once gws plumbs Retry-After alongside the Calendar API error JSON.
+// Tracked upstream in https://github.com/googleworkspace/cli/issues/777;
+// once gws plumbs the header value through, wire it in here as a
+// per-attempt override of the schedule.
 const (
 	defaultMaxAttempts    = 5
 	defaultJitterFraction = 0.25

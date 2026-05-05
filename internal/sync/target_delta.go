@@ -92,12 +92,24 @@ func (r *Reconciler) runTargetDeltaPhase(ctx context.Context, res *TickResult) {
 		for i := range events {
 			ev := events[i]
 			if err := r.processTargetDeltaEvent(ctx, target, &ev, &res.TargetDelta); err != nil {
-				hadErr = true
+				// B18 transient-read tolerance: a narrow set of
+				// well-understood read flakes (events.get / events.instances
+				// 5xx, 400, 404) get logged + skipped without pinning the
+				// targetSyncToken. Without this carve-out a single flaky
+				// read replays the same delta forever. Mirrors the
+				// source-delta classify-loop's transient handling in
+				// runClassifyLoop. See isTransientClassifyReadError for
+				// the matrix.
+				transient := isTransientClassifyReadError(err)
 				r.warn("sync.targetDelta: process failed",
 					"target", target,
 					"target_event", ev.ID,
 					"error", err.Error(),
+					"transient", transient,
 				)
+				if !transient {
+					hadErr = true
+				}
 			}
 		}
 

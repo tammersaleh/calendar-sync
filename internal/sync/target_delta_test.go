@@ -935,10 +935,12 @@ func TestTargetDeltaPhase_TokenStaysOnError(t *testing.T) {
 	queueTargetIncrDelta(api, "tgt-A", []gws.Event{*m}, "tok-tgt-new")
 	api.queueListIncr("src-A", nil, "tok-src-new")
 
-	// events.get returns a backend error - this is NOT 404 so the dispatch
-	// path returns it as a fatal error.
+	// events.get returns api_auth_failed - a NON-transient error per the B18
+	// matrix in isTransientClassifyReadError. Auth failures must keep the
+	// token pinned so the next tick re-attempts after the operator fixes
+	// credentials, not silently advance past the unprocessed event.
 	api.queueGetErr("src-A", "src-evt",
-		&gws.Error{Code: gws.CodeBackendError, ExitCode: 1})
+		&gws.Error{Code: gws.CodeAPIAuthFailed, ExitCode: 2})
 
 	if _, err := r.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)
@@ -946,6 +948,49 @@ func TestTargetDeltaPhase_TokenStaysOnError(t *testing.T) {
 
 	if got := r.targetSyncTokens["tgt-A"]; got != "tok-tgt-old" {
 		t.Errorf("token must NOT advance on error; got %q want tok-tgt-old", got)
+	}
+}
+
+// TestTargetDeltaPhase_TransientReadAdvancesToken pins B18-style
+// transient-read tolerance for the target-delta phase: a backend / 400 /
+// 404 read flake on events.get / events.instances must be logged and
+// skipped, NOT pin the targetSyncToken. Without this carve-out a single
+// flaky read replays the same delta forever (the source-delta classify
+// loop has the same tolerance for the same reason).
+func TestTargetDeltaPhase_TransientReadAdvancesToken(t *testing.T) {
+	api := newStubAPI()
+	pd := makeWritablePDir("p1", "src-A", "tgt-A")
+	canonical := makeCanonical(pd)
+
+	r := newTestReconciler(api, canonical)
+	r.targetSyncTokens["tgt-A"] = "tok-tgt-old"
+	r.inventories["tgt-A"] = NewInventory("tgt-A")
+	r.syncTokens["src-A"] = "tok-src-old"
+
+	m := makeMirrorWithUserEdit("mirror-1", "src-A:src-evt",
+		"2026-04-29T20:00:00Z", "2026-04-30T11:00:00Z",
+		"X", "X-edit")
+
+	queueTargetIncrDelta(api, "tgt-A", []gws.Event{*m}, "tok-tgt-new")
+	api.queueListIncr("src-A", nil, "tok-src-new")
+
+	// events.get returns backend_error - the transient flake the live-
+	// observed Office Hours pattern surfaces. With the B18 tolerance this
+	// is logged + skipped, the token advances, and the next tick re-fetches
+	// fresh.
+	api.queueGetErr("src-A", "src-evt",
+		&gws.Error{Op: "events.get", Code: gws.CodeBackendError, ExitCode: 1})
+
+	res, err := r.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	if got := r.targetSyncTokens["tgt-A"]; got != "tok-tgt-new" {
+		t.Errorf("transient must NOT pin token; got %q want tok-tgt-new", got)
+	}
+	if !res.PerTarget["tgt-A"].SyncTokenChanged {
+		t.Error("PerTarget[tgt-A].SyncTokenChanged should be true after transient")
 	}
 }
 

@@ -40,6 +40,40 @@ Fix sketch: switch to `html/template` (handles XML-class escaping for content), 
 
 ## Fixed
 
+### B17 - target-edit propagation lagged 24h instead of one tick
+
+Surfaced live during the personal->cw rollout: user edited the `Lunch & Reading` 5/20 instance on the cw target by +30 min. The daemon's incremental ticks were idle for hours because nothing on personal had changed, and a manual `calendar-sync run --pair personal-to-work` (which does a full source-list) was needed to catch it.
+
+The watch daemon's per-tick reconciliation was driven by Google's `events.list` `syncToken` on the SOURCE calendar only. A pure target-side edit produces zero change on the source, so the source's syncToken delta returns nothing - drift is never detected until the next FULL re-sync (default 24h).
+
+Phase 1 fix adds a per-target `targetSyncToken` stream and a target-delta phase that runs BEFORE the source-delta phase on every tick:
+
+- New state: `Reconciler.targetSyncTokens map[string]string`. Maintained only for targets that have at least one pdir with the effective two-way-sync gate open (`pd.SourceWritable && pd.PropagateTargetEdits`).
+- FullSync seeds the token via `seedTargetSyncTokens` BEFORE rebuildInventories. Seeding-after would leave an edit landing in the gap invisible to both inventory (already snapshotted) and the seeded token (which starts after the edit).
+- Tick runs `runTargetDeltaPhase` BEFORE the source-delta classify. Phase ordering matters: a source-delta-driven mirror rewrite running first could clobber a target edit before target-delta lists it.
+- For each delta event, dispatch parses `calendar-sync:source` to find the SINGLE owning pdir (matched by source-tuple == pd.source AND target == event.target AND effective gate open). Stray mirrors and non-mirrors skip silently.
+- Recurring-instance dispatch handles both managed form (calendar-sync:source already has `_<UTC>` suffix) and inherited form (parent's id, no suffix - the case that bit B16). Inherited form computes source_instance_id by appending the suffix parsed from the mirror's own id via regex `_\d{8}T\d{6}Z$`.
+- 410 GONE clears the per-target token and surfaces `NeedsFullResync` so the next FullSync re-seeds.
+
+Phase 1 explicitly defers the mirror-only-override case: when the source-instance `events.get` returns 404, emit `skip(reason=mirror_only_override)` and stop. SPEC's existing "Limitation: mirror-only recurring instance overrides" section covers this. Phase 2 would create the source override via patch-of-source-parent's-occurrence and propagate normally.
+
+Test pins (`internal/sync/target_delta_test.go`):
+- `TestTargetDeltaPhase_NonRecurringEdit` - non-recurring target edit propagates.
+- `TestTargetDeltaPhase_RecurringParentEdit` - recurring parent edit propagates.
+- `TestTargetDeltaPhase_ManagedInstanceEdit` - managed-form recurring instance edit propagates via the recurring handler.
+- `TestTargetDeltaPhase_InheritedInstanceEdit_Phase1Skip` - inherited-form recurring instance edit hits 404 on source-instance lookup and emits `skip(mirror_only_override)`.
+- `TestTargetDeltaPhase_SelfWriteSuppression` - post-write delta of an unchanged mirror classifies as `unchanged`, no extra patches.
+- `TestTargetDeltaPhase_InheritedAutoMaterializedNoUserEdit` - inherited auto-materialized instance routes through B15's bootstrap path (`inherited_upgrade`), no source-side patch.
+- `TestTargetDeltaPhase_NotMirror` / `TestTargetDeltaPhase_NoOwningPdir` - skips silently.
+- `TestTargetDeltaPhase_NonWritableTarget` - target with no writable-source pdir is never listed.
+- `TestTargetDeltaPhase_410Recovery` - clears the target token, surfaces NeedsFullResync.
+- `TestTargetDeltaPhase_TokenAdvancementOnSuccess` / `TestTargetDeltaPhase_TokenStaysOnError` - conditional advancement.
+- `TestSeedTargetSyncTokens_RunsBeforeInventoryRebuild` - phase ordering pinned via the recorded-call log.
+- `TestTickPhaseOrdering_TargetBeforeSource` - target-delta runs before source-delta in `Tick`.
+- `TestTick_PropagatesTargetEdit_OneTick` - regression: full-sync, then user edit on target, then Tick - propagate within a single tick.
+
+SPEC §"In-memory state", §"Daemon lifecycle: startup" (step 5a), §"Daemon lifecycle: per-tick reconciliation" (step 0), §"What full re-sync catches", and §"Limitation: mirror-only recurring instance overrides" updated with the new phase + Phase 2 deferral note.
+
 ### B19 - stale inventory after partial recurring-instance repair-path failure
 
 Surfaced during B18 code review (pre-existing; B18's transient tolerance turned the failure mode from "syncToken pinned forever" to "spurious double-writes per tick until next FullSync"). The recurring handler's `locateMirrorInstance` repair path fires up to 3 API calls: source-parent `events.get`, `forceRewriteMirrorParent` (2 `events.patch` writes), then a retry `events.instances`. If step 1 and 2 succeeded but step 3 returned a transient error, `Handle` returned `Result{}, err` and `classifyRecurringInstance` skipped the inventory update on the error path. The post-rewrite mirror parent was dropped on the floor; the next tick saw the stale inventory entry and re-fired the force-rewrite.

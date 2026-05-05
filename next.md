@@ -57,131 +57,34 @@ Functional and idempotent on the steady-state path. **No data corruption risk.**
 - 5/11 Lunch & Reading: source patched to 11:00 to match the mirror's existing state per user preference; daemon reconciled cleanly via `action: patch, reason: source_updated`.
 - Earlier: B16 recurrence-propagate bug clobbered the personal Lunch & Reading parent (anchor moved 2026-02-23 → 2026-05-20). Recovered manually. Source data is intact.
 
-## NEXT TASK: F1 + F2
+## F1 + F2 shipped (this session)
 
-Two features queued for after E2E. Both benefit from the harness now in place - new scenarios go in `internal/e2e/`. The E2E harness already added `gws.CalendarListList` (which F1 needs) and `gws.WithWorkDir` (which F2's stale-binary detection might want), so the gws layer is already partly there.
+### F1 - Calendar refs by display summary
 
-### F1 - Sync non-primary calendars (the user has more than one calendar per email)
-
-Today: passing a group calendar ID (`c_<hash>@group.calendar.google.com`) directly in `source` / `target` works - `internal/config/canonicalize.go` passes the literal string to `gws calendar calendarList get` and Google resolves it. The E2E harness exercises this path. What's NOT supported is calling out a calendar by display summary; the user has to look up the cryptic ID themselves.
-
-The user wants to be able to sync any calendar visible in `gws calendar calendarList list` output by name.
-
-#### Design surface
-
-Two reasonable shapes for the config:
-
-**Option A: explicit calendar ID.** TOML carries the canonical Google Calendar ID directly:
+`source` and `target` in `[[pairs]]` now accept an inline TOML table in addition to the existing string forms:
 
 ```toml
-[[calendars]]
-name = "tripit"
-id = "c_abc123def@group.calendar.google.com"
+[[pairs]]
+name = "tripit-personal"
+source = { summary = "TripIt" }
+target = "primary"
 ```
 
-Pros: unambiguous, no resolution step needed.
-Cons: user has to look up the cryptic ID. Most calendars don't have human-readable IDs.
+Plus optional `account = "..."` for disambiguation when multiple calendars share a summary. Implementation went past the original spec on two points: matching is done against `summaryOverride` when set (the user-visible name in the Calendar UI) with fallback to raw `summary`, and account disambiguation prefers `dataOwner` equality with ID-substring as a fallback. Backwards compatible: every existing string form (`primary`, email, group calendar ID) keeps working unchanged.
 
-**Option B: name-based lookup within an account.** TOML names a calendar by its display summary, optionally scoped to an account email:
+E2E coverage: `TestE2E_F1_SummaryRefResolves` configures both source and target as summary refs and pins the full TOML→canonicalize→sync round trip.
 
-```toml
-[[calendars]]
-name = "tripit"
-account = "tsaleh@coreweave.com"
-summary = "TripIt"
-```
+See SPEC §"[[pairs]]" / "Validation rules" / "Examples" for the new schema.
 
-The canonicalize step calls `calendarList` for the account and finds the entry whose `summary` matches. Errors if zero or multiple match.
+### F2 - Single-command upgrade
 
-Pros: human-friendly. Cons: brittle if user renames calendars; ambiguous if duplicate summaries.
+`.goreleaser.yml` now injects a launchctl kickstart into the cask postflight. After release, `brew upgrade calendar-sync` automatically bounces the running daemon - no more `uninstall && install` dance.
 
-**Option C: hybrid.** Accept either an `id` (preferred) or a `summary` lookup with `account`. Validation rejects providing both.
+Cold install (`brew install` with no agent yet loaded) is handled by a `launchctl print` guard that suppresses stderr so the cask doesn't spew "Could not find service" through brew. Kickstart failures are non-fatal so a transient launchctl issue doesn't break the upgrade transaction.
 
-The user's preference matters here - ask them which they prefer, or implement Option C and let usage decide.
+Limitation: only the default launchd label (`org.calendar-sync.agent`) is restarted. Users who installed with `calendar-sync install --label <custom>` need to keep using the manual dance after `brew upgrade`. Documented in SPEC §"calendar-sync install" / "Upgrades via Homebrew".
 
-#### Required changes (rough sketch)
-
-- `internal/config/types.go`: extend `Calendar` struct with optional `ID` / `Summary` / `Account` fields. Today it's just `Email string`.
-- `internal/config/canonicalize.go`: `resolveCalendar` updated to handle the new shapes. Today it resolves email → primary calendar ID via `CalendarList.Get(email)`. Need a new path that lists all calendars for the user and picks the one matching the supplied id/summary.
-- `internal/gws/calendarlist.go`: may need a `CalendarListList()` method (returns the full list) since today only `CalendarListGet(id)` exists.
-- `SPEC.md` §"Calendars and pdirs": document the new fields.
-- E2E test: create a non-primary calendar via gws, configure it, run sync, verify mirror lands on the right target.
-- Backwards compatibility: the existing `email = "..."` form must keep working unchanged. Adding `id` or `summary` is additive.
-
-#### Watch out for
-
-- **Read-only special calendars.** Google has built-in subscribed calendars (holidays, birthdays, weather, sports). They show up in calendarList but are read-only. The existing accessRole check in `config.AccessRoleAtLeast` should handle this, but verify.
-- **Subscribed calendars from other accounts.** A calendar can be shared with you but owned by someone else. accessRole tells you what you can do with it, but the calendar's `id` is opaque (`<owner>:<calendar_id>` shape). Make sure the resolution is consistent.
-- **TripIt-style read-only feeds.** Likely the canonical use case: TripIt publishes a public iCal feed which you've subscribed to. The resulting calendar is read-only, so calendar-sync can only mirror FROM it (one-way), not propagate edits. The existing `propagate_target_edits` gate should handle this naturally.
-
-### F2 - Single-command upgrade via `brew upgrade calendar-sync`
-
-Today the upgrade dance is:
-
-```bash
-brew upgrade calendar-sync   # binary updated at /opt/homebrew/bin/calendar-sync
-calendar-sync uninstall      # removes plist + unloads from launchd
-calendar-sync install        # installs new plist + loads new daemon
-```
-
-Steps 2-3 are necessary because launchd does NOT restart the daemon when the binary file is replaced. The running pid keeps executing the old binary code (cached by the kernel via mmap, even though the on-disk file is replaced).
-
-The user wants `brew upgrade calendar-sync` to "just work" - bouncing the daemon automatically.
-
-#### The mechanism: cask postflight hook
-
-Homebrew casks support a `postflight` Ruby block that runs after the cask install/upgrade. This is the natural hook for restarting the daemon. Sketch:
-
-```ruby
-cask "calendar-sync" do
-  # ... existing fields ...
-
-  postflight do
-    uid = Process.uid
-    label = "org.calendar-sync.agent"
-    # Only restart if the agent is currently loaded - skip the cold-install case.
-    print = system_command "/bin/launchctl",
-      args: ["print", "gui/#{uid}/#{label}"],
-      must_succeed: false
-    if print.success?
-      system_command "/bin/launchctl",
-        args: ["kickstart", "-k", "gui/#{uid}/#{label}"],
-        must_succeed: false
-    end
-  end
-end
-```
-
-`launchctl kickstart -k <service>` kills the running process and restarts it under launchd. The `-k` flag forces a clean restart even if KeepAlive would have allowed the running pid to continue.
-
-#### The release-tooling change
-
-The cask is generated by GoReleaser. The repo's `.goreleaser.yml` has a `casks:` block (or similar) that produces the formula in `tammersaleh/homebrew-tap`. To add the postflight, modify the GoReleaser config so each new release ships a cask with the postflight.
-
-Look in:
-- `.goreleaser.yml` or `.goreleaser.yaml` in this repo
-- The `tammersaleh/homebrew-tap` repo for the current cask file shape
-
-GoReleaser's docs: <https://goreleaser.com/customization/homebrew_casks/> - `custom_block` or similar lets you inject Ruby blocks into the generated cask.
-
-#### Edge cases
-
-- **Cold install.** First-time `brew install calendar-sync` runs the postflight, but no daemon is loaded yet. The `must_succeed: false` and the `print` check above handle this - kickstart only fires if launchctl print succeeds.
-- **Multiple users.** The cask runs as the installing user. `Process.uid` gives that user. If the user installs as themselves and the daemon runs as themselves, this is correct. Cross-user scenarios (admin install, regular user runs daemon) probably break - flag for the user.
-- **Failed restart.** `must_succeed: false` means a kickstart failure won't fail the brew upgrade. Trade-off: brew succeeds, daemon stays old. Better than blocking the upgrade. The next `calendar-sync status` would catch it.
-- **launchd debouncing.** If the user upgrades multiple casks at once, multiple kickstarts could fire. Idempotent - kickstart on an already-restarted daemon is fine.
-
-#### Required changes (rough sketch)
-
-- `.goreleaser.yml`: add a `custom_block` or `postflight` field to the `casks` block.
-- Test the generated cask locally: install a v2.1.X release, manually edit the cask file with the postflight, run `brew upgrade` and verify the daemon's `started_at` advances.
-- Document the upgrade flow in `doc/install.md` (if it exists) or `SPEC.md`.
-- E2E test? Hard - requires a real cask install. Probably skip and rely on manual verification.
-
-#### Out-of-scope alternatives considered
-
-- **calendar-sync self-detects stale binary.** The daemon could check at startup or periodically whether `/opt/homebrew/bin/calendar-sync` differs from its own running binary, and exit gracefully if so (letting KeepAlive respawn it). Adds complexity; the postflight approach is simpler and brew-native.
-- **launchd-managed `OnDemand` instead of KeepAlive.** Restructure so the daemon exits frequently and launchd respawns it. Major architecture change for marginal benefit.
+The first release that ships F2 will cut the new cask. After it lands, verify the bounce works by running `brew upgrade calendar-sync` against a non-current version, then comparing `calendar-sync version` with `launchctl print gui/$(id -u)/org.calendar-sync.agent | grep pid`.
 
 ## Other backlog (lower priority)
 

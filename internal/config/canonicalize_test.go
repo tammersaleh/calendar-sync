@@ -53,8 +53,8 @@ func TestCanonicalize_PrimaryAliasResolved(t *testing.T) {
 	c := baseConfig()
 	c.Pairs = append(c.Pairs, config.Pair{
 		Name:   "wp",
-		Source: "alice@example.com",
-		Target: "primary",
+		Source: config.CalendarRef{ID: "alice@example.com"},
+		Target: config.CalendarRef{ID: "primary"},
 	})
 
 	lister := &stubLister{
@@ -87,8 +87,8 @@ func TestCanonicalize_AlwaysOnePDirPerPair(t *testing.T) {
 	c := baseConfig()
 	c.Pairs = append(c.Pairs, config.Pair{
 		Name:   "p",
-		Source: "a@example.com",
-		Target: "b@example.com",
+		Source: config.CalendarRef{ID: "a@example.com"},
+		Target: config.CalendarRef{ID: "b@example.com"},
 	})
 	lister := &stubLister{
 		responses: map[string]*gws.CalendarListEntry{
@@ -124,8 +124,8 @@ func TestCanonicalize_RejectsDirectionField(t *testing.T) {
 	c.Pairs = append(c.Pairs, config.Pair{
 		Name:      "p",
 		Direction: "source_to_target",
-		Source:    "a@example.com",
-		Target:    "b@example.com",
+		Source:    config.CalendarRef{ID: "a@example.com"},
+		Target:    config.CalendarRef{ID: "b@example.com"},
 	})
 	lister := &stubLister{
 		responses: map[string]*gws.CalendarListEntry{
@@ -144,13 +144,13 @@ func TestCanonicalize_DisabledPairSkipped(t *testing.T) {
 	c.Pairs = []config.Pair{
 		{
 			Name:   "active",
-			Source: "a@example.com",
-			Target: "b@example.com",
+			Source: config.CalendarRef{ID: "a@example.com"},
+			Target: config.CalendarRef{ID: "b@example.com"},
 		},
 		{
 			Name:    "off",
-			Source:  "c@example.com",
-			Target:  "d@example.com",
+			Source:  config.CalendarRef{ID: "c@example.com"},
+			Target:  config.CalendarRef{ID: "d@example.com"},
 			Enabled: enabled(false),
 		},
 	}
@@ -188,8 +188,8 @@ func TestCanonicalize_SourceWritableFromAccessRole(t *testing.T) {
 			c := baseConfig()
 			c.Pairs = []config.Pair{{
 				Name:   "p",
-				Source: "src@example.com",
-				Target: "dst@example.com",
+				Source: config.CalendarRef{ID: "src@example.com"},
+				Target: config.CalendarRef{ID: "dst@example.com"},
 			}}
 			lister := &stubLister{
 				responses: map[string]*gws.CalendarListEntry{
@@ -230,8 +230,8 @@ func TestCanonicalize_AccessRoleValidation(t *testing.T) {
 			c := baseConfig()
 			c.Pairs = []config.Pair{{
 				Name:   "p",
-				Source: "src@example.com",
-				Target: "dst@example.com",
+				Source: config.CalendarRef{ID: "src@example.com"},
+				Target: config.CalendarRef{ID: "dst@example.com"},
 			}}
 			lister := &stubLister{
 				responses: map[string]*gws.CalendarListEntry{
@@ -261,8 +261,8 @@ func TestCanonicalize_DisabledPairAccessRoleNotValidated(t *testing.T) {
 	c := baseConfig()
 	c.Pairs = []config.Pair{{
 		Name:    "off",
-		Source:  "fr@example.com",
-		Target:  "fr2@example.com",
+		Source:  config.CalendarRef{ID: "fr@example.com"},
+		Target:  config.CalendarRef{ID: "fr2@example.com"},
 		Enabled: enabled(false),
 	}}
 	lister := &stubLister{
@@ -294,8 +294,8 @@ func TestCanonicalize_SourceTargetCollideAfterCanonicalization(t *testing.T) {
 	c := baseConfig()
 	c.Pairs = []config.Pair{{
 		Name:   "selfsync",
-		Source: "primary",
-		Target: "alice@example.com",
+		Source: config.CalendarRef{ID: "primary"},
+		Target: config.CalendarRef{ID: "alice@example.com"},
 	}}
 	lister := &stubLister{
 		responses: map[string]*gws.CalendarListEntry{
@@ -314,8 +314,8 @@ func TestCanonicalize_PDirCollisionRejected(t *testing.T) {
 	// triple is a configuration bug; we'd produce duplicate mirrors.
 	c := baseConfig()
 	c.Pairs = []config.Pair{
-		{Name: "one", Source: "a@example.com", Target: "b@example.com"},
-		{Name: "two", Source: "a@example.com", Target: "b@example.com"},
+		{Name: "one", Source: config.CalendarRef{ID: "a@example.com"}, Target: config.CalendarRef{ID: "b@example.com"}},
+		{Name: "two", Source: config.CalendarRef{ID: "a@example.com"}, Target: config.CalendarRef{ID: "b@example.com"}},
 	}
 	lister := &stubLister{
 		responses: map[string]*gws.CalendarListEntry{
@@ -333,8 +333,8 @@ func TestCanonicalize_ListerErrorPropagates(t *testing.T) {
 	c := baseConfig()
 	c.Pairs = []config.Pair{{
 		Name:   "p",
-		Source: "src@example.com",
-		Target: "dst@example.com",
+		Source: config.CalendarRef{ID: "src@example.com"},
+		Target: config.CalendarRef{ID: "dst@example.com"},
 	}}
 	wantErr := errors.New("simulated network failure")
 	lister := &stubLister{err: wantErr}
@@ -350,8 +350,8 @@ func TestCanonicalize_DedupesCalendarLookups(t *testing.T) {
 	// exactly one CalendarListGet call per distinct reference.
 	c := baseConfig()
 	c.Pairs = []config.Pair{
-		{Name: "one", Source: "a@example.com", Target: "b@example.com"},
-		{Name: "two", Source: "a@example.com", Target: "c@example.com"},
+		{Name: "one", Source: config.CalendarRef{ID: "a@example.com"}, Target: config.CalendarRef{ID: "b@example.com"}},
+		{Name: "two", Source: config.CalendarRef{ID: "a@example.com"}, Target: config.CalendarRef{ID: "c@example.com"}},
 	}
 	lister := &stubLister{
 		responses: map[string]*gws.CalendarListEntry{
@@ -379,8 +379,8 @@ func TestCanonicalize_PerPairHorizonOverridesSettings(t *testing.T) {
 	override := config.Duration(24 * time.Hour)
 	c.Pairs = []config.Pair{{
 		Name:    "p",
-		Source:  "a@example.com",
-		Target:  "b@example.com",
+		Source:  config.CalendarRef{ID: "a@example.com"},
+		Target:  config.CalendarRef{ID: "b@example.com"},
 		Horizon: &override,
 	}}
 	lister := &stubLister{
@@ -406,8 +406,8 @@ func TestCanonicalize_NilHorizonFallsBackToSettings(t *testing.T) {
 	// baseConfig() sets Settings.Horizon to 365d.
 	c.Pairs = []config.Pair{{
 		Name:   "p",
-		Source: "a@example.com",
-		Target: "b@example.com",
+		Source: config.CalendarRef{ID: "a@example.com"},
+		Target: config.CalendarRef{ID: "b@example.com"},
 	}}
 	lister := &stubLister{
 		responses: map[string]*gws.CalendarListEntry{
@@ -433,8 +433,8 @@ func TestCanonicalize_PerPairPropagateTargetEditsOverride(t *testing.T) {
 	override := true
 	c.Pairs = []config.Pair{{
 		Name:                 "p",
-		Source:               "a@example.com",
-		Target:               "b@example.com",
+		Source:               config.CalendarRef{ID: "a@example.com"},
+		Target:               config.CalendarRef{ID: "b@example.com"},
 		PropagateTargetEdits: &override,
 	}}
 	lister := &stubLister{
@@ -462,8 +462,8 @@ func TestCanonicalize_PerPairPropagateTargetEditsExplicitFalse(t *testing.T) {
 	override := false
 	c.Pairs = []config.Pair{{
 		Name:                 "p",
-		Source:               "a@example.com",
-		Target:               "b@example.com",
+		Source:               config.CalendarRef{ID: "a@example.com"},
+		Target:               config.CalendarRef{ID: "b@example.com"},
 		PropagateTargetEdits: &override,
 	}}
 	lister := &stubLister{
@@ -490,8 +490,8 @@ func TestCanonicalize_NilPropagateFallsBackToSettings(t *testing.T) {
 	c.Settings.PropagateTargetEdits = true
 	c.Pairs = []config.Pair{{
 		Name:   "p",
-		Source: "a@example.com",
-		Target: "b@example.com",
+		Source: config.CalendarRef{ID: "a@example.com"},
+		Target: config.CalendarRef{ID: "b@example.com"},
 	}}
 	lister := &stubLister{
 		responses: map[string]*gws.CalendarListEntry{
@@ -512,8 +512,8 @@ func TestCanonicalize_PreservesTimeZoneOnPDir(t *testing.T) {
 	c := baseConfig()
 	c.Pairs = []config.Pair{{
 		Name:     "tz",
-		Source:   "a@example.com",
-		Target:   "b@example.com",
+		Source:   config.CalendarRef{ID: "a@example.com"},
+		Target:   config.CalendarRef{ID: "b@example.com"},
 		TimeZone: "America/New_York",
 	}}
 	lister := &stubLister{
@@ -536,8 +536,8 @@ func TestCanonicalize_PropagatesValidationFailure(t *testing.T) {
 	// must short-circuit before making any gws calls.
 	c := baseConfig()
 	c.Pairs = []config.Pair{
-		{Name: "dup", Source: "a@example.com", Target: "b@example.com"},
-		{Name: "dup", Source: "c@example.com", Target: "d@example.com"},
+		{Name: "dup", Source: config.CalendarRef{ID: "a@example.com"}, Target: config.CalendarRef{ID: "b@example.com"}},
+		{Name: "dup", Source: config.CalendarRef{ID: "c@example.com"}, Target: config.CalendarRef{ID: "d@example.com"}},
 	}
 	lister := &stubLister{}
 

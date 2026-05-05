@@ -101,15 +101,18 @@ func validatePair(idx int, p Pair) error {
 			ErrInvalid, p.Name, p.Direction)
 	}
 
-	if p.Source == "" {
+	if p.Source.ID == "" && p.Source.Summary == "" {
 		return fmt.Errorf("%w: pairs[%q].source is required", ErrInvalid, p.Name)
 	}
-	if p.Target == "" {
+	if p.Target.ID == "" && p.Target.Summary == "" {
 		return fmt.Errorf("%w: pairs[%q].target is required", ErrInvalid, p.Name)
 	}
-	// Pre-canonicalization source==target catches the typo case early.
-	// The canonicalize step also re-checks after primary-resolution.
-	if p.Source == p.Target {
+	// Pre-canonicalization source==target catches the typo case early
+	// for the ID-form case where the strings are directly comparable. The
+	// canonicalize step also re-checks after primary-resolution. Summary-form
+	// refs only short-circuit when both fields match exactly; otherwise the
+	// post-canonicalize same-canonical-ID check is the catch-all.
+	if p.Source.ID != "" && p.Source.ID == p.Target.ID {
 		return fmt.Errorf("%w: pairs[%q] cannot mirror a calendar to itself (source == target)",
 			ErrInvalid, p.Name)
 	}

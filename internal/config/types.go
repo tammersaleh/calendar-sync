@@ -7,6 +7,11 @@
 // gws subprocess.
 package config
 
+import (
+	"encoding/json"
+	"fmt"
+)
+
 // Config is the top-level TOML document. An entirely empty file produces a
 // Config with default Settings and no Pairs (which then fails validation
 // because at least one pair is implied by usage).
@@ -39,12 +44,12 @@ type Settings struct {
 // the field entirely; bidirectional setups declare two pairs with
 // swapped source/target.
 type Pair struct {
-	Name      string `toml:"name"`
-	Direction string `toml:"direction"`
-	Source    string `toml:"source"`
-	Target    string `toml:"target"`
-	Enabled   *bool  `toml:"enabled"`
-	TimeZone  string `toml:"time_zone"`
+	Name      string      `toml:"name"`
+	Direction string      `toml:"direction"`
+	Source    CalendarRef `toml:"source"`
+	Target    CalendarRef `toml:"target"`
+	Enabled   *bool       `toml:"enabled"`
+	TimeZone  string      `toml:"time_zone"`
 
 	// Horizon optionally overrides [settings].horizon for this pair. nil
 	// (the unset case) means fall back to Settings.Horizon at canonicalization
@@ -111,4 +116,96 @@ func AccessRoleAtLeast(actual, minimum string) bool {
 		return false
 	}
 	return accessRoleRank[actual] >= minRank
+}
+
+// CalendarRef is the value of [[pairs]].source or [[pairs]].target. It
+// accepts two TOML forms:
+//
+//   - String: the calendar ID directly (`source = "alice@example.com"`,
+//     `source = "primary"`, or a group calendar ID). UnmarshalTOML stores
+//     this in ID.
+//   - Inline table with a `summary` key: name-based lookup
+//     (`source = {summary = "TripIt"}`). The optional `account` key
+//     disambiguates when multiple visible calendars share the same
+//     summary (`source = {summary = "CoreWeave", account = "alice@example.com"}`).
+//
+// Backwards compatibility: every pre-F1 string config flows through the
+// string case unchanged, producing CalendarRef{ID: ...}; downstream
+// canonicalization routes ID-form refs to CalendarListGet exactly as
+// before.
+type CalendarRef struct {
+	ID      string // set when the TOML value was a string
+	Summary string // set when the TOML value was a table with key "summary"
+	Account string // optional disambiguation when Summary is set
+}
+
+// IsSummaryRef reports whether this ref needs a summary-based lookup
+// (vs. a direct CalendarListGet by ID).
+func (r CalendarRef) IsSummaryRef() bool { return r.Summary != "" }
+
+// UnmarshalTOML decodes either a string or an inline table into a
+// CalendarRef. An empty string is rejected here; an empty summary on the
+// table form is allowed at unmarshal time so validatePair can surface
+// the missing-required-field error through the normal JSON envelope.
+func (r *CalendarRef) UnmarshalTOML(data any) error {
+	switch v := data.(type) {
+	case string:
+		if v == "" {
+			return fmt.Errorf("calendar ref must not be empty")
+		}
+		r.ID = v
+		return nil
+	case map[string]any:
+		for k := range v {
+			if k != "summary" && k != "account" {
+				return fmt.Errorf("calendar ref table has unknown field %q; allowed: summary, account", k)
+			}
+		}
+		summary, _ := v["summary"].(string)
+		account, _ := v["account"].(string)
+		// Allow empty summary at unmarshal time; validatePair surfaces
+		// the missing-field error through the normal validation envelope.
+		r.Summary = summary
+		r.Account = account
+		return nil
+	default:
+		return fmt.Errorf("calendar ref must be a string or inline table, got %T", data)
+	}
+}
+
+// MarshalJSON emits the user-facing wire shape used by `pair list` /
+// `config show`. ID-form refs marshal as plain strings so existing JSONL
+// output (and the SPEC's documented examples) are unchanged. Summary-form
+// refs marshal as objects so the output mirrors what the user wrote.
+func (r CalendarRef) MarshalJSON() ([]byte, error) {
+	if r.IsSummaryRef() {
+		type wire struct {
+			Summary string `json:"summary"`
+			Account string `json:"account,omitempty"`
+		}
+		return json.Marshal(wire{Summary: r.Summary, Account: r.Account})
+	}
+	return json.Marshal(r.ID)
+}
+
+// UnmarshalJSON is the inverse of MarshalJSON: a JSON string becomes an
+// ID-form ref, a JSON object becomes a summary-form ref. Required so test
+// code (and any future caller) can decode the wire shape back into a typed
+// CalendarRef.
+func (r *CalendarRef) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		r.ID = s
+		return nil
+	}
+	var obj struct {
+		Summary string `json:"summary"`
+		Account string `json:"account"`
+	}
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return fmt.Errorf("calendar ref must be string or object: %w", err)
+	}
+	r.Summary = obj.Summary
+	r.Account = obj.Account
+	return nil
 }

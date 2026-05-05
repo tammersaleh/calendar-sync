@@ -19,8 +19,8 @@ func validConfig() Config {
 		Pairs: []Pair{
 			{
 				Name:   "work-personal",
-				Source: "alice@example.com",
-				Target: "alice.personal@example.org",
+				Source: CalendarRef{ID: "alice@example.com"},
+				Target: CalendarRef{ID: "alice.personal@example.org"},
 			},
 		},
 	}
@@ -243,8 +243,8 @@ func TestValidate_AcceptsEmptyDirection(t *testing.T) {
 
 func TestValidate_RawSourceEqualsTarget(t *testing.T) {
 	c := validConfig()
-	c.Pairs[0].Source = "alice@example.com"
-	c.Pairs[0].Target = "alice@example.com"
+	c.Pairs[0].Source = CalendarRef{ID: "alice@example.com"}
+	c.Pairs[0].Target = CalendarRef{ID: "alice@example.com"}
 	if !errors.Is(c.Validate(), ErrInvalid) {
 		t.Errorf("expected ErrInvalid for source==target")
 	}
@@ -266,8 +266,8 @@ func TestValidate_DuplicatePairNames(t *testing.T) {
 	c := validConfig()
 	c.Pairs = append(c.Pairs, Pair{
 		Name:   c.Pairs[0].Name,
-		Source: "x@example.com",
-		Target: "y@example.com",
+		Source: CalendarRef{ID: "x@example.com"},
+		Target: CalendarRef{ID: "y@example.com"},
 	})
 	if !errors.Is(c.Validate(), ErrInvalid) {
 		t.Errorf("expected ErrInvalid for duplicate pair name")
@@ -280,8 +280,8 @@ func TestValidate_RequiredFields(t *testing.T) {
 		mutate func(*Pair)
 	}{
 		{"name empty", func(p *Pair) { p.Name = "" }},
-		{"source empty", func(p *Pair) { p.Source = "" }},
-		{"target empty", func(p *Pair) { p.Target = "" }},
+		{"source empty", func(p *Pair) { p.Source = CalendarRef{} }},
+		{"target empty", func(p *Pair) { p.Target = CalendarRef{} }},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

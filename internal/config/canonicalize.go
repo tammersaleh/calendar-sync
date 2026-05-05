@@ -3,6 +3,7 @@ package config
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/tammersaleh/calendar-sync/internal/gws"
@@ -119,9 +120,9 @@ func (c Config) Canonicalize(ctx context.Context, lister CalendarLister) (*Canon
 
 // resolveCalendars walks every distinct calendar reference across all pairs
 // and resolves it via lister exactly once. Returns the resolved map (keyed
-// by canonical ID) plus a "TOML reference → canonical ID" lookup so the
-// pdir-expansion step can map a Pair's literal Source/Target back to a
-// resolved Calendar in O(1).
+// by canonical ID) plus a "ref-key → canonical ID" lookup so the pdir-
+// expansion step can map a Pair's literal Source/Target back to a resolved
+// Calendar in O(1).
 //
 // The first OriginalRef wins when multiple TOML references resolve to the
 // same canonical ID (e.g. one pair uses "primary" and another uses the
@@ -137,26 +138,30 @@ func resolveCalendars(ctx context.Context, c Config, lister CalendarLister) (
 	resolved = make(map[string]Calendar, len(c.Pairs)*2)
 	refToCanonical = make(map[string]string, len(c.Pairs)*2)
 
-	resolve := func(ref string) error {
-		if _, ok := refToCanonical[ref]; ok {
+	resolve := func(ref CalendarRef) error {
+		key := refKey(ref)
+		if _, ok := refToCanonical[key]; ok {
 			return nil
 		}
-		entry, err := lister.CalendarListGet(ctx, ref)
+		// Summary-form refs are added in a follow-up commit; for now,
+		// every supported ref is ID-form and routes through CalendarListGet
+		// exactly as before.
+		entry, err := lister.CalendarListGet(ctx, ref.ID)
 		if err != nil {
-			return fmt.Errorf("resolve %q: %w", ref, err)
+			return fmt.Errorf("resolve %q: %w", ref.ID, err)
 		}
 		if entry.ID == "" {
 			return fmt.Errorf("%w: gws calendarList.get(%q) returned an empty id",
-				ErrInvalid, ref)
+				ErrInvalid, ref.ID)
 		}
 		if _, exists := resolved[entry.ID]; !exists {
 			resolved[entry.ID] = Calendar{
 				CanonicalID: entry.ID,
 				AccessRole:  entry.AccessRole,
-				OriginalRef: ref,
+				OriginalRef: ref.ID,
 			}
 		}
-		refToCanonical[ref] = entry.ID
+		refToCanonical[key] = entry.ID
 		return nil
 	}
 
@@ -179,6 +184,32 @@ func resolveCalendars(ctx context.Context, c Config, lister CalendarLister) (
 	return resolved, refToCanonical, nil
 }
 
+// refKey returns a stable lookup key for a CalendarRef. ID-form refs key
+// on the literal ID string (preserving the pre-F1 behavior where multiple
+// pairs sharing a calendar dedupe to one CalendarListGet call). Summary-form
+// refs key on a "summary:<lower-summary>\x00<lower-account>" sentinel so two
+// pairs that name the same calendar by summary share one lookup.
+func refKey(r CalendarRef) string {
+	if r.IsSummaryRef() {
+		return "summary:" + strings.ToLower(r.Summary) + "\x00" + strings.ToLower(r.Account)
+	}
+	return r.ID
+}
+
+// refDescription returns a human-readable description of a CalendarRef
+// for error messages. ID-form refs render as the bare ID in quotes;
+// summary-form refs render with the summary (and optional account) so
+// the error names the form the user actually wrote.
+func refDescription(r CalendarRef) string {
+	if r.IsSummaryRef() {
+		if r.Account != "" {
+			return fmt.Sprintf("{summary=%q, account=%q}", r.Summary, r.Account)
+		}
+		return fmt.Sprintf("{summary=%q}", r.Summary)
+	}
+	return fmt.Sprintf("%q", r.ID)
+}
+
 // expandPDirs walks the pair list and emits one PDir per enabled pair.
 // Every pair is implicitly source-to-target (v2.0.0 dropped the
 // `direction` field; see SPEC.md "[[pairs]]"). For each emitted PDir it
@@ -198,15 +229,15 @@ func expandPDirs(c Config, calendars map[string]Calendar, refToCanonical map[str
 			continue
 		}
 
-		sourceCal, ok := calendars[refToCanonical[p.Source]]
+		sourceCal, ok := calendars[refToCanonical[refKey(p.Source)]]
 		if !ok {
-			return nil, fmt.Errorf("%w: pair %q source %q not resolved",
-				ErrInvalid, p.Name, p.Source)
+			return nil, fmt.Errorf("%w: pair %q source %s not resolved",
+				ErrInvalid, p.Name, refDescription(p.Source))
 		}
-		targetCal, ok := calendars[refToCanonical[p.Target]]
+		targetCal, ok := calendars[refToCanonical[refKey(p.Target)]]
 		if !ok {
-			return nil, fmt.Errorf("%w: pair %q target %q not resolved",
-				ErrInvalid, p.Name, p.Target)
+			return nil, fmt.Errorf("%w: pair %q target %s not resolved",
+				ErrInvalid, p.Name, refDescription(p.Target))
 		}
 
 		if sourceCal.CanonicalID == targetCal.CanonicalID {

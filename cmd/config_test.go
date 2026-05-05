@@ -318,8 +318,8 @@ func TestConfigShowCmd_CanonicalizeResolvesSource(t *testing.T) {
 	if len(payload.Pairs) != 1 {
 		t.Fatalf("want 1 pair, got %d", len(payload.Pairs))
 	}
-	if payload.Pairs[0].Source != "work@example.com" {
-		t.Errorf("source = %q, want work@example.com", payload.Pairs[0].Source)
+	if payload.Pairs[0].Source.ID != "work@example.com" {
+		t.Errorf("source = %q, want work@example.com", payload.Pairs[0].Source.ID)
 	}
 }
 

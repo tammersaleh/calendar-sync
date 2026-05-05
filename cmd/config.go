@@ -68,9 +68,11 @@ func (c *ConfigShowCmd) Run(rt *Runtime) error {
 }
 
 // pairPayloadFromCanonical returns a pairPayload populated from canonical
-// resolution: source/target are the canonical IDs (post-primary-expansion).
-// Every pdir is a_to_b in v2.0.0+, so the pdir's SourceCalendar and
-// TargetCalendar map directly to the pair's source and target.
+// resolution: source/target are the canonical IDs (post-primary or
+// post-summary expansion). Every pdir is a_to_b in v2.0.0+, so the pdir's
+// SourceCalendar and TargetCalendar map directly to the pair's source and
+// target. The wire shape collapses summary-form refs to their canonical ID
+// in the canonicalize=true output: that's the entire point of the flag.
 func pairPayloadFromCanonical(p config.Pair, canonical *config.Canonical) pairPayload {
 	source := p.Source
 	target := p.Target
@@ -78,8 +80,8 @@ func pairPayloadFromCanonical(p config.Pair, canonical *config.Canonical) pairPa
 		if pd.PairName != p.Name {
 			continue
 		}
-		source = pd.SourceCalendar
-		target = pd.TargetCalendar
+		source = config.CalendarRef{ID: pd.SourceCalendar}
+		target = config.CalendarRef{ID: pd.TargetCalendar}
 		break
 	}
 	row := pairPayload{
@@ -160,6 +162,11 @@ type settingsPayload struct {
 // implicitly source-to-target. The PDir-level direction (always "a_to_b")
 // still surfaces in `pair test` output via pairTestPayload.
 //
+// Source and Target use config.CalendarRef so the JSON wire shape mirrors
+// the user's TOML: ID-form refs marshal as plain strings (backwards-
+// compatible with the SPEC examples and pre-F1 output), summary-form refs
+// marshal as objects. See CalendarRef.MarshalJSON.
+//
 // Horizon surfaces only when the pair set its own override; absence (the
 // settings-fallback case) drops the field via omitempty so the wire shape
 // matches the user's config exactly.
@@ -170,12 +177,12 @@ type settingsPayload struct {
 // with omitempty would also drop `false`, silently demoting a deliberate
 // per-pair override back to the fallback.
 type pairPayload struct {
-	Name                 string `json:"name"`
-	Source               string `json:"source"`
-	Target               string `json:"target"`
-	Enabled              bool   `json:"enabled"`
-	Horizon              string `json:"horizon,omitempty"`
-	PropagateTargetEdits *bool  `json:"propagate_target_edits,omitempty"`
+	Name                 string             `json:"name"`
+	Source               config.CalendarRef `json:"source"`
+	Target               config.CalendarRef `json:"target"`
+	Enabled              bool               `json:"enabled"`
+	Horizon              string             `json:"horizon,omitempty"`
+	PropagateTargetEdits *bool              `json:"propagate_target_edits,omitempty"`
 }
 
 // configValidatePayload is SPEC line 609's wire shape:

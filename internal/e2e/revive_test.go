@@ -47,8 +47,8 @@ func TestE2E_Revive_CancelledMirror(t *testing.T) {
 	// Bypass-cancel the mirror directly via Calendar API. This is the
 	// out-of-band path - calendar-sync did not emit this cancellation,
 	// so its bookkeeping won't match the post-cancel state.
-	if _, err := h.GWS.EventsPatch(ctx, h.TargetCalID, mirrorID, &gws.Event{
-		Status: gws.EventStatusCancelled,
+	if _, err := h.GWS.EventsPatch(ctx, h.TargetCalID, mirrorID, &gws.PatchEvent{
+		Status: gws.PatchStr(gws.EventStatusCancelled),
 	}); err != nil {
 		t.Fatalf("bypass-cancel mirror %s: %v", mirrorID, err)
 	}

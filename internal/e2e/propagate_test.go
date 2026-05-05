@@ -52,8 +52,8 @@ func TestE2E_TargetEdit_Propagates(t *testing.T) {
 	// drift signals are (source_changed=false, mirror_drifted=true), the
 	// `target_edited` cell.
 	editedTitle := h.Title("propagate-edited")
-	if _, err := h.GWS.EventsPatch(ctx, h.TargetCalID, mirrorID, &gws.Event{
-		Summary: editedTitle,
+	if _, err := h.GWS.EventsPatch(ctx, h.TargetCalID, mirrorID, &gws.PatchEvent{
+		Summary: gws.PatchStr(editedTitle),
 	}); err != nil {
 		t.Fatalf("patch mirror %s: %v", mirrorID, err)
 	}

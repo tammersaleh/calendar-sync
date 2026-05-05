@@ -51,7 +51,7 @@ func TestE2E_OutsideHorizon_NoMirror(t *testing.T) {
 
 	// Patch start/end into the horizon window. delta=-12h yields ~12h
 	// from now, safely under the 1d horizon.
-	patched, err := h.GWS.EventsPatch(ctx, h.SourceCalID, source.ID, &gws.Event{
+	patched, err := h.GWS.EventsPatch(ctx, h.SourceCalID, source.ID, &gws.PatchEvent{
 		Start: futureDateTime(-12 * time.Hour),
 		End:   futureDateTime(-11 * time.Hour),
 	})

@@ -175,7 +175,7 @@ func TestE2E_SourceModified_PatchMirror(t *testing.T) {
 	// Patch source.summary. EventsPatch returns the post-write source
 	// resource; its Updated stamp is what the mirror should adopt.
 	newTitle := h.Title("patch-edited")
-	patched, err := h.GWS.EventsPatch(ctx, h.SourceCalID, source.ID, &gws.Event{Summary: newTitle})
+	patched, err := h.GWS.EventsPatch(ctx, h.SourceCalID, source.ID, &gws.PatchEvent{Summary: gws.PatchStr(newTitle)})
 	if err != nil {
 		t.Fatalf("patch source %s: %v", source.ID, err)
 	}

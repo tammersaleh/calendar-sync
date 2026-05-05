@@ -73,7 +73,7 @@ func TestE2E_StaleBookkeeping(t *testing.T) {
 	// fields once we sabotage stored bookkeeping below.
 	movedStart := futureDateTime(2 * time.Hour)
 	movedEnd := futureDateTime(3 * time.Hour)
-	patchedSource, err := h.GWS.EventsPatch(ctx, h.SourceCalID, source.ID, &gws.Event{
+	patchedSource, err := h.GWS.EventsPatch(ctx, h.SourceCalID, source.ID, &gws.PatchEvent{
 		Start: movedStart,
 		End:   movedEnd,
 	})
@@ -96,7 +96,7 @@ func TestE2E_StaleBookkeeping(t *testing.T) {
 	// mirror_drifted=false. Source's CURRENT managed fields differ from
 	// mirror's CURRENT managed fields (start moved on source, mirror still
 	// has the original start) -> fields_disagree=true.
-	if _, err := h.GWS.EventsPatch(ctx, h.TargetCalID, mirrorID, &gws.Event{
+	if _, err := h.GWS.EventsPatch(ctx, h.TargetCalID, mirrorID, &gws.PatchEvent{
 		ExtendedProperties: &gws.ExtendedProperties{
 			Private: map[string]string{
 				mirror.ExtKeySourceUpdated: patchedSource.Updated,

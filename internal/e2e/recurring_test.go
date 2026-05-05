@@ -186,8 +186,8 @@ func TestE2E_InstanceOverridePropagates(t *testing.T) {
 	// write source; its Updated stamp drives the next reconciliation's
 	// source_changed signal.
 	editedTitle := h.Title("recurring-propagate-edited")
-	patched, err := h.GWS.EventsPatch(ctx, h.SourceCalID, override.ID, &gws.Event{
-		Summary: editedTitle,
+	patched, err := h.GWS.EventsPatch(ctx, h.SourceCalID, override.ID, &gws.PatchEvent{
+		Summary: gws.PatchStr(editedTitle),
 	})
 	if err != nil {
 		t.Fatalf("patch source override %s: %v", override.ID, err)
@@ -300,8 +300,8 @@ func mustInsertRecurringSourceWithOverride(t *testing.T, h *Harness, ctx context
 	movedStart := originalStart.Add(2 * time.Hour)
 	movedEnd := movedStart.Add(time.Hour)
 	overrideTitle := h.Title(scenarioTag + "-override")
-	override, err = h.GWS.EventsPatch(ctx, h.SourceCalID, target.ID, &gws.Event{
-		Summary: overrideTitle,
+	override, err = h.GWS.EventsPatch(ctx, h.SourceCalID, target.ID, &gws.PatchEvent{
+		Summary: gws.PatchStr(overrideTitle),
 		Start:   &gws.EventDateTime{DateTime: movedStart.Format(time.RFC3339), TimeZone: "UTC"},
 		End:     &gws.EventDateTime{DateTime: movedEnd.Format(time.RFC3339), TimeZone: "UTC"},
 	})

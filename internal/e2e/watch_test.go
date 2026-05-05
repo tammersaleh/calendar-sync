@@ -75,8 +75,8 @@ func TestE2E_Watch_TickPropagatesSourceEdit(t *testing.T) {
 	// Patch the source. The next tick (≤ 15s away on the wall-clock-aligned
 	// boundary) should reconcile this as patch/source_updated.
 	editedTitle := h.Title("watch-edited")
-	if _, err := h.GWS.EventsPatch(ctx, h.SourceCalID, source.ID, &gws.Event{
-		Summary: editedTitle,
+	if _, err := h.GWS.EventsPatch(ctx, h.SourceCalID, source.ID, &gws.PatchEvent{
+		Summary: gws.PatchStr(editedTitle),
 	}); err != nil {
 		t.Fatalf("patch source %s: %v", source.ID, err)
 	}

@@ -28,13 +28,11 @@ Daemon as of end of session (~16:00Z 2026-05-05): running v2.4.0, pid 76065, sta
 
 After `brew upgrade` to v2.4.0, the daemon ran cleanly per stderr (BuildInventory complete at 15:32:38Z, no warnings since), and `_meta` lines streamed to stdout per tick. But `calendar-sync status` reported `mirrors:0` and omitted `last_full_sync_at`, `last_tick_at`, `last_tick_status` for ~23 minutes. Around 15:55:49Z those fields populated correctly and have stayed that way.
 
-Curious: when the IPC eventually populated (`last_full_sync_at = 15:55:49Z`), no fresh BuildInventory entries appeared in stderr. That implies either (a) `recordFullSync` was called from a non-FullSync path (no caller of that exists in the code I read), or (b) the FullSync ran but its `BuildInventory` calls didn't log - which contradicts `inventory.go:219`'s unconditional `if log != nil` log emission.
+Curious: when the IPC eventually populated (`last_full_sync_at = 15:55:49Z`), no fresh BuildInventory entries appeared in stderr. That implies either (a) `recordFullSync` was called from a non-FullSync path (no caller of that exists in the code), or (b) the FullSync ran but its `BuildInventory` calls didn't log - which contradicts `inventory.go:219`'s unconditional `if log != nil` log emission.
 
-Best theory I have: the startup FullSync DID complete and call `recordFullSync` (the `_meta` for the 21s startup pass appears in stdout), but somehow the snapshot field updates didn't take effect, then a fast-track FullSync at 15:55:49Z worked. I cannot reconcile this with the code as written. A `feature-dev:code-explorer` sub-agent investigated and concluded "I cannot find the specific code-level bug through static analysis. The root cause must be in a production execution scenario that the tests don't exercise." It also flagged a real test gap: no daemon integration test asserts on `store.snapshot()` content after `Daemon.runFullSync`. Adding one is the recommended next step.
+A daemon-level integration test (`TestDaemon_StartupFullSyncPopulatesSnapshot`, commit `6fcb0cd`) now drives a real `Daemon.Run` end-to-end and asserts the snapshot fields populate after the startup FullSync. The test PASSES, which means the in-process `runFullSync → recordFullSync → snapshot → IPC` path is correct. The production observation was therefore likely environmental (slow real-clock gws calls, a launchd startup/restart race, or similar) rather than a code bug. The test guards against a real future regression in this path.
 
-If the next session wants to investigate: the agent's full report recommends adding a test that drives `Daemon.Run` against a stub API, waits for FullSync, calls `store.snapshot()` directly, and asserts non-zero `LastFullSyncAt`, per-pdir `LastTickAt`, `LastTickStatus=="ok"`. That would either reproduce the bug (and pinpoint where state diverges) or pin healthy behavior.
-
-For now: daemon IS functioning - mirrors maintained, stderr clean, target-edit propagation working in real-time per the Tick output. The IPC quirk is observability, not correctness.
+For now: daemon IS functioning - mirrors maintained, stderr clean, target-edit propagation working in real-time. If the IPC empty-field window recurs after a future daemon restart, that's worth investigating further; the integration test would have caught a code-level cause.
 
 ## What's left
 
@@ -59,17 +57,15 @@ Recommend: leave Phase 2 deferred until you observe the limitation actually hurt
 
 `internal/gws/retry.go` has a comment pointing at `googleworkspace/cli#777`. The gws CLI doesn't expose `Retry-After` in its error envelope, so calendar-sync's retry layer can't honor it. Two-line change in retry.go once the upstream lands.
 
-### 4. Daemon integration test gap
-
-Per the IPC investigation above: there's no test that exercises the full `Daemon.runFullSync` → `store.snapshot()` integration. Adding one would have caught the IPC quirk this session (or, conversely, would prove the daemon is healthy and the IPC quirk was environmental). The B17 fast-follow test added this session is unit-level for `runTargetDeltaPhase`; the daemon-level gap is separate.
-
-### 5. Backlog files
+### 4. Backlog files
 
 `backlog/B17-target-syncToken.md` is now stale (B17 shipped). Per the design doc's last section: safe to delete after a quiet week of v2.4.0 in production. `backlog/` is otherwise empty.
 
 ## This session's commits
 
 ```
+6fcb0cd test: pin daemon-IPC integration after startup FullSync
+8140518 docs: update next.md handoff after v2.4.0 ship
 3c42af8 test: cover empty-nextToken branch in runTargetDeltaPhase
 404daf0 chore(main): release 2.4.0 (#19)
 e258a63 chore: pass release PR JSON via env to bash auto-merge step

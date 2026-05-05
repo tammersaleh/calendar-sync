@@ -293,6 +293,59 @@ target    = "work@example.com"
 	}
 }
 
+// hangingCanonicalizeGws blocks CalendarListGet until ctx is cancelled.
+// Used to drive the --timeout bounds-canonicalize test: the stub holds
+// canonicalize indefinitely so only the test's deadline can release it.
+type hangingCanonicalizeGws struct {
+	stubGws
+}
+
+func (h *hangingCanonicalizeGws) CalendarListGet(ctx context.Context, _ string) (*gws.CalendarListEntry, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// TestRunCmd_TimeoutBoundsCanonicalize pins SPEC's --timeout semantics:
+// "Wall-clock cap for the entire command." Canonicalize calls gws
+// calendarList; the timeout context must cover that call, not just the
+// sync loop. Before the hoist, --timeout only wrapped c.run; a hanging
+// canonicalize (e.g. gws subprocess wedged) would never deadline.
+func TestRunCmd_TimeoutBoundsCanonicalize(t *testing.T) {
+	tmp := shortTempDir(t)
+	t.Setenv("TMPDIR", tmp)
+
+	path := writeConfigFixture(t, validConfigTOML)
+	rt := &Runtime{
+		Stdout:  &bytes.Buffer{},
+		Stderr:  &bytes.Buffer{},
+		Globals: Globals{Config: path},
+		Ctx:     context.Background(),
+		Gws:     &hangingCanonicalizeGws{},
+	}
+
+	start := time.Now()
+	err := (&RunCmd{Timeout: 100 * time.Millisecond}).Run(rt)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("expected timeout error; got nil")
+	}
+	// 100ms timeout + small slack. If we hit anywhere near the default 5m
+	// the timeout did not bound canonicalize.
+	if elapsed > 2*time.Second {
+		t.Errorf("elapsed = %v, want < 2s; --timeout did not bound canonicalize", elapsed)
+	}
+	// MapError should resolve a context deadline error to a stable code.
+	// The exact code isn't load-bearing for this fix (whatever code
+	// canonicalize wraps a deadline as is fine); what matters is that the
+	// command returned promptly rather than hanging.
+	if !strings.Contains(err.Error(), "deadline") &&
+		!strings.Contains(err.Error(), "context") &&
+		!strings.Contains(err.Error(), "timeout") {
+		t.Errorf("err = %v; expected a deadline/context error", err)
+	}
+}
+
 // errStubEventsList is the canned error failingInventoryGws raises.
 var errStubEventsList = stubError("EventsList: test failure")
 

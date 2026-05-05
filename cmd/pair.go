@@ -88,7 +88,18 @@ func (c *PairTestCmd) Run(rt *Runtime) error {
 			fmt.Sprintf("pair %q not found", c.Name), "", errors.New("no matching pair"))
 	}
 
-	canonical, err := cfg.Canonicalize(rt.Ctx, rt.gwsClient())
+	// Bound the full command (canonicalize + delegated dry-run) under the
+	// run command's --timeout. PairTestCmd doesn't expose its own --timeout
+	// flag yet; the inherited 5m default is the cap.
+	runCmd := &RunCmd{
+		Pair:      []string{c.Name},
+		Direction: c.Direction,
+		DryRun:    true,
+	}
+	ctx, cancel := runCmd.timeoutContext(rt.Ctx)
+	defer cancel()
+
+	canonical, err := cfg.Canonicalize(ctx, rt.gwsClient())
 	if err != nil {
 		return err
 	}
@@ -114,12 +125,7 @@ func (c *PairTestCmd) Run(rt *Runtime) error {
 	}
 
 	// Delegate to the run command's dry-run path.
-	runCmd := &RunCmd{
-		Pair:      []string{c.Name},
-		Direction: c.Direction,
-		DryRun:    true,
-	}
-	if err := runCmd.run(rt, canonical, &count); err != nil {
+	if err := runCmd.run(ctx, rt, canonical, &count); err != nil {
 		return err
 	}
 	p.Meta(metaCount{Count: count})

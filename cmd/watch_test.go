@@ -126,6 +126,132 @@ log_format         = "json"
 	}
 }
 
+// hangingEventsListGws blocks EventsList until ctx is cancelled, recording
+// every observed deadline so the test can assert the per-call cap was
+// applied. Used by TestWatchCmd_TimeoutBoundsGwsCall.
+type hangingEventsListGws struct {
+	stubGws
+	called    chan struct{}  // signals first call
+	deadlines chan time.Time // observed deadlines
+}
+
+func newHangingEventsListGws() *hangingEventsListGws {
+	return &hangingEventsListGws{
+		called:    make(chan struct{}, 1),
+		deadlines: make(chan time.Time, 4),
+	}
+}
+
+func (h *hangingEventsListGws) EventsList(ctx context.Context, _ gws.EventsListParams) ([]gws.Event, string, error) {
+	dl, _ := ctx.Deadline()
+	select {
+	case h.deadlines <- dl:
+	default:
+	}
+	select {
+	case h.called <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return nil, "", ctx.Err()
+}
+
+// TestWatchCmd_TimeoutBoundsGwsCall pins SPEC line 488: --timeout is the
+// "wall-clock cap for any single source-list or mirror-list call." Wrap
+// the gws client so a wedged subprocess returns context.DeadlineExceeded
+// after timeout instead of holding the daemon's whole pass.
+//
+// Setup: stub EventsList blocks until ctx is cancelled. The daemon's
+// initial FullSync calls EventsList; with the wrapper, ctx carries a
+// 100ms deadline. Without the wrapper, ctx has no deadline and the call
+// would hang until the test's outer cleanup.
+func TestWatchCmd_TimeoutBoundsGwsCall(t *testing.T) {
+	tmp := shortTempDir(t)
+	t.Setenv("TMPDIR", tmp)
+	path := writeConfigFixture(t, validConfigTOML)
+
+	prev := AuthChecker
+	AuthChecker = func(_ context.Context) error { return nil }
+	t.Cleanup(func() { AuthChecker = prev })
+
+	stub := newHangingEventsListGws()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Outer ceiling so a regression doesn't hang the test forever.
+	time.AfterFunc(3*time.Second, cancel)
+
+	rt := &Runtime{
+		Stdout:  &bytes.Buffer{},
+		Stderr:  &bytes.Buffer{},
+		Globals: Globals{Config: path},
+		Ctx:     ctx,
+		Gws:     stub,
+	}
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		done <- (&WatchCmd{Timeout: 100 * time.Millisecond}).Run(rt)
+	}()
+
+	// The first EventsList call must observe a deadline within ~timeout
+	// of "now", proving the wrapper applied. We don't care about the
+	// exact daemon return; we care that the per-call ctx had a deadline.
+	select {
+	case <-stub.called:
+		// First call landed.
+	case <-time.After(2 * time.Second):
+		t.Fatal("EventsList was not called within 2s; daemon never reached source-list step")
+	}
+
+	select {
+	case dl := <-stub.deadlines:
+		if dl.IsZero() {
+			t.Errorf("EventsList ctx had no deadline; --timeout did not bound the call")
+		}
+		// Allow generous slack: the deadline should be within a couple
+		// hundred ms of "start + 100ms". We only assert ordering, not
+		// exact wall-clock alignment.
+		want := start.Add(100 * time.Millisecond)
+		// The deadline must be in the future at the moment of observation
+		// AND must be soon (not minutes away). 5s is the upper bound.
+		if dl.Sub(want) > 5*time.Second {
+			t.Errorf("EventsList deadline = %v, way past --timeout=100ms (started at %v)", dl, start)
+		}
+	default:
+		t.Errorf("expected an observed deadline, got none")
+	}
+
+	// Wait for the daemon to wind down.
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		// Force-cancel via outer ctx and let the daemon exit.
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("WatchCmd.Run did not return within 4s after timeout-bounded call")
+		}
+	}
+}
+
+// TestWatchCmd_TimeoutZeroDisablesWrapper pins the "0 disables" contract:
+// a zero/negative timeout MUST NOT wrap the GwsClient (the wrapper would
+// otherwise install a deadline of "right now" and every gws call would
+// instantly fail). callTimeoutAPI returns the inner client unchanged.
+func TestWatchCmd_TimeoutZeroDisablesWrapper(t *testing.T) {
+	stub := &stubGws{}
+	wrapped := newCallTimeoutAPI(stub, 0)
+	if wrapped != GwsClient(stub) {
+		t.Errorf("newCallTimeoutAPI(stub, 0) = %T, want the inner stub unchanged", wrapped)
+	}
+	wrapped = newCallTimeoutAPI(stub, -time.Second)
+	if wrapped != GwsClient(stub) {
+		t.Errorf("newCallTimeoutAPI(stub, -1s) = %T, want the inner stub unchanged", wrapped)
+	}
+}
+
 // TestWatchCmd_SettingsDryRunGatesWrites is the watch-side counterpart to
 // TestRunCmd_SettingsDryRunGatesWrites. The daemon has no `--dry-run` flag,
 // so settings.dry_run is the only way to flip the wrapper. We feed the

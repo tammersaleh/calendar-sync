@@ -31,6 +31,11 @@ type RunCmd struct {
 
 // Run is the kong entry point. It wraps the shared run logic with timeout
 // + daemon-running detection + the canonicalize step.
+//
+// SPEC: --timeout is the "wall-clock cap for the entire command", so the
+// timeout context is derived BEFORE canonicalize (which calls gws
+// calendarList and can hang). Both canonicalize and the run loop share
+// the same deadline.
 func (c *RunCmd) Run(rt *Runtime) error {
 	if err := refuseIfDaemonRunning(); err != nil {
 		return err
@@ -42,25 +47,35 @@ func (c *RunCmd) Run(rt *Runtime) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
-	canonical, err := cfg.Canonicalize(rt.Ctx, rt.gwsClient())
+
+	ctx, cancel := c.timeoutContext(rt.Ctx)
+	defer cancel()
+
+	canonical, err := cfg.Canonicalize(ctx, rt.gwsClient())
 	if err != nil {
 		return err
 	}
 	count := 0
-	return c.run(rt, canonical, &count)
+	return c.run(ctx, rt, canonical, &count)
 }
 
-// run is the shared core invoked by both RunCmd.Run (above) and PairTestCmd.Run.
-// `count` is incremented (or zeroed) by the printed Outcomes so PairTestCmd
-// can fold this command's count into its own meta.
-func (c *RunCmd) run(rt *Runtime, canonical *config.Canonical, count *int) error {
+// timeoutContext derives a child context from parent that bounds the
+// entire command per SPEC's --timeout semantics. Zero / negative timeouts
+// fall back to the 5m default.
+func (c *RunCmd) timeoutContext(parent context.Context) (context.Context, context.CancelFunc) {
 	timeout := c.Timeout
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
 	}
-	ctx, cancel := context.WithTimeout(rt.Ctx, timeout)
-	defer cancel()
+	return context.WithTimeout(parent, timeout)
+}
 
+// run is the shared core invoked by both RunCmd.Run (above) and PairTestCmd.Run.
+// `count` is incremented (or zeroed) by the printed Outcomes so PairTestCmd
+// can fold this command's count into its own meta. ctx must already carry
+// the --timeout deadline; see RunCmd.Run / PairTestCmd.Run for the
+// derivation.
+func (c *RunCmd) run(ctx context.Context, rt *Runtime, canonical *config.Canonical, count *int) error {
 	pdirs := filterPDirs(canonical.PDirs, c.Pair, c.Direction)
 	if len(c.Pair) > 0 && len(pdirs) == 0 {
 		return newCmdError(output.CodePairNotFound,

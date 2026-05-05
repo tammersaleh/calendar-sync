@@ -889,11 +889,14 @@ func (r *Reconciler) advanceTokens(
 			continue
 		}
 		if token == "" {
-			// SPEC line 912: "If the staged token is missing... leave the
+			// SPEC line 1017: "If the staged token is missing (Google can
+			// omit nextSyncToken on very long full lists)... leave the
 			// in-memory token empty so the next cycle re-runs a full
-			// source-list." We honor this by NOT writing an empty token;
-			// the existing entry stays put (which on FullSync was already
-			// untouched by step 1).
+			// source-list." A stale value from a prior pass would silently
+			// route the next Tick down the incremental path with a token
+			// Google has already invalidated; clear it explicitly so the
+			// daemon falls back to FullSync next cycle.
+			delete(r.syncTokens, source)
 			continue
 		}
 		r.syncTokens[source] = token

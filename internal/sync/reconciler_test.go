@@ -192,6 +192,50 @@ func TestFullSync_SourceListError_TokenStaysEmpty(t *testing.T) {
 	}
 }
 
+// TestAdvanceTokens_StaleTokenClearedWhenStagedEmpty pins SPEC line 1017:
+// when a full source-list returns no nextSyncToken (Google can omit it on
+// very long lists) and no pdir for that source failed, the in-memory
+// token must be cleared so the next cycle runs another FullSync rather
+// than a Tick with a stale token Google has already invalidated.
+func TestAdvanceTokens_StaleTokenClearedWhenStagedEmpty(t *testing.T) {
+	r := New(nil, makeCanonical(makeTestPDir("p1", "src-A", "tgt-A", true)))
+	r.syncTokens["src-A"] = "old-token"
+
+	stagedTokens := map[string]string{"src-A": ""}
+	pdirs := []PDirResult{{Pair: "p1", Source: "src-A"}}
+	perSource := map[string]SourceStatus{}
+
+	r.advanceTokens(stagedTokens, pdirs, perSource)
+
+	if got, ok := r.syncTokens["src-A"]; ok {
+		t.Errorf("syncTokens[src-A] = %q (still present); SPEC line 1017 requires the slot be cleared",
+			got)
+	}
+	if perSource["src-A"].SyncTokenChanged {
+		t.Errorf("SyncTokenChanged should be false when staged token is empty")
+	}
+}
+
+// TestAdvanceTokens_StaleTokenSurvivesPdirFailure pins the conjunction
+// of SPEC's two rules: failed pdir + empty staged token leaves the
+// existing token alone (the failure rule trumps the empty-token rule;
+// the next cycle will retry whatever path the still-valid token suggests).
+func TestAdvanceTokens_StaleTokenSurvivesPdirFailure(t *testing.T) {
+	r := New(nil, makeCanonical(makeTestPDir("p1", "src-A", "tgt-A", true)))
+	r.syncTokens["src-A"] = "old-token"
+
+	stagedTokens := map[string]string{"src-A": ""}
+	pdirs := []PDirResult{{Pair: "p1", Source: "src-A", Err: errors.New("boom")}}
+	perSource := map[string]SourceStatus{}
+
+	r.advanceTokens(stagedTokens, pdirs, perSource)
+
+	if got := r.syncTokens["src-A"]; got != "old-token" {
+		t.Errorf("syncTokens[src-A] = %q, want old-token (failure rule must trump empty-token rule)",
+			got)
+	}
+}
+
 // ---------- FullSync: classify error on one event keeps others going ----------
 
 // errorOnInsertAPI wraps a stubAPI but causes EventsInsert for a specific
@@ -995,19 +1039,20 @@ func TestFullSync_OrphanWalk_SkipsVisitedEntries(t *testing.T) {
 	}
 }
 
-// ---------- staged-but-empty-token: leave existing token unchanged ----------
+// ---------- staged-but-empty-token: clear existing token ----------
 
-// SPEC line 912: "If the staged token is missing... leave the in-memory
-// token empty so the next cycle re-runs a full source-list." We exercise
-// this on FullSync: the source-list returns events but no nextSyncToken.
-// The reconciler must NOT clobber an existing token with empty (which
-// would force a useless full re-sync next tick). Existing-token preserved.
+// SPEC line 1017: "If the staged token is missing (Google can omit
+// nextSyncToken on very long full lists)... leave the in-memory token
+// empty so the next cycle re-runs a full source-list." On FullSync the
+// source-list returns events but no nextSyncToken; any prior-pass token
+// must be cleared, otherwise the next Tick would silently route through
+// the incremental path with a token Google has already invalidated.
 //
-// lastFullSync, however, IS stamped: a successful full source-list scan
-// is what the timestamp tracks, regardless of whether Google returned a
-// token. Gating the stamp on token advancement would leave a no-token
-// source permanently stale and the daemon would loop FullSync forever.
-func TestFullSync_EmptyStagedToken_DoesNotClobber(t *testing.T) {
+// lastFullSync IS stamped: a successful full source-list scan is what
+// the timestamp tracks, regardless of whether Google returned a token.
+// Gating the stamp on token advancement would leave a no-token source
+// permanently stale and the daemon would loop FullSync forever.
+func TestFullSync_EmptyStagedToken_ClearsExistingToken(t *testing.T) {
 	api := newStubAPI()
 	pd := makeTestPDir("p1", "src-A", "tgt-A", true)
 	canonical := makeCanonical(pd)
@@ -1023,9 +1068,9 @@ func TestFullSync_EmptyStagedToken_DoesNotClobber(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FullSync error: %v", err)
 	}
-	if r.syncTokens["src-A"] != "preexisting-tok" {
-		t.Errorf("token should not be clobbered by empty staged token; got %q",
-			r.syncTokens["src-A"])
+	if got, ok := r.syncTokens["src-A"]; ok {
+		t.Errorf("syncTokens[src-A] = %q (still present); SPEC line 1017 requires the slot be cleared",
+			got)
 	}
 	if res.PerSource["src-A"].SyncTokenChanged {
 		t.Errorf("SyncTokenChanged should be false when staged token is empty")

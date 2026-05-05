@@ -916,6 +916,47 @@ func TestTargetDeltaPhase_TokenAdvancementOnSuccess(t *testing.T) {
 	}
 }
 
+// TestTargetDeltaPhase_StaleTokenClearedWhenStagedEmpty is the target-side
+// equivalent of the source-side rule documented in SPEC line 1017: when a
+// successful events.list returns no nextSyncToken (Google can omit it on
+// long deltas) and no event errored, the in-memory targetSyncToken must be
+// cleared so the next cycle runs another FullSync rather than a Tick with
+// a stale token Google has already invalidated.
+//
+// Source-side analog:
+// internal/sync/reconciler_test.go:200 (TestAdvanceTokens_StaleTokenClearedWhenStagedEmpty).
+func TestTargetDeltaPhase_StaleTokenClearedWhenStagedEmpty(t *testing.T) {
+	api := newStubAPI()
+	pd := makeWritablePDir("p1", "src-A", "tgt-A")
+	canonical := makeCanonical(pd)
+
+	r := newTestReconciler(api, canonical)
+	r.targetSyncTokens["tgt-A"] = "tok-tgt-old"
+	r.inventories["tgt-A"] = NewInventory("tgt-A")
+	r.syncTokens["src-A"] = "tok-src-old"
+
+	// Empty delta AND empty nextToken: the long-delta case where Google
+	// omitted the nextSyncToken. The branch fires regardless of how many
+	// events were in the delta as long as none errored.
+	queueTargetIncrDelta(api, "tgt-A", nil, "")
+	api.queueListIncr("src-A", nil, "tok-src-new")
+
+	res, err := r.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	if _, ok := r.targetSyncTokens["tgt-A"]; ok {
+		t.Errorf("targetSyncTokens[tgt-A] should be cleared when nextToken is empty")
+	}
+	if !res.PerTarget["tgt-A"].NeedsFullResync {
+		t.Errorf("PerTarget[tgt-A].NeedsFullResync should be true after empty nextToken")
+	}
+	if res.PerTarget["tgt-A"].SyncTokenChanged {
+		t.Errorf("SyncTokenChanged should be false; the token was cleared, not advanced")
+	}
+}
+
 // ---------- 12. Token does NOT advance when classify error fires ----------
 
 func TestTargetDeltaPhase_TokenStaysOnError(t *testing.T) {

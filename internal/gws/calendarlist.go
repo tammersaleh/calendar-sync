@@ -51,12 +51,9 @@ func (c *Client) CalendarListList(ctx context.Context) ([]CalendarListEntry, err
 		"--format", "json",
 	}
 
-	stdout, stderr, exit, err := c.execute(ctx, args)
+	stdout, _, err := c.executeTyped(ctx, args, "calendarList.list")
 	if err != nil {
 		return nil, err
-	}
-	if exit != 0 {
-		return nil, classifyError(stdout, stderr, exit, "calendarList.list")
 	}
 
 	pages, err := parseCalendarListPages(stdout)
@@ -111,12 +108,9 @@ func (c *Client) CalendarListGet(ctx context.Context, calendarID string) (*Calen
 		"--format", "json",
 	}
 
-	stdout, stderr, exit, err := c.execute(ctx, args)
+	stdout, _, err := c.executeTyped(ctx, args, "calendarList.get")
 	if err != nil {
 		return nil, err
-	}
-	if exit != 0 {
-		return nil, classifyError(stdout, stderr, exit, "calendarList.get")
 	}
 
 	var entry CalendarListEntry

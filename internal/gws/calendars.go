@@ -38,12 +38,9 @@ func (c *Client) CalendarsGet(ctx context.Context, calendarID string) (*Calendar
 		"--format", "json",
 	}
 
-	stdout, stderr, exit, err := c.execute(ctx, args)
+	stdout, _, err := c.executeTyped(ctx, args, "calendars.get")
 	if err != nil {
 		return nil, err
-	}
-	if exit != 0 {
-		return nil, classifyError(stdout, stderr, exit, "calendars.get")
 	}
 
 	var out Calendar
@@ -77,12 +74,9 @@ func (c *Client) CalendarsInsert(ctx context.Context, body *Calendar) (*Calendar
 		"--format", "json",
 	}
 
-	stdout, stderr, exit, err := c.execute(ctx, args)
+	stdout, _, err := c.executeTyped(ctx, args, "calendars.insert")
 	if err != nil {
 		return nil, err
-	}
-	if exit != 0 {
-		return nil, classifyError(stdout, stderr, exit, "calendars.insert")
 	}
 
 	var out Calendar
@@ -113,12 +107,8 @@ func (c *Client) CalendarsDelete(ctx context.Context, calendarID string) error {
 		"--format", "json",
 	}
 
-	stdout, stderr, exit, err := c.execute(ctx, args)
-	if err != nil {
+	if _, _, err := c.executeTyped(ctx, args, "calendars.delete"); err != nil {
 		return err
-	}
-	if exit != 0 {
-		return classifyError(stdout, stderr, exit, "calendars.delete")
 	}
 	return nil
 }

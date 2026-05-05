@@ -34,6 +34,12 @@ type Client struct {
 	binPath string
 	workDir string
 	log     Logger
+	// retry is the per-call retry configuration. Defaults are SPEC's: 5
+	// attempts, 1s/2s/4s/8s schedule, 25% jitter, real time.Sleep. Tests
+	// override via WithMaxAttempts / withRetryConfig (the latter is
+	// package-internal so production callers can't accidentally drop
+	// retries).
+	retry retryConfig
 }
 
 // Option configures a Client.
@@ -62,6 +68,22 @@ func WithWorkDir(dir string) Option {
 // the level + format vocabulary the layer-7 daemon configures upstream.
 func WithLogger(l Logger) Option {
 	return func(c *Client) { c.log = l }
+}
+
+// WithMaxAttempts overrides the SPEC-default 5-attempt retry ceiling. The
+// only intended caller is the test suite, which uses MaxAttempts=1 to
+// suppress retries when scenario fixtures only emit one response. Setting
+// 0 or negative restores the default.
+func WithMaxAttempts(n int) Option {
+	return func(c *Client) { c.retry.MaxAttempts = n }
+}
+
+// withRetryConfig is the package-internal escape hatch for tests that need
+// to inject a fake clock / custom schedule. Production callers use
+// WithMaxAttempts; the rest of the retry config is hardcoded to SPEC's
+// values to keep the user-tunable surface zero.
+func withRetryConfig(cfg retryConfig) Option {
+	return func(c *Client) { c.retry = cfg }
 }
 
 // New returns a Client. Without options it invokes gws by name, picking up
@@ -151,4 +173,53 @@ func isExecNotFound(err error) bool {
 		return errors.Is(execErr.Err, exec.ErrNotFound) || errors.Is(execErr, fs.ErrNotExist)
 	}
 	return false
+}
+
+// executeTyped runs a gws subprocess and returns either (stdout, stderr,
+// nil) on success or a typed *gws.Error on failure. Wraps execute +
+// classifyError plus the SPEC §"Retry policy" retry layer: rate-limited
+// and backend-error responses are retried up to 5 times with exponential
+// backoff and jitter; non-retryable failures (auth, not-found, conflict,
+// gone, invalid-request, network, gws-launch) short-circuit on the first
+// attempt.
+//
+// Each retry emits one warn-log per SPEC's sample shape (line 1408). A
+// nil Logger silences these warns.
+//
+// op is the SPEC's `endpoint` field (events.list, events.patch, etc.) -
+// surfaces in retry logs and as the Op on the typed error.
+//
+// Context composition with the cmd-layer per-call timeout: ctx flows
+// untouched into both the subprocess execution and the inter-attempt
+// sleep. That means cmd/timeout_api.go's --timeout deadline bounds the
+// WHOLE retry budget (every attempt + every backoff together), not each
+// attempt independently. With SPEC's defaults that ceiling is ~15s of
+// backoff plus N attempts; a 5-minute --timeout still has room for the
+// full retry budget, while a tight timeout (e.g. 5s) would cap retries
+// at whatever fits, which is the right behavior - the user asked for a
+// hard wall-clock cap.
+func (c *Client) executeTyped(ctx context.Context, args []string, op string) (stdout, stderr []byte, err error) {
+	cfg := c.retry
+	cfg.Op = op
+	if cfg.Logger == nil {
+		cfg.Logger = c.log
+	}
+
+	retryErr := withRetry(ctx, cfg, func() error {
+		var exit int
+		var runErr error
+		stdout, stderr, exit, runErr = c.execute(ctx, args)
+		if runErr != nil {
+			// Launch failures (binary missing, ctx canceled mid-run)
+			// already carry a typed envelope when they should
+			// (CodeGWSNotFound) or are not retryable to begin with
+			// (ctx errors). Surface verbatim.
+			return runErr
+		}
+		if exit != 0 {
+			return classifyError(stdout, stderr, exit, op)
+		}
+		return nil
+	})
+	return stdout, stderr, retryErr
 }

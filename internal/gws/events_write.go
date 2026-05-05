@@ -89,12 +89,9 @@ func (c *Client) EventsInsert(ctx context.Context, calendarID string, body *Even
 		"--format", "json",
 	}
 
-	stdout, stderr, exit, err := c.execute(ctx, args)
+	stdout, _, err := c.executeTyped(ctx, args, "events.insert")
 	if err != nil {
 		return nil, err
-	}
-	if exit != 0 {
-		return nil, classifyError(stdout, stderr, exit, "events.insert")
 	}
 
 	var out Event
@@ -141,12 +138,9 @@ func (c *Client) EventsPatch(ctx context.Context, calendarID, eventID string, bo
 		"--format", "json",
 	}
 
-	stdout, stderr, exit, err := c.execute(ctx, args)
+	stdout, _, err := c.executeTyped(ctx, args, "events.patch")
 	if err != nil {
 		return nil, err
-	}
-	if exit != 0 {
-		return nil, classifyError(stdout, stderr, exit, "events.patch")
 	}
 
 	var out Event
@@ -181,12 +175,8 @@ func (c *Client) EventsDelete(ctx context.Context, calendarID, eventID string) e
 		"--format", "json",
 	}
 
-	stdout, stderr, exit, err := c.execute(ctx, args)
-	if err != nil {
+	if _, _, err := c.executeTyped(ctx, args, "events.delete"); err != nil {
 		return err
-	}
-	if exit != 0 {
-		return classifyError(stdout, stderr, exit, "events.delete")
 	}
 	return nil
 }

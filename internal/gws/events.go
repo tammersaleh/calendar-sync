@@ -74,12 +74,9 @@ func (c *Client) EventsList(ctx context.Context, params EventsListParams) (event
 		"--format", "json",
 	}
 
-	stdout, stderr, exit, err := c.execute(ctx, args)
+	stdout, _, err := c.executeTyped(ctx, args, "events.list")
 	if err != nil {
 		return nil, "", err
-	}
-	if exit != 0 {
-		return nil, "", classifyError(stdout, stderr, exit, "events.list")
 	}
 
 	pages, err := parseNDJSONPages(stdout)
@@ -119,12 +116,9 @@ func (c *Client) EventsGet(ctx context.Context, calendarID, eventID string) (*Ev
 		"--format", "json",
 	}
 
-	stdout, stderr, exit, err := c.execute(ctx, args)
+	stdout, _, err := c.executeTyped(ctx, args, "events.get")
 	if err != nil {
 		return nil, err
-	}
-	if exit != 0 {
-		return nil, classifyError(stdout, stderr, exit, "events.get")
 	}
 
 	var event Event
@@ -174,12 +168,9 @@ func (c *Client) EventsInstances(ctx context.Context, params EventsInstancesPara
 		"--format", "json",
 	}
 
-	stdout, stderr, exit, err := c.execute(ctx, args)
+	stdout, _, err := c.executeTyped(ctx, args, "events.instances")
 	if err != nil {
 		return nil, err
-	}
-	if exit != 0 {
-		return nil, classifyError(stdout, stderr, exit, "events.instances")
 	}
 
 	pages, err := parseNDJSONPages(stdout)

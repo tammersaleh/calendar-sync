@@ -60,6 +60,15 @@ type SetupOptions struct {
 	Horizon              string // e.g. "30d", "365d"; default "365d"
 	DryRun               bool
 	PairName             string // default "e2e-pair"
+
+	// F1: emit `source = {summary = "..."}` instead of an ID-form string.
+	// The summary string is the fixture's stable summary
+	// (sourceCalSummary). SPEC §"Configuration" documents the inline-table
+	// form; this exercises the summary→canonical-ID resolution chain
+	// against live Google Calendar.
+	UseSummarySourceRef bool
+	// F1: same as UseSummarySourceRef but for the target ref.
+	UseSummaryTargetRef bool
 }
 
 // Setup is called from a test to prepare the per-test harness state.
@@ -105,6 +114,8 @@ func Setup(t *testing.T, opts SetupOptions) *Harness {
 		Horizon:              horizon,
 		PropagateTargetEdits: opts.PropagateTargetEdits,
 		DryRun:               opts.DryRun,
+		SourceSummary:        summaryIfRequested(opts.UseSummarySourceRef, sourceCalSummary),
+		TargetSummary:        summaryIfRequested(opts.UseSummaryTargetRef, targetCalSummary),
 	})
 	h.ConfigPath = cfg
 
@@ -145,6 +156,13 @@ type configValues struct {
 	Horizon              string
 	PropagateTargetEdits bool
 	DryRun               bool
+
+	// SourceSummary, when non-empty, switches the emitted `source` line
+	// to the inline-table summary form (F1). Source is then ignored.
+	SourceSummary string
+	// TargetSummary, when non-empty, switches the emitted `target` line
+	// to the inline-table summary form (F1). Target is then ignored.
+	TargetSummary string
 }
 
 // writeConfig produces a minimal config.toml at path. Returns the path
@@ -164,13 +182,30 @@ func writeConfig(t *testing.T, path string, v configValues) string {
 	b.WriteString("\n")
 	b.WriteString("[[pairs]]\n")
 	fmt.Fprintf(&b, "name = %q\n", v.PairName)
-	fmt.Fprintf(&b, "source = %q\n", v.Source)
-	fmt.Fprintf(&b, "target = %q\n", v.Target)
+	if v.SourceSummary != "" {
+		fmt.Fprintf(&b, "source = { summary = %q }\n", v.SourceSummary)
+	} else {
+		fmt.Fprintf(&b, "source = %q\n", v.Source)
+	}
+	if v.TargetSummary != "" {
+		fmt.Fprintf(&b, "target = { summary = %q }\n", v.TargetSummary)
+	} else {
+		fmt.Fprintf(&b, "target = %q\n", v.Target)
+	}
 
 	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
 		t.Fatalf("write config %q: %v", path, err)
 	}
 	return path
+}
+
+// summaryIfRequested returns summary when use is true, otherwise "". Keeps
+// Setup compact when wiring the new SetupOptions toggles into configValues.
+func summaryIfRequested(use bool, summary string) string {
+	if use {
+		return summary
+	}
+	return ""
 }
 
 // Title generates a unique, harness-tagged event title for use in

@@ -994,6 +994,49 @@ func TestTargetDeltaPhase_TransientReadAdvancesToken(t *testing.T) {
 	}
 }
 
+// TestTargetDeltaPhase_NoInventoryDoesNotAdvanceToken pins the Finding-3
+// fix: when seedTargetSyncTokens succeeds but rebuildInventories fails for
+// a target, the token is set but the inventory is absent. Without the
+// guard, target-delta would still list and advance the token, consuming
+// the delta without reconciling it against any inventory. The fix bails
+// out before EventsList and leaves the token alone for a future tick to
+// pick up after a successful FullSync.
+func TestTargetDeltaPhase_NoInventoryDoesNotAdvanceToken(t *testing.T) {
+	api := newStubAPI()
+	pd := makeWritablePDir("p1", "src-A", "tgt-A")
+	canonical := makeCanonical(pd)
+
+	r := newTestReconciler(api, canonical)
+	r.targetSyncTokens["tgt-A"] = "tok-tgt-stale"
+	r.syncTokens["src-A"] = "tok-src-old"
+	// Deliberately do NOT install an inventory for tgt-A. This simulates
+	// the failure mode where seedTargetSyncTokens succeeded but
+	// rebuildInventories errored for this target.
+
+	// Source-delta still runs (independent of target-delta inventory state).
+	api.queueListIncr("src-A", nil, "tok-src-new")
+
+	res, err := r.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	// Token must NOT advance.
+	if got := r.targetSyncTokens["tgt-A"]; got != "tok-tgt-stale" {
+		t.Errorf("missing inventory must NOT advance token; got %q want tok-tgt-stale", got)
+	}
+	if res.PerTarget["tgt-A"].SyncTokenChanged {
+		t.Error("PerTarget[tgt-A].SyncTokenChanged must be false when inventory missing")
+	}
+	// No EventsList call should fire against tgt-A. Target-delta's whole
+	// phase should be skipped, not just the per-event loop.
+	for _, c := range api.callsByOp("EventsList") {
+		if c.CalendarID == "tgt-A" {
+			t.Errorf("missing-inventory target must not be listed; got %+v", c)
+		}
+	}
+}
+
 // ---------- 13. Seed runs BEFORE inventory rebuild ----------
 
 func TestSeedTargetSyncTokens_RunsBeforeInventoryRebuild(t *testing.T) {

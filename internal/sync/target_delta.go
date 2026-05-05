@@ -58,6 +58,22 @@ func (r *Reconciler) runTargetDeltaPhase(ctx context.Context, res *TickResult) {
 			continue
 		}
 
+		// B17 missing-inventory guard: FullSync seeds tokens BEFORE
+		// rebuilding inventories (so an edit landing in the seed-to-
+		// inventory gap is visible to the next tick). If the inventory
+		// rebuild then errored for this target, the seeded token is set
+		// but the inventory is absent. Listing the delta now would either
+		// be impossible to reconcile (no inventory to compare against) or
+		// silently advance the token past unprocessed events. Skip the
+		// whole phase for this target until a future FullSync rebuilds
+		// the inventory.
+		if _, ok := r.inventories[target]; !ok {
+			r.debug("sync.targetDelta: no inventory; skipping target",
+				"target", target,
+			)
+			continue
+		}
+
 		params := gws.EventsListParams{
 			CalendarID:   target,
 			SyncToken:    token,
@@ -259,15 +275,11 @@ func (r *Reconciler) processTargetDeltaEvent(
 	// reading the inventory entry pre-target-edit means we're comparing
 	// the user's new mirror state against the desired-from-source state,
 	// which is exactly what propagate wants.
-	inv, ok := r.inventories[target]
-	if !ok {
-		// Cold-start safety: no inventory yet means no FullSync has
-		// completed. Defensive skip; the next FullSync rebuilds.
-		r.debug("sync.targetDelta: no inventory yet; skipping",
-			"target", target,
-		)
-		return nil
-	}
+	//
+	// runTargetDeltaPhase guarantees the per-target inventory is present
+	// before dispatch (the loop bails out if r.inventories[target] is
+	// missing). The lookup here is just to grab the *Inventory pointer.
+	inv := r.inventories[target]
 	classifier, _ := r.buildClassifier(pd, inv, counts)
 
 	// Refresh the inventory entry with the live mirror state from the

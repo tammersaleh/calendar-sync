@@ -28,13 +28,19 @@ jobs:
       # RELEASE_PAT (user-attributed), not GITHUB_TOKEN - otherwise the
       # resulting merge commit won't trigger this workflow again to run
       # goreleaser.
+      #
+      # The PR JSON is passed via env var, not direct ${{ }} interpolation,
+      # because the changelog body contains commit messages that may include
+      # apostrophes (e.g. "don't ..."). Direct interpolation embeds those
+      # quotes inside a bash single-quoted string and breaks the parser.
       - name: Enable auto-merge on release PR
         if: ${{ steps.release.outputs.pr }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+          PR_JSON: ${{ steps.release.outputs.pr }}
         run: |
-          pr_number=$(echo '${{ steps.release.outputs.pr }}' | jq -r '.number')
-          gh pr merge --auto --squash "$pr_number" --repo ${{ github.repository }}
+          pr_number=$(jq -r '.number' <<<"$PR_JSON")
+          gh pr merge --auto --squash "$pr_number" --repo "${{ github.repository }}"
 
   goreleaser:
     needs: release-please

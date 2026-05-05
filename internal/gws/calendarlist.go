@@ -11,10 +11,20 @@ import (
 // resource that calendar-sync uses. The accessRole field drives config
 // validation (SPEC.md "Validation rules") and the per-pdir source_writable
 // flag (SPEC.md "Drift detection model").
+//
+// SummaryOverride is the user-applied display name that takes precedence
+// over Summary in Google Calendar's UI; F1 summary lookups match against
+// the override-aware effective name. DataOwner is the owner email Google
+// reports for secondary calendars; F1 prefers it over the brittle ID-
+// substring heuristic when disambiguating by account. Primary marks the
+// authenticated user's primary calendar.
 type CalendarListEntry struct {
-	ID         string `json:"id"`
-	Summary    string `json:"summary,omitempty"`
-	AccessRole string `json:"accessRole"`
+	ID              string `json:"id"`
+	Summary         string `json:"summary,omitempty"`
+	SummaryOverride string `json:"summaryOverride,omitempty"`
+	AccessRole      string `json:"accessRole"`
+	DataOwner       string `json:"dataOwner,omitempty"`
+	Primary         bool   `json:"primary,omitempty"`
 }
 
 // calendarListPage is one page of calendarList.list output. gws --page-all

@@ -317,16 +317,16 @@ Duration strings follow Go's `time.ParseDuration` syntax (`30s`, `5m`, `24h`) pl
 `source` and `target` accept two forms:
 
 - **String** - the calendar ID directly. Accepts an email address (`"alice@example.com"`), the literal `"primary"` (which calendar-sync resolves to its canonical ID), or a group calendar ID (`"<hash>@group.calendar.google.com"`).
-- **Inline table** - lookup by display summary. The `summary` key (required) is matched case-insensitively against the gws-authenticated account's calendar list. The optional `account` key disambiguates when multiple visible calendars share the same summary; matching is by case-insensitive substring of the calendar's ID. Useful for subscriptions whose IDs aren't memorable (`source = {summary = "TripIt"}` resolves to whatever `<random>@import.calendar.google.com` ID Google assigned).
+- **Inline table** - lookup by display summary. The `summary` key (required) is matched case-insensitively against the gws-authenticated account's calendar list. Matching is against the user-visible name: each candidate's `summaryOverride` if set (the per-calendar display label users edit in Google's UI), otherwise its underlying `summary`. The optional `account` key disambiguates when multiple visible calendars share the same display name; matching prefers the candidate's `dataOwner` (case-insensitive equality), falling back to a case-insensitive substring of the calendar's ID when `dataOwner` is empty. Useful for subscriptions whose IDs aren't memorable (`source = {summary = "TripIt"}` resolves to whatever `<random>@import.calendar.google.com` ID Google assigned).
 
 | Inline-table field | Type   | Required | Description                                                                                                  |
 |--------------------|--------|----------|--------------------------------------------------------------------------------------------------------------|
-| `summary`          | string | yes      | Display summary as it appears in Google Calendar. Matched case-insensitively.                                |
-| `account`          | string | no       | Disambiguator when multiple calendars share `summary`. Matched as a case-insensitive substring of each candidate's ID. |
+| `summary`          | string | yes      | Display name as it appears in Google Calendar (the override the user applied if set, otherwise the calendar's underlying summary). Matched case-insensitively. |
+| `account`          | string | no       | Disambiguator when multiple calendars share `summary`. Matched first against each candidate's `dataOwner` (case-insensitive equality), then against the calendar ID as a case-insensitive substring when `dataOwner` is empty. |
 
 The inline-table form makes one `gws calendar calendarList list` call at canonicalize time and resolves every summary-form ref against the result, regardless of how many pairs use it. ID-form refs continue to use one `calendar calendarList get` per distinct ref.
 
-Limitation: `account` substring matching breaks for import/subscription calendars whose IDs look like `<random>@import.calendar.google.com` - the random hash carries no account information. If two such calendars share a summary and `account` can't disambiguate them, fall back to the bare ID-form ref. New calendars added in Google Calendar's UI after the daemon starts aren't visible until config reload (same behavior as the pre-F1 ID-form path).
+Limitation: when `dataOwner` is empty, `account` falls back to ID-substring matching, which breaks for import/subscription calendars whose IDs look like `<random>@import.calendar.google.com` - the random hash carries no account information. If two such calendars share a display name and neither can be disambiguated by `dataOwner` or ID substring, fall back to the bare ID-form ref. New calendars added in Google Calendar's UI after the daemon starts aren't visible until config reload (same behavior as the pre-F1 ID-form path).
 
 #### Validation rules
 

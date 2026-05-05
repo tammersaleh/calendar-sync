@@ -662,9 +662,11 @@ func TestCanonicalize_SummaryRefAmbiguousNoAccount(t *testing.T) {
 	}
 }
 
-// TestCanonicalize_SummaryRefAccountDisambiguates: ambiguous summary +
-// account substring filters down to exactly one match.
-func TestCanonicalize_SummaryRefAccountDisambiguates(t *testing.T) {
+// TestCanonicalize_SummaryRefAccountDisambiguatesByDataOwner pins the
+// preferred two-step match: DataOwner equality wins over the ID-substring
+// heuristic. Two entries share a summary; the user-typed account picks
+// the one whose DataOwner matches.
+func TestCanonicalize_SummaryRefAccountDisambiguatesByDataOwner(t *testing.T) {
 	c := baseConfig()
 	c.Pairs = []config.Pair{{
 		Name:   "p",
@@ -675,6 +677,42 @@ func TestCanonicalize_SummaryRefAccountDisambiguates(t *testing.T) {
 		responses: map[string]*gws.CalendarListEntry{
 			"primary": {ID: "personal@example.org", AccessRole: "owner"},
 		},
+		// IDs deliberately don't contain either account email; only the
+		// DataOwner field can disambiguate. Pinned shape: group calendars
+		// (`c_<hash>@group.calendar.google.com`) and import calendars carry
+		// no account in the ID, so the ID-substring fallback can't help.
+		listResponses: []gws.CalendarListEntry{
+			{ID: "c_aaa@group.calendar.google.com", Summary: "CoreWeave", DataOwner: "alice@example.com", AccessRole: "owner"},
+			{ID: "c_bbb@group.calendar.google.com", Summary: "CoreWeave", DataOwner: "bob@example.com", AccessRole: "reader"},
+		},
+	}
+	can, err := c.Canonicalize(context.Background(), lister)
+	if err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	if got, want := can.PDirs[0].SourceCalendar, "c_aaa@group.calendar.google.com"; got != want {
+		t.Errorf("SourceCalendar = %q, want %q (DataOwner-based disambiguation)", got, want)
+	}
+}
+
+// TestCanonicalize_SummaryRefAccountDisambiguatesByIDSubstring: when
+// DataOwner is empty (e.g. shared calendars Google didn't populate the
+// field for), the case-insensitive ID-substring fallback still resolves
+// the ambiguity. Pinned so the fallback path doesn't regress when a future
+// change tightens DataOwner usage.
+func TestCanonicalize_SummaryRefAccountDisambiguatesByIDSubstring(t *testing.T) {
+	c := baseConfig()
+	c.Pairs = []config.Pair{{
+		Name:   "p",
+		Source: config.CalendarRef{Summary: "CoreWeave", Account: "alice@example.com"},
+		Target: config.CalendarRef{ID: "primary"},
+	}}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"primary": {ID: "personal@example.org", AccessRole: "owner"},
+		},
+		// DataOwner is empty on both entries; the ID substring is the only
+		// signal. This is the legacy heuristic kept as a fallback.
 		listResponses: []gws.CalendarListEntry{
 			{ID: "alice@example.com", Summary: "CoreWeave", AccessRole: "owner"},
 			{ID: "bob@example.com", Summary: "CoreWeave", AccessRole: "reader"},
@@ -685,7 +723,69 @@ func TestCanonicalize_SummaryRefAccountDisambiguates(t *testing.T) {
 		t.Fatalf("Canonicalize: %v", err)
 	}
 	if got, want := can.PDirs[0].SourceCalendar, "alice@example.com"; got != want {
-		t.Errorf("SourceCalendar = %q, want %q (account substring disambiguation)", got, want)
+		t.Errorf("SourceCalendar = %q, want %q (ID-substring fallback)", got, want)
+	}
+}
+
+// TestCanonicalize_SummaryOverrideTakesPrecedence: SummaryOverride is the
+// user-applied display name shown in Google's UI; F1 must match against
+// the override, not the underlying summary. The user's real TripIt
+// subscription has summary="Tammer Saleh (TripIt)" and
+// summaryOverride="TripIt"; typing the raw summary in TOML should resolve
+// nothing, while typing the override matches.
+func TestCanonicalize_SummaryOverrideTakesPrecedence(t *testing.T) {
+	c := baseConfig()
+	c.Pairs = []config.Pair{{
+		Name:   "p",
+		Source: config.CalendarRef{Summary: "TripIt"}, // the user-visible override
+		Target: config.CalendarRef{ID: "primary"},
+	}}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"primary": {ID: "alice@example.com", AccessRole: "owner"},
+		},
+		listResponses: []gws.CalendarListEntry{
+			{
+				ID:              "tripit-abc@import.calendar.google.com",
+				Summary:         "Tammer Saleh (TripIt)", // raw subscription summary
+				SummaryOverride: "TripIt",                // what the user actually sees
+				AccessRole:      "reader",
+			},
+		},
+	}
+	can, err := c.Canonicalize(context.Background(), lister)
+	if err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	if got, want := can.PDirs[0].SourceCalendar, "tripit-abc@import.calendar.google.com"; got != want {
+		t.Errorf("SourceCalendar = %q, want %q (override-aware summary lookup)", got, want)
+	}
+}
+
+// TestCanonicalize_SummaryFallsBackToSummaryWhenNoOverride: the override-
+// preferred lookup must still resolve plain entries that have no override
+// set (the typical case for a user's own secondary calendars).
+func TestCanonicalize_SummaryFallsBackToSummaryWhenNoOverride(t *testing.T) {
+	c := baseConfig()
+	c.Pairs = []config.Pair{{
+		Name:   "p",
+		Source: config.CalendarRef{Summary: "Family"},
+		Target: config.CalendarRef{ID: "primary"},
+	}}
+	lister := &stubLister{
+		responses: map[string]*gws.CalendarListEntry{
+			"primary": {ID: "alice@example.com", AccessRole: "owner"},
+		},
+		listResponses: []gws.CalendarListEntry{
+			{ID: "fam-abc@group.calendar.google.com", Summary: "Family", AccessRole: "writer"},
+		},
+	}
+	can, err := c.Canonicalize(context.Background(), lister)
+	if err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	if got, want := can.PDirs[0].SourceCalendar, "fam-abc@group.calendar.google.com"; got != want {
+		t.Errorf("SourceCalendar = %q, want %q (summary fallback when override is empty)", got, want)
 	}
 }
 

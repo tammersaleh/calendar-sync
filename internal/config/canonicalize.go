@@ -226,16 +226,29 @@ func anyEnabledSummaryRef(c Config) bool {
 }
 
 // buildSummaryIndex groups CalendarListList entries by their lowercased
-// summary so summary lookups can match case-insensitively. SPEC's
-// risk-section note: Google's UI shows "TripIt" but a user might type
-// "tripit"; exact-case would be a footgun.
+// effective summary so summary lookups can match case-insensitively.
+//
+// "Effective summary" is summaryOverride when set, otherwise summary.
+// SummaryOverride is the user's per-calendar display name in Google's UI:
+// the underlying TripIt subscription has summary="Tammer Saleh (TripIt)"
+// but the user only ever sees their override "TripIt" in the calendar
+// list. Indexing by override-first matches what the user typed in TOML.
 func buildSummaryIndex(entries []gws.CalendarListEntry) map[string][]gws.CalendarListEntry {
 	out := make(map[string][]gws.CalendarListEntry, len(entries))
 	for _, e := range entries {
-		key := strings.ToLower(e.Summary)
+		key := strings.ToLower(effectiveSummary(e))
 		out[key] = append(out[key], e)
 	}
 	return out
+}
+
+// effectiveSummary returns the user-visible name: SummaryOverride when
+// non-empty, falling back to Summary.
+func effectiveSummary(e gws.CalendarListEntry) string {
+	if e.SummaryOverride != "" {
+		return e.SummaryOverride
+	}
+	return e.Summary
 }
 
 // resolveOne resolves a single CalendarRef. ID-form routes through
@@ -265,14 +278,18 @@ func resolveOne(
 //   - 1 match: success.
 //   - N matches with no account: ErrInvalid listing every match so the
 //     user can see exactly what to disambiguate against.
-//   - N matches with account: filter by case-insensitive ID-substring.
-//     Yield 1: success. Yield 0 / 2+: ErrInvalid with the relevant detail.
+//   - N matches with account: filter by the two-step match (DataOwner
+//     equality preferred, ID-substring fallback). Yield 1: success.
+//     Yield 0 / 2+: ErrInvalid with the relevant detail.
 //
-// Account disambiguation by ID-substring is the design plan's heuristic:
-// it works for the typical case (an "alice@example.com" account vs a
-// shared calendar at the same domain) but is documented as not robust
-// for "<random>@import.calendar.google.com"-shaped IDs. Users with that
-// shape have to fall back to bare ID refs.
+// Account disambiguation prefers DataOwner because Google reports it
+// authoritatively for secondary calendars and group calendars whose IDs
+// (`c_<hash>@group.calendar.google.com`) carry no account information.
+// When DataOwner is empty (the user's own primary, some shared
+// calendars), fall back to the case-insensitive ID-substring heuristic.
+// Both fallbacks still fail for "<random>@import.calendar.google.com"-
+// shaped IDs whose hash carries no account context; those users fall
+// back to bare ID refs.
 func resolveSummaryRef(
 	ref CalendarRef,
 	summaryIndex map[string][]gws.CalendarListEntry,
@@ -296,14 +313,14 @@ func resolveSummaryRef(
 	accountLower := strings.ToLower(ref.Account)
 	var filtered []gws.CalendarListEntry
 	for _, e := range matches {
-		if strings.Contains(strings.ToLower(e.ID), accountLower) {
+		if matchesAccount(e, ref.Account, accountLower) {
 			filtered = append(filtered, e)
 		}
 	}
 	switch len(filtered) {
 	case 0:
 		return nil, fmt.Errorf(
-			"%w: summary %q matches %d calendars but none has an ID containing account %q; matches were: %s",
+			"%w: summary %q matches %d calendars but none has DataOwner or ID matching account %q; matches were: %s",
 			ErrInvalid, ref.Summary, len(matches), ref.Account, formatMatchIDs(matches))
 	case 1:
 		entry := filtered[0]
@@ -313,6 +330,16 @@ func resolveSummaryRef(
 			"%w: summary %q with account %q is still ambiguous: %s",
 			ErrInvalid, ref.Summary, ref.Account, formatMatchIDs(filtered))
 	}
+}
+
+// matchesAccount applies the two-step disambiguation match: prefer
+// DataOwner equality when Google populated the field; otherwise fall
+// back to the case-insensitive ID-substring heuristic.
+func matchesAccount(e gws.CalendarListEntry, account, accountLower string) bool {
+	if e.DataOwner != "" {
+		return strings.EqualFold(e.DataOwner, account)
+	}
+	return strings.Contains(strings.ToLower(e.ID), accountLower)
 }
 
 // formatMatchIDs formats a list of CalendarListEntry IDs as a

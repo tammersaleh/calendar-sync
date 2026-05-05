@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.2.0](https://github.com/tammersaleh/calendar-sync/compare/v2.1.9...v2.2.0) (2026-05-05)
+
+
+### Features
+
+* add CalendarRef type for string-or-table source/target ([ea238e0](https://github.com/tammersaleh/calendar-sync/commit/ea238e0cbf660554555a1bf0b9e59a197be3ecea))
+* bounce launchd agent on brew upgrade via cask postflight ([66646af](https://github.com/tammersaleh/calendar-sync/commit/66646afc90347c9490b95c79d990b4fd2cf74b55))
+* match calendar refs against summaryOverride and dataOwner ([a00ee0e](https://github.com/tammersaleh/calendar-sync/commit/a00ee0edb1961df64c1822f984dc582ee0cb5816))
+* resolve summary-form calendar refs via CalendarListList ([fd3863f](https://github.com/tammersaleh/calendar-sync/commit/fd3863f691641fefb82f72307fd260573d2d0ec9))
+* validate CalendarRef summary/account union rules ([6a7e55a](https://github.com/tammersaleh/calendar-sync/commit/6a7e55a5e79c7892e932c32a12fe7ba7eef4bb5e))
+
+
+### Bug Fixes
+
+* address F2 review findings ([23dc765](https://github.com/tammersaleh/calendar-sync/commit/23dc765d608a89345ae11ed614939a2c23352f02))
+* clear stale union state in CalendarRef unmarshalers ([dcc9797](https://github.com/tammersaleh/calendar-sync/commit/dcc97978155347d758374490ef414d1325c67e07))
+* honor account on single-summary-match for CalendarRef ([8baf219](https://github.com/tammersaleh/calendar-sync/commit/8baf2190b567038cda2dccc19693fd8ba20a07e8))
+* type-assert inline-table fields in CalendarRef.UnmarshalTOML ([95b5b93](https://github.com/tammersaleh/calendar-sync/commit/95b5b936f03db15426870025fc058000cb284686))
+
 ## [2.1.9](https://github.com/tammersaleh/calendar-sync/compare/v2.1.8...v2.1.9) (2026-05-04)
 
 

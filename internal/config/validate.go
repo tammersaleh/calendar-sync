@@ -101,17 +101,17 @@ func validatePair(idx int, p Pair) error {
 			ErrInvalid, p.Name, p.Direction)
 	}
 
-	if p.Source.ID == "" && p.Source.Summary == "" {
-		return fmt.Errorf("%w: pairs[%q].source is required", ErrInvalid, p.Name)
+	if err := validateCalendarRef(p.Name, "source", p.Source); err != nil {
+		return err
 	}
-	if p.Target.ID == "" && p.Target.Summary == "" {
-		return fmt.Errorf("%w: pairs[%q].target is required", ErrInvalid, p.Name)
+	if err := validateCalendarRef(p.Name, "target", p.Target); err != nil {
+		return err
 	}
 	// Pre-canonicalization source==target catches the typo case early
 	// for the ID-form case where the strings are directly comparable. The
 	// canonicalize step also re-checks after primary-resolution. Summary-form
-	// refs only short-circuit when both fields match exactly; otherwise the
-	// post-canonicalize same-canonical-ID check is the catch-all.
+	// refs aren't checked here - the post-canonicalize same-canonical-ID
+	// check is the catch-all for all forms.
 	if p.Source.ID != "" && p.Source.ID == p.Target.ID {
 		return fmt.Errorf("%w: pairs[%q] cannot mirror a calendar to itself (source == target)",
 			ErrInvalid, p.Name)
@@ -126,6 +126,26 @@ func validatePair(idx int, p Pair) error {
 			return fmt.Errorf("%w: pairs[%q].horizon %s outside allowed range %s..%s",
 				ErrInvalid, p.Name, d, minHorizon, maxHorizon)
 		}
+	}
+	return nil
+}
+
+// validateCalendarRef enforces the string-or-table union shape that
+// CalendarRef.UnmarshalTOML is permissive about. The unmarshal path
+// accepts {} and {account = "..."} (no summary) and surfaces the
+// required-field error here so config_invalid output stays uniform.
+//
+// Account-without-summary is checked before the required-field check so a
+// user who wrote `target = {account = "alice"}` gets a hint that account
+// requires summary, rather than the more generic "target is required".
+func validateCalendarRef(pairName, field string, r CalendarRef) error {
+	if r.Account != "" && r.Summary == "" {
+		return fmt.Errorf("%w: pairs[%q].%s sets account=%q but no summary; account is only valid with a summary lookup",
+			ErrInvalid, pairName, field, r.Account)
+	}
+	if r.ID == "" && r.Summary == "" {
+		return fmt.Errorf("%w: pairs[%q].%s is required",
+			ErrInvalid, pairName, field)
 	}
 	return nil
 }

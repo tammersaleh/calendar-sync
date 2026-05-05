@@ -294,6 +294,69 @@ func TestValidate_RequiredFields(t *testing.T) {
 	}
 }
 
+// TestValidate_CalendarRefAcceptsSummaryForm pins the F1 happy path: a
+// pair with an inline-table source and a string target validates cleanly
+// (canonicalize-time resolution then routes the summary lookup).
+func TestValidate_CalendarRefAcceptsSummaryForm(t *testing.T) {
+	c := validConfig()
+	c.Pairs[0].Source = CalendarRef{Summary: "TripIt"}
+	c.Pairs[0].Target = CalendarRef{ID: "primary"}
+	if err := c.Validate(); err != nil {
+		t.Errorf("rejected summary-form source: %v", err)
+	}
+}
+
+// TestValidate_CalendarRefRejectsAccountWithoutSummary covers the new
+// rule from the F1 plan: account without summary is malformed.
+// UnmarshalTOML is permissive on the shape; validate.go surfaces the
+// required-field error so the user gets a uniform JSON error envelope.
+func TestValidate_CalendarRefRejectsAccountWithoutSummary(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Pair)
+	}{
+		{
+			name: "source account without summary",
+			mutate: func(p *Pair) {
+				p.Source = CalendarRef{Account: "alice@example.com"}
+			},
+		},
+		{
+			name: "target account without summary",
+			mutate: func(p *Pair) {
+				p.Target = CalendarRef{Account: "alice@example.com"}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := validConfig()
+			tc.mutate(&c.Pairs[0])
+			err := c.Validate()
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("err = %v; want ErrInvalid", err)
+			}
+			if !strings.Contains(err.Error(), "account") {
+				t.Errorf("err message %q should mention account", err.Error())
+			}
+			if !strings.Contains(err.Error(), "summary") {
+				t.Errorf("err message %q should mention summary", err.Error())
+			}
+		})
+	}
+}
+
+// TestValidate_CalendarRefRejectsEmptyTable covers the {} table case
+// (no summary key at all). UnmarshalTOML accepts it; validatePair must
+// surface it as missing-required-field.
+func TestValidate_CalendarRefRejectsEmptyTable(t *testing.T) {
+	c := validConfig()
+	c.Pairs[0].Source = CalendarRef{}
+	if !errors.Is(c.Validate(), ErrInvalid) {
+		t.Errorf("expected ErrInvalid for fully-empty CalendarRef")
+	}
+}
+
 func TestAccessRoleAtLeast(t *testing.T) {
 	tests := []struct {
 		actual string

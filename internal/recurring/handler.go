@@ -569,6 +569,23 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 
 	case mirror.ActionPropagate:
 		fields := mirror.DriftedFieldNames(mirrorInstance, desired)
+		if len(fields) == 0 {
+			// MirrorDrifted=true (stored checksum disagreed) but live
+			// managed fields equal desired-from-source. Don't write an
+			// empty {} merge patch to the source - either Google rejects
+			// it (perpetual pdir failure) or it's a wasted RPC. Repair
+			// the mirror's bookkeeping locally instead. Mirrors the
+			// stale_bookkeeping cell on the non-recurring path.
+			post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, mirror.BuildPatchPayload(desired))
+			if err != nil {
+				return Result{}, err
+			}
+			return Result{
+				Action:                  mirror.ActionPatch,
+				Reason:                  mirror.ReasonStaleBookkeeping,
+				PostWriteMirrorInstance: post,
+			}, nil
+		}
 		propagateBody := mirror.BuildPropagatePatchBody(mirrorInstance, fields)
 		patchedSource, err := h.API.EventsPatch(ctx, h.SourceCalendarID, source.ID, propagateBody)
 		if err != nil {

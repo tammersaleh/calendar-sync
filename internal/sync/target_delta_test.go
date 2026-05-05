@@ -490,10 +490,18 @@ func TestTargetDeltaPhase_SelfWriteSuppression(t *testing.T) {
 		t.Fatalf("Tick: %v", err)
 	}
 
-	for _, o := range *captured {
-		if o.Action == mirror.ActionPatch || o.Action == mirror.ActionPropagate {
-			t.Errorf("self-write should not trigger writes; got %+v", o)
-		}
+	// Pin the outcome shape: exactly one outcome, action=skip,
+	// reason=unchanged. A future drift-signal regression that emits
+	// skip(stale_bookkeeping) (or any other reason) without firing patches
+	// would still satisfy a "no writes" assertion - asserting on the
+	// reason is what holds the contract.
+	if len(*captured) != 1 {
+		t.Fatalf("self-write should emit exactly one outcome; got %+v", *captured)
+	}
+	got := (*captured)[0]
+	if got.Action != mirror.ActionSkip || got.Reason != mirror.ReasonUnchanged {
+		t.Errorf("self-write outcome = %s/%s, want skip/unchanged",
+			got.Action, got.Reason)
 	}
 	patches := api.callsByOp("EventsPatch")
 	if len(patches) != 0 {

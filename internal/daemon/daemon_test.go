@@ -1,8 +1,10 @@
 package daemon
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"os"
@@ -320,6 +322,144 @@ func TestDaemon_StartupRunsFullSyncOnce(t *testing.T) {
 	// Socket file should be unlinked after clean shutdown.
 	if _, err := os.Stat(d.SocketPath); err == nil {
 		t.Errorf("socket file should be removed on shutdown; still at %s", d.SocketPath)
+	}
+}
+
+// TestDaemon_StartupFullSyncPopulatesSnapshot: after Run starts and the
+// startup FullSync completes, dialing the IPC socket returns a status
+// JSONL with populated LastFullSyncAt, LastTickAt, LastTickStatus, and
+// Mirrors. Closes the gap flagged by the v2.4.0 production observation
+// where IPC reported empty values for these fields ~23m post-startup
+// despite stderr showing BuildInventory complete.
+//
+// The bonus assertion (post-tick LastTickAt advances past the FullSync's
+// timestamp) verifies the same path keeps working through one tick
+// cycle - a regression there would also explain the production symptom.
+func TestDaemon_StartupFullSyncPopulatesSnapshot(t *testing.T) {
+	api := newStubAPI()
+	api.listTokens["src"] = "tok-1"
+	api.listTokens["tgt"] = "tok-tgt-1"
+	startupT := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+	clock := newFakeClock(startupT)
+	// Use makeWritableDaemon so the writable-source path (production
+	// daemon's actual configuration) is exercised, including the per-
+	// target inventory + syncToken phases.
+	d, _ := makeWritableDaemon(t, api, clock)
+
+	cancel, done := runDaemonAsync(d)
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	// Wait for startup FullSync to complete + the After timer for the
+	// next tick to register. Writable-pdir FullSync issues source-list
+	// + target seed + 3 inventory rebuilds = 5 list calls minimum.
+	waitFor(t, "startup FullSync done + After registered", 2*time.Second, func() bool {
+		clock.mu.Lock()
+		defer clock.mu.Unlock()
+		return api.listCalls.Load() >= 5 && len(clock.pending) > 0
+	})
+
+	header, pdirs := dialAndDecodeStatus(t, d.SocketPath)
+
+	// FullSync recorded into the snapshot: header.LastFullSyncAt
+	// populated, pdir line populated with last-tick fields.
+	if header.LastFullSyncAt == "" {
+		t.Errorf("header.LastFullSyncAt is empty after startup FullSync; this reproduces the v2.4.0 production gap")
+	}
+	if len(pdirs) != 1 {
+		t.Fatalf("got %d pdir lines, want 1", len(pdirs))
+	}
+	pd := pdirs[0]
+	if pd.LastTickAt == "" {
+		t.Errorf("pdir.LastTickAt is empty after startup FullSync; applyResults should have set it")
+	}
+	if pd.LastTickStatus != "ok" {
+		t.Errorf("pdir.LastTickStatus = %q, want %q (no PDirResult.Err on happy path)", pd.LastTickStatus, "ok")
+	}
+	// Mirrors is 0 because stubAPI returns an empty inventory; verify the
+	// field is present in the response. Per Go's encoding/json + the
+	// statusPDir tag (no omitempty), Mirrors is always emitted, so any
+	// numeric value (including zero) is fine - we just want to confirm
+	// inventorySizes[target] was looked up successfully.
+	if pd.Mirrors < 0 {
+		t.Errorf("pdir.Mirrors = %d, want >= 0", pd.Mirrors)
+	}
+
+	fullSyncAtStr := pd.LastTickAt
+
+	// Bonus assertion: advance the clock past the next-tick boundary,
+	// wait for a tick, then re-dial and confirm LastTickAt advanced past
+	// the FullSync's timestamp.
+	clock.advance(120 * time.Second)
+	waitFor(t, "tick fired", 2*time.Second, func() bool {
+		// Writable target-delta phase + source-delta phase produce 2
+		// incremental list calls per tick.
+		return api.tickListCalls.Load() >= 2
+	})
+
+	_, pdirs2 := dialAndDecodeStatus(t, d.SocketPath)
+	if len(pdirs2) != 1 {
+		t.Fatalf("post-tick: got %d pdir lines, want 1", len(pdirs2))
+	}
+	pd2 := pdirs2[0]
+	if pd2.LastTickAt == "" {
+		t.Fatalf("post-tick: pdir.LastTickAt is empty")
+	}
+	if pd2.LastTickAt == fullSyncAtStr {
+		t.Errorf("post-tick: pdir.LastTickAt = %q, want value later than startup FullSync timestamp %q", pd2.LastTickAt, fullSyncAtStr)
+	}
+	if pd2.LastTickStatus != "ok" {
+		t.Errorf("post-tick: pdir.LastTickStatus = %q, want %q", pd2.LastTickStatus, "ok")
+	}
+}
+
+// dialAndDecodeStatus dials the daemon's IPC socket and parses the
+// JSONL response into the header + per-pdir lines. The trailing _meta
+// line is consumed to keep the connection drain-clean.
+func dialAndDecodeStatus(t *testing.T, socketPath string) (statusHeader, []statusPDir) {
+	t.Helper()
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatalf("dial %s: %v", socketPath, err)
+	}
+	defer conn.Close()
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+
+	br := bufio.NewReader(conn)
+	headerLine, err := br.ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("read header: %v", err)
+	}
+	var header statusHeader
+	if err := json.Unmarshal(headerLine, &header); err != nil {
+		t.Fatalf("decode header: %v (line=%q)", err, headerLine)
+	}
+
+	var pdirs []statusPDir
+	for {
+		line, err := br.ReadBytes('\n')
+		if err != nil {
+			t.Fatalf("read line: %v", err)
+		}
+		// The _meta trailer is the last line; detect it by trying to
+		// decode into a struct with a _meta key. statusPDir has no
+		// _meta tag, so a meta line decodes into pdir as zero-valued.
+		var probe map[string]json.RawMessage
+		if err := json.Unmarshal(line, &probe); err != nil {
+			t.Fatalf("decode probe: %v (line=%q)", err, line)
+		}
+		if _, isMeta := probe["_meta"]; isMeta {
+			return header, pdirs
+		}
+		var pdir statusPDir
+		if err := json.Unmarshal(line, &pdir); err != nil {
+			t.Fatalf("decode pdir: %v (line=%q)", err, line)
+		}
+		pdirs = append(pdirs, pdir)
 	}
 }
 

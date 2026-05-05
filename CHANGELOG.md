@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.3.0](https://github.com/tammersaleh/calendar-sync/compare/v2.2.0...v2.3.0) (2026-05-05)
+
+
+### Features
+
+* PatchEvent type for explicit-clear merge patches ([f7db671](https://github.com/tammersaleh/calendar-sync/commit/f7db67133ec83f8a677af8bf12209f03bb0ef8dd))
+
+
+### Bug Fixes
+
+* --timeout bounds the full command, not just the run loop ([9f82a67](https://github.com/tammersaleh/calendar-sync/commit/9f82a673bef7f7e9c22a053cff044dcb00f9e901))
+* address final-review findings on correctness pass ([507ce54](https://github.com/tammersaleh/calendar-sync/commit/507ce54ec1e8862e3434bd90705d7a05b8d24461))
+* clear stale syncToken on FullSync when Google omits nextSyncToken ([083a170](https://github.com/tammersaleh/calendar-sync/commit/083a17083333a026dd3f560ad391c728efb0224a))
+* degrade empty-fields propagate to stale_bookkeeping ([91337a5](https://github.com/tammersaleh/calendar-sync/commit/91337a571025b02f54099208d02d0c6bc78f178f))
+* degrade empty-fields propagate to stale_bookkeeping in recurring handler ([8a1b6e5](https://github.com/tammersaleh/calendar-sync/commit/8a1b6e590f576a2e1603f3fe88edcba0073f96ff))
+* install plist handles relative paths and XML metacharacters ([f4f7fc8](https://github.com/tammersaleh/calendar-sync/commit/f4f7fc8cc46cf2a23230a4c976dc5fdc82c9a1ba))
+* respect [[pairs]].time_zone for all-day mirrored events ([e8f6d39](https://github.com/tammersaleh/calendar-sync/commit/e8f6d390a622907aa90791d7841d02f6d9937fac))
+* retry rate-limited and backend gws calls per SPEC ([c13452f](https://github.com/tammersaleh/calendar-sync/commit/c13452f1d88e64c9bccf4c21d0a9e6367e5e2f3e))
+
 ## [2.2.0](https://github.com/tammersaleh/calendar-sync/compare/v2.1.9...v2.2.0) (2026-05-05)
 
 

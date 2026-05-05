@@ -12,6 +12,9 @@ import (
 // that stores calendar-sync:checksum computed from the post-write
 // resource. Returns the post-checksum response.
 //
+// Body is *gws.PatchEvent so callers can express clear-intent on managed
+// fields (e.g. propagate a cleared description back to source).
+//
 // This duplicates the helper of the same name in internal/recurring/
 // handler.go. The duplication is intentional for now per the layer-6
 // prompt - extracting a shared helper requires a careful home (likely a
@@ -21,14 +24,14 @@ import (
 func (c *Classifier) patchMirrorWithChecksum(
 	ctx context.Context,
 	calendarID, eventID string,
-	body *gws.Event,
+	body *gws.PatchEvent,
 ) (*gws.Event, error) {
 	post, err := c.API.EventsPatch(ctx, calendarID, eventID, body)
 	if err != nil {
 		return nil, err
 	}
 	checksum := mirror.Checksum(mirror.ManagedFieldsFromEvent(post))
-	follow := &gws.Event{
+	follow := &gws.PatchEvent{
 		ExtendedProperties: &gws.ExtendedProperties{
 			Private: map[string]string{mirror.ExtKeyChecksum: checksum},
 		},
@@ -46,7 +49,7 @@ func (c *Classifier) followUpChecksum(
 	post *gws.Event,
 ) (*gws.Event, error) {
 	checksum := mirror.Checksum(mirror.ManagedFieldsFromEvent(post))
-	follow := &gws.Event{
+	follow := &gws.PatchEvent{
 		ExtendedProperties: &gws.ExtendedProperties{
 			Private: map[string]string{mirror.ExtKeyChecksum: checksum},
 		},

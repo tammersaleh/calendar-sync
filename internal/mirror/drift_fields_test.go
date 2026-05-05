@@ -117,11 +117,11 @@ func TestBuildPropagatePatchBody_IncludesLocation(t *testing.T) {
 		Location: "User-edited venue",
 	}
 	body := BuildPropagatePatchBody(live, []string{"location"})
-	if body.Location != "User-edited venue" {
-		t.Errorf("Location = %q, want %q", body.Location, "User-edited venue")
+	if body.Location == nil || *body.Location != "User-edited venue" {
+		t.Errorf("Location = %v, want %q", body.Location, "User-edited venue")
 	}
-	if body.Summary != "" {
-		t.Errorf("Summary should not be set (not in drifted list); got %q", body.Summary)
+	if body.Summary != nil {
+		t.Errorf("Summary should not be set (not in drifted list); got %v", body.Summary)
 	}
 }
 
@@ -133,11 +133,11 @@ func TestBuildPropagatePatchBody_StripsTrailerFromDescription(t *testing.T) {
 		End:         &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z"},
 	}
 	body := BuildPropagatePatchBody(live, []string{"summary", "description", "start", "end"})
-	if body.Summary != "Real summary" {
-		t.Errorf("Summary = %q", body.Summary)
+	if body.Summary == nil || *body.Summary != "Real summary" {
+		t.Errorf("Summary = %v", body.Summary)
 	}
-	if body.Description != "user-typed body" {
-		t.Errorf("Description = %q, want trailer stripped", body.Description)
+	if body.Description == nil || *body.Description != "user-typed body" {
+		t.Errorf("Description = %v, want trailer stripped", body.Description)
 	}
 	if body.Start == nil || body.Start.DateTime != live.Start.DateTime {
 		t.Errorf("Start passthrough wrong; got %+v", body.Start)
@@ -157,11 +157,11 @@ func TestBuildPropagatePatchBody_OmitsUndriftedFields(t *testing.T) {
 		Visibility:   gws.VisibilityPrivate,
 	}
 	body := BuildPropagatePatchBody(live, []string{"summary"})
-	if body.Summary != "Real summary" {
-		t.Errorf("Summary = %q", body.Summary)
+	if body.Summary == nil || *body.Summary != "Real summary" {
+		t.Errorf("Summary = %v", body.Summary)
 	}
-	if body.Description != "" {
-		t.Errorf("Description should not be set; got %q", body.Description)
+	if body.Description != nil {
+		t.Errorf("Description should not be set; got %v", body.Description)
 	}
 	if body.Start != nil {
 		t.Errorf("Start should not be set; got %+v", body.Start)
@@ -169,24 +169,57 @@ func TestBuildPropagatePatchBody_OmitsUndriftedFields(t *testing.T) {
 	if body.End != nil {
 		t.Errorf("End should not be set; got %+v", body.End)
 	}
-	if body.Transparency != "" {
-		t.Errorf("Transparency should not be set; got %q", body.Transparency)
+	if body.Transparency != nil {
+		t.Errorf("Transparency should not be set; got %v", body.Transparency)
 	}
-	if body.Visibility != "" {
-		t.Errorf("Visibility should not be set; got %q", body.Visibility)
+	if body.Visibility != nil {
+		t.Errorf("Visibility should not be set; got %v", body.Visibility)
 	}
 }
 
 func TestBuildPropagatePatchBody_EmptyDriftedFieldsYieldsEmptyBody(t *testing.T) {
 	// Defensive: a no-drifted-fields call (which the sync layer would never
-	// actually make) returns an empty *gws.Event without panicking.
+	// actually make) returns an empty *gws.PatchEvent without panicking.
 	live := &gws.Event{Summary: "anything"}
 	body := BuildPropagatePatchBody(live, nil)
 	if body == nil {
 		t.Fatal("body should never be nil")
 	}
-	if body.Summary != "" {
+	if body.Summary != nil {
 		t.Errorf("body should be empty; got %+v", body)
+	}
+}
+
+func TestBuildPropagatePatchBody_ClearsSummary(t *testing.T) {
+	// SPEC: when the user erases the summary on the mirror and propagate
+	// runs, the source's summary must be CLEARED, not left untouched. The
+	// patch body must carry summary as a non-nil pointer to "" so Calendar
+	// API's merge-patch semantics overwrite the existing value rather than
+	// preserve it via omitempty.
+	live := &gws.Event{Summary: ""}
+	body := BuildPropagatePatchBody(live, []string{"summary"})
+	if body.Summary == nil {
+		t.Fatal("Summary must be present in patch body even when empty (clear-intent); got nil")
+	}
+	if *body.Summary != "" {
+		t.Errorf("Summary = %q, want empty string", *body.Summary)
+	}
+}
+
+func TestBuildPropagatePatchBody_ClearsRecurrenceToEmptyArray(t *testing.T) {
+	// When the user converts a recurring mirror back to a single-instance
+	// event (clears the RRULE) the propagate body must instruct Calendar
+	// API to clear the source's recurrence array. PatchRecurrenceClear
+	// produces a non-nil pointer to []string{}, which marshals to
+	// "recurrence":[] - the clear form. Without this, omitempty would drop
+	// the field and source would keep its recurrence forever.
+	live := &gws.Event{Recurrence: nil}
+	body := BuildPropagatePatchBody(live, []string{"recurrence"})
+	if body.Recurrence == nil {
+		t.Fatal("Recurrence must be present in patch body even when empty (clear-intent); got nil")
+	}
+	if len(*body.Recurrence) != 0 {
+		t.Errorf("Recurrence = %v, want empty slice", *body.Recurrence)
 	}
 }
 
@@ -388,10 +421,13 @@ func TestBuildPropagatePatchBody_IncludesRecurrence(t *testing.T) {
 		Recurrence: []string{"RRULE:FREQ=WEEKLY;COUNT=4"},
 	}
 	body := BuildPropagatePatchBody(live, []string{"recurrence"})
-	if len(body.Recurrence) != 1 || body.Recurrence[0] != "RRULE:FREQ=WEEKLY;COUNT=4" {
-		t.Errorf("Recurrence = %v, want [RRULE:FREQ=WEEKLY;COUNT=4]", body.Recurrence)
+	if body.Recurrence == nil {
+		t.Fatal("Recurrence missing from patch body")
 	}
-	if body.Summary != "" {
-		t.Errorf("Summary should not be set (not in drifted list); got %q", body.Summary)
+	if len(*body.Recurrence) != 1 || (*body.Recurrence)[0] != "RRULE:FREQ=WEEKLY;COUNT=4" {
+		t.Errorf("Recurrence = %v, want [RRULE:FREQ=WEEKLY;COUNT=4]", *body.Recurrence)
+	}
+	if body.Summary != nil {
+		t.Errorf("Summary should not be set (not in drifted list); got %v", body.Summary)
 	}
 }

@@ -101,34 +101,47 @@ func recurrenceEqual(a, b []string) bool {
 // fields per SPEC.md "Field-level propagate" (so untouched source fields
 // like attendees / conferenceData are preserved).
 //
+// The returned *gws.PatchEvent uses pointer fields so a cleared mirror
+// value (e.g. user erased the description) reaches the source as an
+// explicit clear rather than being dropped by json:",omitempty".
+//
 // The description value is the LIVE mirror's description with the trailer
 // stripped, per SPEC.md "Drift handling" step 3. If the trailer is the
 // entire description (i.e. source body was empty), the stripped result is
 // the empty string, which is the correct value to send to source.
 //
+// Recurrence is special-cased: a nil or empty live.Recurrence in the
+// drifted set means "clear recurrence" (a recurring event the user flipped
+// to single-instance), so the body uses PatchRecurrenceClear() to send the
+// empty-array clear form rather than dropping the field.
+//
 // Both the recurring-instance handler and the sync-layer classifier use
 // this helper; it lives in the mirror package alongside DriftedFieldNames.
-func BuildPropagatePatchBody(live *gws.Event, drifted []string) *gws.Event {
-	body := &gws.Event{}
+func BuildPropagatePatchBody(live *gws.Event, drifted []string) *gws.PatchEvent {
+	body := &gws.PatchEvent{}
 	for _, f := range drifted {
 		switch f {
 		case "summary":
-			body.Summary = live.Summary
+			body.Summary = gws.PatchStr(live.Summary)
 		case "description":
 			stripped, _ := StripTrailer(live.Description)
-			body.Description = stripped
+			body.Description = gws.PatchStr(stripped)
 		case "location":
-			body.Location = live.Location
+			body.Location = gws.PatchStr(live.Location)
 		case "start":
 			body.Start = live.Start
 		case "end":
 			body.End = live.End
 		case "transparency":
-			body.Transparency = live.Transparency
+			body.Transparency = gws.PatchStr(live.Transparency)
 		case "visibility":
-			body.Visibility = live.Visibility
+			body.Visibility = gws.PatchStr(live.Visibility)
 		case "recurrence":
-			body.Recurrence = live.Recurrence
+			if len(live.Recurrence) == 0 {
+				body.Recurrence = gws.PatchRecurrenceClear()
+			} else {
+				body.Recurrence = gws.PatchRecurrence(live.Recurrence)
+			}
 		}
 	}
 	return body

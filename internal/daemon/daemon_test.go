@@ -159,7 +159,7 @@ func (s *stubAPI) EventsInsert(_ context.Context, _ string, _ *gws.Event) (*gws.
 	return nil, errors.New("stubAPI.EventsInsert: not implemented for daemon tests")
 }
 
-func (s *stubAPI) EventsPatch(_ context.Context, _, _ string, _ *gws.Event) (*gws.Event, error) {
+func (s *stubAPI) EventsPatch(_ context.Context, _, _ string, _ *gws.PatchEvent) (*gws.Event, error) {
 	return nil, errors.New("stubAPI.EventsPatch: not implemented for daemon tests")
 }
 

@@ -79,7 +79,7 @@ func (s *stubGws) EventsInsert(context.Context, string, *gws.Event) (*gws.Event,
 	return nil, nil
 }
 
-func (s *stubGws) EventsPatch(context.Context, string, string, *gws.Event) (*gws.Event, error) {
+func (s *stubGws) EventsPatch(context.Context, string, string, *gws.PatchEvent) (*gws.Event, error) {
 	return nil, nil
 }
 

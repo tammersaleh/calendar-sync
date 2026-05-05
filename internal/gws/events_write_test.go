@@ -175,13 +175,10 @@ func TestEventsInsert_PartialPayloadOmitsZeroFields(t *testing.T) {
 	}
 }
 
-func TestEventsPatch_ZeroSummaryIsOmittedNotCleared(t *testing.T) {
-	// Document the omitempty behavior: passing Summary="" produces an
-	// empty patch body, NOT a clear-to-empty-string. SPEC.md never asks
-	// for clear-to-empty on managed fields (summary/description always
-	// derive from the source; transparency/visibility are forced to
-	// constants), so this is a tolerable contract rather than a bug -
-	// but the behavior is surprising enough to pin down explicitly.
+func TestEventsPatch_NilFieldsProduceEmptyBody(t *testing.T) {
+	// PatchEvent semantics: a nil pointer field means "leave alone" and
+	// must not appear on the wire. Verify that an entirely-nil PatchEvent
+	// marshals to {} so omitempty does its job.
 	scenario := testhelpers.Scenario{
 		Calls: []testhelpers.ScenarioCall{
 			{Stdout: `{"id":"e1"}`, Exit: 0},
@@ -189,7 +186,7 @@ func TestEventsPatch_ZeroSummaryIsOmittedNotCleared(t *testing.T) {
 	}
 
 	calls := testhelpers.WithFakeGWS(t, scenario, func() {
-		_, _ = gws.New().EventsPatch(context.Background(), "cal", "e1", &gws.Event{Summary: ""})
+		_, _ = gws.New().EventsPatch(context.Background(), "cal", "e1", &gws.PatchEvent{})
 	})
 
 	gotBody, ok := calls[0].Body.(map[string]any)
@@ -197,7 +194,73 @@ func TestEventsPatch_ZeroSummaryIsOmittedNotCleared(t *testing.T) {
 		t.Fatalf("body did not parse as object: %#v", calls[0].Body)
 	}
 	if len(gotBody) != 0 {
-		t.Errorf("zero-valued patch produced non-empty body %#v; want {} (omitempty drops everything)", gotBody)
+		t.Errorf("nil-fields patch produced non-empty body %#v; want {} (nil pointers are omitted)", gotBody)
+	}
+}
+
+func TestEventsPatch_NonNilEmptyStringClearsField(t *testing.T) {
+	// PatchEvent's primary motivation: a non-nil pointer to "" must reach
+	// the wire as "summary":"" so Calendar API clears the existing value.
+	// A bare *gws.Event with Summary="" would silently drop the key via
+	// omitempty; the patch type's pointer encoding fixes that.
+	scenario := testhelpers.Scenario{
+		Calls: []testhelpers.ScenarioCall{
+			{Stdout: `{"id":"e1"}`, Exit: 0},
+		},
+	}
+
+	calls := testhelpers.WithFakeGWS(t, scenario, func() {
+		_, _ = gws.New().EventsPatch(context.Background(), "cal", "e1",
+			&gws.PatchEvent{Summary: gws.PatchStrClear()})
+	})
+
+	gotBody, ok := calls[0].Body.(map[string]any)
+	if !ok {
+		t.Fatalf("body did not parse as object: %#v", calls[0].Body)
+	}
+	raw, present := gotBody["summary"]
+	if !present {
+		t.Fatalf("clear-summary patch missing summary key; want present with empty string. body=%#v", gotBody)
+	}
+	got, ok := raw.(string)
+	if !ok {
+		t.Fatalf("summary wrong type: %#v", raw)
+	}
+	if got != "" {
+		t.Errorf("summary = %q, want empty string", got)
+	}
+}
+
+func TestEventsPatch_ClearRecurrenceProducesEmptyArray(t *testing.T) {
+	// PatchRecurrenceClear must produce "recurrence":[] - the explicit
+	// clear-form Calendar API requires to remove a recurrence rule from
+	// an event. nil-Recurrence (the omitempty drop) would leave the
+	// existing rule in place.
+	scenario := testhelpers.Scenario{
+		Calls: []testhelpers.ScenarioCall{
+			{Stdout: `{"id":"e1"}`, Exit: 0},
+		},
+	}
+
+	calls := testhelpers.WithFakeGWS(t, scenario, func() {
+		_, _ = gws.New().EventsPatch(context.Background(), "cal", "e1",
+			&gws.PatchEvent{Recurrence: gws.PatchRecurrenceClear()})
+	})
+
+	gotBody, ok := calls[0].Body.(map[string]any)
+	if !ok {
+		t.Fatalf("body did not parse as object: %#v", calls[0].Body)
+	}
+	raw, present := gotBody["recurrence"]
+	if !present {
+		t.Fatalf("clear-recurrence patch missing recurrence key. body=%#v", gotBody)
+	}
+	arr, ok := raw.([]any)
+	if !ok {
+		t.Fatalf("recurrence wrong type: %#v", raw)
+	}
+	if len(arr) != 0 {
+		t.Errorf("recurrence = %v, want empty array", arr)
 	}
 }
 
@@ -224,7 +287,8 @@ func TestEventsPatch_MalformedStdoutReturnsError(t *testing.T) {
 	}
 	var gotErr error
 	testhelpers.WithFakeGWS(t, scenario, func() {
-		_, gotErr = gws.New().EventsPatch(context.Background(), "x", "e1", &gws.Event{Summary: "x"})
+		_, gotErr = gws.New().EventsPatch(context.Background(), "x", "e1",
+			&gws.PatchEvent{Summary: gws.PatchStr("x")})
 	})
 	if gotErr == nil {
 		t.Fatal("expected parse error on malformed stdout, got nil")
@@ -238,7 +302,7 @@ func TestEventsPatch_HappyPath(t *testing.T) {
 		},
 	}
 
-	patch := &gws.Event{Summary: "Lunch (updated)"}
+	patch := &gws.PatchEvent{Summary: gws.PatchStr("Lunch (updated)")}
 
 	var (
 		got    *gws.Event
@@ -271,8 +335,8 @@ func TestEventsPatch_HappyPath(t *testing.T) {
 
 	gotBody := calls[0].Body.(map[string]any)
 	want := map[string]any{"summary": "Lunch (updated)"}
-	// Patch sends only the fields the caller set. The Event type's
-	// omitempty rules drop everything else.
+	// Patch sends only the fields the caller set; omitempty drops nil
+	// pointer fields.
 	if !reflect.DeepEqual(gotBody, want) {
 		t.Errorf("--json body = %#v, want %#v (only the changed fields)", gotBody, want)
 	}

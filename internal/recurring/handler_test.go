@@ -13,12 +13,15 @@ import (
 // recordedCall captures one method invocation on the stub. Fields are unioned
 // across all three operations so a single []recordedCall preserves call order
 // across method boundaries; tests assert on (Op, ...) tuples per call.
+//
+// PatchBody is *gws.PatchEvent so tests can inspect pointer-field
+// clear-intent (a non-nil pointer to "" is meaningfully different from nil).
 type recordedCall struct {
 	Op            string // "EventsGet", "EventsInstances", "EventsPatch"
 	CalendarID    string
 	EventID       string
 	OriginalStart string
-	Body          *gws.Event
+	PatchBody     *gws.PatchEvent
 }
 
 // stubAPI is a hand-rolled in-process API stub. CLAUDE.md "Testing" prefers
@@ -87,12 +90,12 @@ func (s *stubAPI) EventsInstances(_ context.Context, params gws.EventsInstancesP
 	return head, nil
 }
 
-func (s *stubAPI) EventsPatch(_ context.Context, calendarID, eventID string, body *gws.Event) (*gws.Event, error) {
+func (s *stubAPI) EventsPatch(_ context.Context, calendarID, eventID string, body *gws.PatchEvent) (*gws.Event, error) {
 	s.calls = append(s.calls, recordedCall{
 		Op:         "EventsPatch",
 		CalendarID: calendarID,
 		EventID:    eventID,
-		Body:       body,
+		PatchBody:  body,
 	})
 	if len(s.patchErrors) > 0 {
 		head := s.patchErrors[0]
@@ -879,8 +882,9 @@ func TestHandle_Step3_CancellationFamily(t *testing.T) {
 				if patches[0].CalendarID != "tgt-cal" || patches[0].EventID != "mi-1" {
 					t.Errorf("patch on %s/%s, want tgt-cal/mi-1", patches[0].CalendarID, patches[0].EventID)
 				}
-				if patches[0].Body == nil || patches[0].Body.Status != gws.EventStatusCancelled {
-					t.Errorf("cancel patch body must set status=cancelled; got %+v", patches[0].Body)
+				if patches[0].PatchBody == nil || patches[0].PatchBody.Status == nil ||
+					*patches[0].PatchBody.Status != gws.EventStatusCancelled {
+					t.Errorf("cancel patch body must set status=cancelled; got %+v", patches[0].PatchBody)
 				}
 				if got.PostWriteMirrorInstance == nil {
 					t.Errorf("PostWriteMirrorInstance should be set on cancel path")
@@ -1025,11 +1029,11 @@ func TestHandle_Step3_ConfirmedSourceCancelledMirror_Revives(t *testing.T) {
 	if len(patches) != 2 {
 		t.Fatalf("expected 2 EventsPatch calls (main + checksum); got %d", len(patches))
 	}
-	mainBody := patches[0].Body
-	if mainBody == nil || mainBody.Status != gws.EventStatusConfirmed {
+	mainBody := patches[0].PatchBody
+	if mainBody == nil || mainBody.Status == nil || *mainBody.Status != gws.EventStatusConfirmed {
 		t.Errorf("main patch body must include status=confirmed; got %+v", mainBody)
 	}
-	if mainBody == nil || mainBody.Summary == "" {
+	if mainBody == nil || mainBody.Summary == nil || *mainBody.Summary == "" {
 		t.Errorf("main patch body must carry full managed-field payload; got %+v", mainBody)
 	}
 	if got.PostWriteMirrorInstance == nil {
@@ -1121,12 +1125,11 @@ func TestHandle_Step3_SourceChangedOnly_PatchesMirror(t *testing.T) {
 		if p.CalendarID != "tgt-cal" || p.EventID != "mi-1" {
 			t.Errorf("patch[%d] on %s/%s, want tgt-cal/mi-1", i, p.CalendarID, p.EventID)
 		}
-		if p.Body != nil && p.Body.ID != "" {
-			t.Errorf("patch[%d] body.ID should be empty (events.patch carries the id in the URL); got %q", i, p.Body.ID)
-		}
+		// PatchEvent has no ID field; events.patch carries the event ID in
+		// the URL, so there's nothing to check here.
 	}
 	// Second patch body must contain the checksum extended property only.
-	checksumBody := patches[1].Body
+	checksumBody := patches[1].PatchBody
 	if checksumBody == nil || checksumBody.ExtendedProperties == nil {
 		t.Fatalf("checksum patch body missing ExtendedProperties; got %+v", checksumBody)
 	}
@@ -1205,22 +1208,22 @@ func TestHandle_Step3_MirrorDriftedOnly_Propagate(t *testing.T) {
 	// The propagate patch carries only drifted fields. Description must be
 	// the mirror description with the trailer stripped (the source's true content),
 	// not the trailered mirror description.
-	if patches[0].Body == nil {
+	if patches[0].PatchBody == nil {
 		t.Fatalf("propagate patch body is nil")
 	}
-	if patches[0].Body.Summary != "User edit" {
-		t.Errorf("propagate patch body Summary = %q, want 'User edit'", patches[0].Body.Summary)
+	if patches[0].PatchBody.Summary == nil || *patches[0].PatchBody.Summary != "User edit" {
+		t.Errorf("propagate patch body Summary = %v, want 'User edit'", patches[0].PatchBody.Summary)
 	}
-	if patches[0].Body.Description != "User edit" {
-		t.Errorf("propagate patch body Description = %q, want 'User edit' (trailer stripped)", patches[0].Body.Description)
+	if patches[0].PatchBody.Description == nil || *patches[0].PatchBody.Description != "User edit" {
+		t.Errorf("propagate patch body Description = %v, want 'User edit' (trailer stripped)", patches[0].PatchBody.Description)
 	}
 	// start/end didn't drift in this test, so the propagate body must NOT
 	// carry them (SPEC's "Field-level propagate": only drifted fields).
-	if patches[0].Body.Start != nil {
-		t.Errorf("propagate patch body Start should be nil; got %+v", patches[0].Body.Start)
+	if patches[0].PatchBody.Start != nil {
+		t.Errorf("propagate patch body Start should be nil; got %+v", patches[0].PatchBody.Start)
 	}
-	if patches[0].Body.End != nil {
-		t.Errorf("propagate patch body End should be nil; got %+v", patches[0].Body.End)
+	if patches[0].PatchBody.End != nil {
+		t.Errorf("propagate patch body End should be nil; got %+v", patches[0].PatchBody.End)
 	}
 }
 
@@ -1470,8 +1473,8 @@ func TestHandle_V1Mirror_NoActualDrift_PatchesAsMigrationUpgrade(t *testing.T) {
 		}
 		// Migration upgrade only writes the mirror; the source must not be
 		// touched, and no cancellation patch must be sent.
-		if p.Body != nil && p.Body.Status == gws.EventStatusCancelled {
-			t.Errorf("patches[%d] body must not set status=cancelled; got %+v", i, p.Body)
+		if p.PatchBody != nil && p.PatchBody.Status != nil && *p.PatchBody.Status == gws.EventStatusCancelled {
+			t.Errorf("patches[%d] body must not set status=cancelled; got %+v", i, p.PatchBody)
 		}
 	}
 	// Stronger source-untouched assertion: scan the recorded calls for any
@@ -1483,17 +1486,17 @@ func TestHandle_V1Mirror_NoActualDrift_PatchesAsMigrationUpgrade(t *testing.T) {
 	}
 	// The main patch body must carry version=2 in extended properties (the
 	// schema bump is the whole point of the upgrade).
-	if patches[0].Body == nil || patches[0].Body.ExtendedProperties == nil {
-		t.Fatalf("main patch body missing ExtendedProperties; got %+v", patches[0].Body)
+	if patches[0].PatchBody == nil || patches[0].PatchBody.ExtendedProperties == nil {
+		t.Fatalf("main patch body missing ExtendedProperties; got %+v", patches[0].PatchBody)
 	}
-	if v := patches[0].Body.ExtendedProperties.Private[mirror.ExtKeyVersion]; v != mirror.SchemaVersion {
+	if v := patches[0].PatchBody.ExtendedProperties.Private[mirror.ExtKeyVersion]; v != mirror.SchemaVersion {
 		t.Errorf("main patch body version = %q, want %q", v, mirror.SchemaVersion)
 	}
 	// Checksum followup carries the new :checksum.
-	if patches[1].Body == nil || patches[1].Body.ExtendedProperties == nil {
-		t.Fatalf("checksum patch body missing ExtendedProperties; got %+v", patches[1].Body)
+	if patches[1].PatchBody == nil || patches[1].PatchBody.ExtendedProperties == nil {
+		t.Fatalf("checksum patch body missing ExtendedProperties; got %+v", patches[1].PatchBody)
 	}
-	if cs := patches[1].Body.ExtendedProperties.Private[mirror.ExtKeyChecksum]; cs == "" {
+	if cs := patches[1].PatchBody.ExtendedProperties.Private[mirror.ExtKeyChecksum]; cs == "" {
 		t.Errorf("checksum patch body missing %s", mirror.ExtKeyChecksum)
 	}
 }
@@ -1685,12 +1688,12 @@ func TestHandle_V2Mirror_NeedsMigration_PatchesAsMigrationUpgrade(t *testing.T) 
 	if len(patches) != 2 {
 		t.Fatalf("expected 2 EventsPatch (main + checksum followup); got %d", len(patches))
 	}
-	if patches[0].Body == nil || patches[0].Body.ExtendedProperties == nil {
-		t.Fatalf("main patch body missing ExtendedProperties; got %+v", patches[0].Body)
+	if patches[0].PatchBody == nil || patches[0].PatchBody.ExtendedProperties == nil {
+		t.Fatalf("main patch body missing ExtendedProperties; got %+v", patches[0].PatchBody)
 	}
 	// The main patch body must carry the new SchemaVersion ("3") in
 	// extended properties - that's what the upgrade is for.
-	if v := patches[0].Body.ExtendedProperties.Private[mirror.ExtKeyVersion]; v != mirror.SchemaVersion {
+	if v := patches[0].PatchBody.ExtendedProperties.Private[mirror.ExtKeyVersion]; v != mirror.SchemaVersion {
 		t.Errorf("main patch body version = %q, want %q", v, mirror.SchemaVersion)
 	}
 	// Migration upgrade must NOT patch the source.
@@ -1781,10 +1784,10 @@ func TestHandle_V2MirrorInstanceEmptyTransparencyDoesNotPropagate(t *testing.T) 
 	if len(patches) != 2 {
 		t.Fatalf("expected 2 EventsPatch (main + checksum followup); got %d", len(patches))
 	}
-	if patches[0].Body == nil || patches[0].Body.ExtendedProperties == nil {
-		t.Fatalf("main patch body missing ExtendedProperties; got %+v", patches[0].Body)
+	if patches[0].PatchBody == nil || patches[0].PatchBody.ExtendedProperties == nil {
+		t.Fatalf("main patch body missing ExtendedProperties; got %+v", patches[0].PatchBody)
 	}
-	if v := patches[0].Body.ExtendedProperties.Private[mirror.ExtKeyVersion]; v != mirror.SchemaVersion {
+	if v := patches[0].PatchBody.ExtendedProperties.Private[mirror.ExtKeyVersion]; v != mirror.SchemaVersion {
 		t.Errorf("main patch body version = %q, want %q", v, mirror.SchemaVersion)
 	}
 }
@@ -1879,15 +1882,15 @@ func TestHandle_V2MirrorInstanceLocationDriftRoutesToMigrationSourceWon(t *testi
 	}
 	// Main patch body must carry the new SchemaVersion ("3") and source's
 	// location.
-	body := patches[0].Body
+	body := patches[0].PatchBody
 	if body == nil || body.ExtendedProperties == nil {
 		t.Fatal("main patch body missing ExtendedProperties")
 	}
 	if v := body.ExtendedProperties.Private[mirror.ExtKeyVersion]; v != mirror.SchemaVersion {
 		t.Errorf("main patch body version = %q, want %q", v, mirror.SchemaVersion)
 	}
-	if body.Location != source.Location {
-		t.Errorf("main patch body Location = %q, want %q (source's location)", body.Location, source.Location)
+	if body.Location == nil || *body.Location != source.Location {
+		t.Errorf("main patch body Location = %v, want %q (source's location)", body.Location, source.Location)
 	}
 }
 
@@ -1965,7 +1968,7 @@ func TestHandle_InheritedInstance_NoActualDrift_PatchesAsInheritedUpgrade(t *tes
 	// Main patch body's calendar-sync:source must be the per-INSTANCE tuple
 	// (not the parent's). After this write, IsInheritedRecurringInstance
 	// would return false and future runs use the standard drift matrix.
-	body := patches[0].Body
+	body := patches[0].PatchBody
 	if body == nil || body.ExtendedProperties == nil {
 		t.Fatal("main patch body missing ExtendedProperties")
 	}
@@ -2048,7 +2051,7 @@ func TestHandle_InheritedInstance_DriftOnly_InheritedSourceWon(t *testing.T) {
 	}
 	// Main patch body must carry source's reschedule (13:00, not the
 	// auto-materialized 12:00).
-	body := patches[0].Body
+	body := patches[0].PatchBody
 	if body == nil || body.Start == nil {
 		t.Fatal("main patch body missing Start")
 	}

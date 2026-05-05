@@ -12,13 +12,19 @@ import (
 // recordedCall captures one method invocation on stubAPI. Fields are unioned
 // across all six operations so a single []recordedCall preserves call order
 // across method boundaries; tests assert on (Op, ...) tuples per call.
+//
+// Body is *gws.Event for inserts (the production-side EventsInsert wire
+// shape); PatchBody is *gws.PatchEvent for EventsPatch so tests can inspect
+// pointer-field clear-intent (a non-nil pointer to "" is meaningfully
+// different from nil).
 type recordedCall struct {
-	Op            string // "EventsList", "EventsGet", "EventsInstances", "EventsInsert", "EventsPatch", "EventsDelete"
-	CalendarID    string
-	EventID       string
-	ListParams    gws.EventsListParams
+	Op             string // "EventsList", "EventsGet", "EventsInstances", "EventsInsert", "EventsPatch", "EventsDelete"
+	CalendarID     string
+	EventID        string
+	ListParams     gws.EventsListParams
 	InstanceParams gws.EventsInstancesParams
-	Body          *gws.Event
+	Body           *gws.Event      // EventsInsert
+	PatchBody      *gws.PatchEvent // EventsPatch
 }
 
 // stubAPI is a hand-rolled in-process API implementation used by the layer-6
@@ -191,14 +197,14 @@ func (s *stubAPI) EventsInsert(_ context.Context, calendarID string, body *gws.E
 	return head, nil
 }
 
-func (s *stubAPI) EventsPatch(_ context.Context, calendarID, eventID string, body *gws.Event) (*gws.Event, error) {
+func (s *stubAPI) EventsPatch(_ context.Context, calendarID, eventID string, body *gws.PatchEvent) (*gws.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, recordedCall{
 		Op:         "EventsPatch",
 		CalendarID: calendarID,
 		EventID:    eventID,
-		Body:       body,
+		PatchBody:  body,
 	})
 	if len(s.patchErrors) > 0 {
 		head := s.patchErrors[0]

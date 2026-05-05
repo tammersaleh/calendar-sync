@@ -120,12 +120,10 @@ func TestClassify_Step8_Insert_409_CancelledExisting_Revives(t *testing.T) {
 	if len(patches) != 2 {
 		t.Fatalf("expected 2 patches (main revive + checksum); got %d", len(patches))
 	}
-	// Main revive body must set status=confirmed and clear ID.
-	if patches[0].Body == nil || patches[0].Body.Status != gws.EventStatusConfirmed {
-		t.Errorf("revive patch body must set status=confirmed; got %+v", patches[0].Body)
-	}
-	if patches[0].Body.ID != "" {
-		t.Errorf("revive patch body ID must be empty (events.patch carries id in URL); got %q", patches[0].Body.ID)
+	// Main revive body must set status=confirmed.
+	if patches[0].PatchBody == nil || patches[0].PatchBody.Status == nil ||
+		*patches[0].PatchBody.Status != gws.EventStatusConfirmed {
+		t.Errorf("revive patch body must set status=confirmed; got %+v", patches[0].PatchBody)
 	}
 	// Inventory updated.
 	tuple := mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt"}

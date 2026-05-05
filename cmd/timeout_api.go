@@ -72,7 +72,7 @@ func (c *callTimeoutAPI) EventsInsert(ctx context.Context, calendarID string, bo
 	return c.inner.EventsInsert(cctx, calendarID, body)
 }
 
-func (c *callTimeoutAPI) EventsPatch(ctx context.Context, calendarID, eventID string, body *gws.Event) (*gws.Event, error) {
+func (c *callTimeoutAPI) EventsPatch(ctx context.Context, calendarID, eventID string, body *gws.PatchEvent) (*gws.Event, error) {
 	cctx, cancel := c.withTimeout(ctx)
 	defer cancel()
 	return c.inner.EventsPatch(cctx, calendarID, eventID, body)

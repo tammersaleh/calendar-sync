@@ -84,10 +84,12 @@ func (c *Classifier) completeInsert(ctx context.Context, source, inserted *gws.E
 // calendar is the same as a fresh insert); reason stays source_updated.
 func (c *Classifier) reviveCancelledMirror(ctx context.Context, source, existing *gws.Event) error {
 	payload := mirror.BuildPayloadWithTimeZone(c.SourceCalendarID, source, c.TimeZone)
-	payload.ID = ""
-	payload.Status = gws.EventStatusConfirmed
+	patch := mirror.BuildPatchPayload(payload)
+	// Revive paths set status explicitly. BuildPatchPayload deliberately
+	// leaves Status nil; populate it here.
+	patch.Status = gws.PatchStr(gws.EventStatusConfirmed)
 
-	post, err := c.patchMirrorWithChecksum(ctx, c.TargetCalendarID, existing.ID, payload)
+	post, err := c.patchMirrorWithChecksum(ctx, c.TargetCalendarID, existing.ID, patch)
 	if err != nil {
 		return err
 	}

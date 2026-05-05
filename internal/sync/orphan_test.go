@@ -678,7 +678,7 @@ func (c *concurrentGetAPI) EventsInsert(_ context.Context, _ string, _ *gws.Even
 	return nil, nil
 }
 
-func (c *concurrentGetAPI) EventsPatch(_ context.Context, _ string, _ string, _ *gws.Event) (*gws.Event, error) {
+func (c *concurrentGetAPI) EventsPatch(_ context.Context, _ string, _ string, _ *gws.PatchEvent) (*gws.Event, error) {
 	return nil, nil
 }
 

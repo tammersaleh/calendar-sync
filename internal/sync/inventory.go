@@ -18,7 +18,7 @@ type API interface {
 	EventsGet(ctx context.Context, calendarID, eventID string) (*gws.Event, error)
 	EventsInstances(ctx context.Context, params gws.EventsInstancesParams) ([]gws.Event, error)
 	EventsInsert(ctx context.Context, calendarID string, body *gws.Event) (*gws.Event, error)
-	EventsPatch(ctx context.Context, calendarID, eventID string, body *gws.Event) (*gws.Event, error)
+	EventsPatch(ctx context.Context, calendarID, eventID string, body *gws.PatchEvent) (*gws.Event, error)
 	EventsDelete(ctx context.Context, calendarID, eventID string) error
 }
 

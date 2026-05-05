@@ -1029,15 +1029,15 @@ func TestClassify_Step8_InventoryMiss_Insert(t *testing.T) {
 	if len(patches) != 1 {
 		t.Fatalf("expected 1 patch (checksum followup); got %d", len(patches))
 	}
-	body := patches[0].Body
+	body := patches[0].PatchBody
 	if body == nil || body.ExtendedProperties == nil {
 		t.Fatal("checksum patch body missing")
 	}
 	if body.ExtendedProperties.Private[mirror.ExtKeyChecksum] == "" {
 		t.Errorf("checksum patch body missing %s", mirror.ExtKeyChecksum)
 	}
-	if body.Summary != "" {
-		t.Errorf("checksum patch must not carry managed fields; Summary=%q", body.Summary)
+	if body.Summary != nil {
+		t.Errorf("checksum patch must not carry managed fields; Summary=%v", body.Summary)
 	}
 }
 
@@ -1164,11 +1164,13 @@ func TestClassify_Step8_CancelledMirrorWithSyncableSource_Revives(t *testing.T) 
 	if len(patches) != 2 {
 		t.Fatalf("expected 2 EventsPatch (main + checksum); got %d", len(patches))
 	}
-	if patches[0].Body == nil || patches[0].Body.Status != gws.EventStatusConfirmed {
-		t.Errorf("main patch must include status=confirmed; got %+v", patches[0].Body)
+	if patches[0].PatchBody == nil || patches[0].PatchBody.Status == nil ||
+		*patches[0].PatchBody.Status != gws.EventStatusConfirmed {
+		t.Errorf("main patch must include status=confirmed; got %+v", patches[0].PatchBody)
 	}
-	if patches[0].Body == nil || patches[0].Body.Summary == "" {
-		t.Errorf("main patch must carry full managed-field payload; got %+v", patches[0].Body)
+	if patches[0].PatchBody == nil || patches[0].PatchBody.Summary == nil ||
+		*patches[0].PatchBody.Summary == "" {
+		t.Errorf("main patch must carry full managed-field payload; got %+v", patches[0].PatchBody)
 	}
 	// Inventory should hold the post-write (confirmed) mirror, not the cancelled stub.
 	updated, ok := inv.Lookup(tuple)
@@ -1575,7 +1577,7 @@ func TestClassify_Step8_V1Mirror_NoActualDrift_MigrationUpgrade(t *testing.T) {
 		}
 	}
 	// Main patch body carries version=2.
-	body := patches[0].Body
+	body := patches[0].PatchBody
 	if body == nil || body.ExtendedProperties == nil {
 		t.Fatal("main patch body missing ExtendedProperties")
 	}
@@ -1756,7 +1758,7 @@ func TestClassify_Step8_V2Mirror_NeedsMigration_PatchesAsMigrationUpgrade(t *tes
 	}
 	// Main patch body must carry the new SchemaVersion ("3") in the
 	// extended properties - that's the whole point of the upgrade.
-	body := patches[0].Body
+	body := patches[0].PatchBody
 	if body == nil || body.ExtendedProperties == nil {
 		t.Fatal("main patch body missing ExtendedProperties")
 	}
@@ -1846,7 +1848,7 @@ func TestClassify_Step8_V2Mirror_EmptyTransparencyDoesNotPropagate(t *testing.T)
 	if len(patches) != 2 {
 		t.Fatalf("expected 2 patches (main + checksum); got %d", len(patches))
 	}
-	body := patches[0].Body
+	body := patches[0].PatchBody
 	if body == nil || body.ExtendedProperties == nil {
 		t.Fatal("main patch body missing ExtendedProperties")
 	}
@@ -1938,15 +1940,15 @@ func TestClassify_Step8_V2Mirror_LocationDriftRoutesToMigrationSourceWon(t *test
 	}
 	// Main patch body must carry the new SchemaVersion ("3") and source's
 	// location - the mirror is rewritten with v3 schema + source's content.
-	body := patches[0].Body
+	body := patches[0].PatchBody
 	if body == nil || body.ExtendedProperties == nil {
 		t.Fatal("main patch body missing ExtendedProperties")
 	}
 	if v := body.ExtendedProperties.Private[mirror.ExtKeyVersion]; v != mirror.SchemaVersion {
 		t.Errorf("main patch body version = %q, want %q", v, mirror.SchemaVersion)
 	}
-	if body.Location != source.Location {
-		t.Errorf("main patch body Location = %q, want %q (source's location)", body.Location, source.Location)
+	if body.Location == nil || *body.Location != source.Location {
+		t.Errorf("main patch body Location = %v, want %q (source's location)", body.Location, source.Location)
 	}
 }
 
@@ -2018,12 +2020,12 @@ func TestClassify_Step8_V2Mirror_RealUserEditOnSummaryRoutesToMigrationSourceWon
 		t.Fatalf("expected 2 EventsPatch (mirror main + checksum); got %d", len(patches))
 	}
 	// Main patch body must overwrite the mirror's summary with source's.
-	body := patches[0].Body
+	body := patches[0].PatchBody
 	if body == nil {
 		t.Fatal("main patch body nil")
 	}
-	if body.Summary != source.Summary {
-		t.Errorf("main patch body Summary = %q, want %q (mirror's user edit must be overwritten)", body.Summary, source.Summary)
+	if body.Summary == nil || *body.Summary != source.Summary {
+		t.Errorf("main patch body Summary = %v, want %q (mirror's user edit must be overwritten)", body.Summary, source.Summary)
 	}
 }
 
@@ -2091,7 +2093,7 @@ func TestClassify_Step8_V2Mirror_SourceChangedNoMirrorDriftStillPatchesNormally(
 	}
 	// Main patch must carry v3 schema (the upgrade still runs even on the
 	// fall-through cell).
-	body := patches[0].Body
+	body := patches[0].PatchBody
 	if body == nil || body.ExtendedProperties == nil {
 		t.Fatal("main patch body missing ExtendedProperties")
 	}

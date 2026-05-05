@@ -35,13 +35,12 @@ func (c *Classifier) doPropagate(
 
 	// Rebuild the mirror payload from the post-patch source so the mirror
 	// gets the new state (and the new calendar-sync:source_updated value
-	// pulled from patchedSource.Updated). BuildPayload always sets the
-	// deterministic ID; clear it because events.patch carries the id in
-	// the URL, not the body.
+	// pulled from patchedSource.Updated). Convert via BuildPatchPayload so
+	// every managed field is set explicitly (clear-intent on whatever the
+	// post-patch source has cleared).
 	rewritten := mirror.BuildPayload(c.SourceCalendarID, patchedSource)
-	rewritten.ID = ""
 
-	post, err := c.patchMirrorWithChecksum(ctx, c.TargetCalendarID, mirrorEvent.ID, rewritten)
+	post, err := c.patchMirrorWithChecksum(ctx, c.TargetCalendarID, mirrorEvent.ID, mirror.BuildPatchPayload(rewritten))
 	if err != nil {
 		return err
 	}
@@ -76,8 +75,7 @@ func (c *Classifier) doRevert(
 	outcome mirror.Outcome,
 ) error {
 	fields := mirror.DriftedFieldNames(mirrorEvent, desired)
-	desired.ID = ""
-	post, err := c.patchMirrorWithChecksum(ctx, c.TargetCalendarID, mirrorEvent.ID, desired)
+	post, err := c.patchMirrorWithChecksum(ctx, c.TargetCalendarID, mirrorEvent.ID, mirror.BuildPatchPayload(desired))
 	if err != nil {
 		return err
 	}

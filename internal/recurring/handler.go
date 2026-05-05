@@ -26,7 +26,7 @@ import (
 type API interface {
 	EventsGet(ctx context.Context, calendarID, eventID string) (*gws.Event, error)
 	EventsInstances(ctx context.Context, params gws.EventsInstancesParams) ([]gws.Event, error)
-	EventsPatch(ctx context.Context, calendarID, eventID string, body *gws.Event) (*gws.Event, error)
+	EventsPatch(ctx context.Context, calendarID, eventID string, body *gws.PatchEvent) (*gws.Event, error)
 }
 
 // MirrorParentLookup returns the mirror-parent Event for a source-tuple from
@@ -378,13 +378,13 @@ func (h *Handler) locateMirrorInstance(ctx context.Context, source, mirrorParent
 }
 
 // forceRewriteMirrorParent rebuilds the mirror parent payload from the
-// source and patches it. The id field on the body is cleared because
-// events.patch carries the event ID in the request URL, not the body.
-// Returns the post-checksum mirror-parent resource.
+// source and patches it. Returns the post-checksum mirror-parent resource.
+// The patch is built via mirror.BuildPatchPayload so cleared source fields
+// (e.g. user removed the source's recurrence) reach the mirror as explicit
+// clears rather than being dropped by omitempty.
 func (h *Handler) forceRewriteMirrorParent(ctx context.Context, sourceParent *gws.Event, mirrorParentID string) (*gws.Event, error) {
 	payload := mirror.BuildPayloadWithTimeZone(h.SourceCalendarID, sourceParent, h.TimeZone)
-	payload.ID = ""
-	return h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorParentID, payload)
+	return h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorParentID, mirror.BuildPatchPayload(payload))
 }
 
 // reconcileInstance runs SPEC.md §"Step 3". Applies the
@@ -416,7 +416,7 @@ func (h *Handler) cancelMirrorInstance(ctx context.Context, mirrorInstance *gws.
 	if mirrorInstance.Status == gws.EventStatusCancelled {
 		return Result{Action: mirror.ActionSkip, Reason: mirror.ReasonUnchanged}, nil
 	}
-	body := &gws.Event{Status: gws.EventStatusCancelled}
+	body := &gws.PatchEvent{Status: gws.PatchStr(gws.EventStatusCancelled)}
 	post, err := h.API.EventsPatch(ctx, h.TargetCalendarID, mirrorInstance.ID, body)
 	if err != nil {
 		return Result{}, err
@@ -517,8 +517,7 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 			// per-instance metadata (calendar-sync:source matches the
 			// instance ID, fresh checksum). Future drift detection compares
 			// instance-vs-instance instead of inheriting the parent's value.
-			desired.ID = ""
-			post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, desired)
+			post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, mirror.BuildPatchPayload(desired))
 			if err != nil {
 				return Result{}, err
 			}
@@ -535,8 +534,7 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 			// override that the parent's RRULE projection didn't carry.
 			// Either way the source is authoritative and we must not
 			// propagate the mirror's value back.
-			desired.ID = ""
-			post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, desired)
+			post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, mirror.BuildPatchPayload(desired))
 			if err != nil {
 				return Result{}, err
 			}
@@ -558,8 +556,7 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 		return Result{Action: mirror.ActionSkip, Reason: outcome.Reason, Conflict: outcome.Conflict}, nil
 
 	case mirror.ActionPatch:
-		desired.ID = ""
-		post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, desired)
+		post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, mirror.BuildPatchPayload(desired))
 		if err != nil {
 			return Result{}, err
 		}
@@ -579,8 +576,7 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 		}
 		// Re-write the mirror instance using the source's NEW state.
 		desiredFromPatched := mirror.BuildInstancePayloadWithTimeZone(h.SourceCalendarID, patchedSource, h.TimeZone)
-		desiredFromPatched.ID = ""
-		post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, desiredFromPatched)
+		post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, mirror.BuildPatchPayload(desiredFromPatched))
 		if err != nil {
 			return Result{}, err
 		}
@@ -594,8 +590,7 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 
 	case mirror.ActionRevert:
 		fields := mirror.DriftedFieldNames(mirrorInstance, desired)
-		desired.ID = ""
-		post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, desired)
+		post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, mirror.BuildPatchPayload(desired))
 		if err != nil {
 			return Result{}, err
 		}
@@ -621,9 +616,11 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 // from the user's POV the mirror reappears.
 func (h *Handler) reviveCancelledMirrorInstance(ctx context.Context, source, mirrorInstance *gws.Event) (Result, error) {
 	desired := mirror.BuildInstancePayloadWithTimeZone(h.SourceCalendarID, source, h.TimeZone)
-	desired.ID = ""
-	desired.Status = gws.EventStatusConfirmed
-	post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, desired)
+	patch := mirror.BuildPatchPayload(desired)
+	// Revive paths set status explicitly. BuildPatchPayload deliberately
+	// leaves Status nil; populate it here.
+	patch.Status = gws.PatchStr(gws.EventStatusConfirmed)
+	post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, patch)
 	if err != nil {
 		return Result{}, err
 	}
@@ -639,16 +636,19 @@ func (h *Handler) reviveCancelledMirrorInstance(ctx context.Context, source, mir
 // that stores calendar-sync:checksum computed from the post-write resource.
 // Returns the post-checksum response.
 //
+// Body is *gws.PatchEvent so callers can express clear-intent on managed
+// fields (e.g. propagate a cleared description back to source).
+//
 // Both patches target the same (calendarID, eventID); only the body
 // differs. The follow-up body carries only the checksum extended property,
 // not any managed field.
-func (h *Handler) patchMirrorWithChecksum(ctx context.Context, calendarID, eventID string, body *gws.Event) (*gws.Event, error) {
+func (h *Handler) patchMirrorWithChecksum(ctx context.Context, calendarID, eventID string, body *gws.PatchEvent) (*gws.Event, error) {
 	post, err := h.API.EventsPatch(ctx, calendarID, eventID, body)
 	if err != nil {
 		return nil, err
 	}
 	checksum := mirror.Checksum(mirror.ManagedFieldsFromEvent(post))
-	follow := &gws.Event{
+	follow := &gws.PatchEvent{
 		ExtendedProperties: &gws.ExtendedProperties{
 			Private: map[string]string{mirror.ExtKeyChecksum: checksum},
 		},

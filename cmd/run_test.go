@@ -435,7 +435,7 @@ func TestDryRunAPI_PatchMergesIntoCachedInsertResource(t *testing.T) {
 
 	// Follow-up checksum patch: body carries ONLY {checksum}, the
 	// production shape (internal/sync/helpers.go:followUpChecksum).
-	patchBody := &gws.Event{
+	patchBody := &gws.PatchEvent{
 		ExtendedProperties: &gws.ExtendedProperties{
 			Private: map[string]string{
 				"calendar-sync:checksum": "deadbeef",
@@ -488,7 +488,7 @@ func TestDryRunAPI_PatchOverwritesExistingPrivateKey(t *testing.T) {
 	if _, err := api.EventsInsert(ctx, "cal", insertBody); err != nil {
 		t.Fatalf("EventsInsert: %v", err)
 	}
-	patchBody := &gws.Event{
+	patchBody := &gws.PatchEvent{
 		ExtendedProperties: &gws.ExtendedProperties{
 			Private: map[string]string{"k": "new"},
 		},
@@ -511,8 +511,8 @@ func TestDryRunAPI_PatchOverwritesExistingPrivateKey(t *testing.T) {
 // prior contract for callers that don't go through Insert.
 func TestDryRunAPI_PatchWithoutPriorInsertReturnsBody(t *testing.T) {
 	api := newDryRunAPI(&stubGws{})
-	body := &gws.Event{
-		Summary: "patched",
+	body := &gws.PatchEvent{
+		Summary: gws.PatchStr("patched"),
 		ExtendedProperties: &gws.ExtendedProperties{
 			Private: map[string]string{"k": "v"},
 		},
@@ -561,7 +561,7 @@ func TestDryRunAPI_DeleteClearsCache(t *testing.T) {
 	// After Delete, a Patch with no body of its own should hit the
 	// no-prior-insert fallback (body-echo). The Insert's Summary=v1
 	// must NOT bleed through.
-	patchBody := &gws.Event{Summary: "v2"}
+	patchBody := &gws.PatchEvent{Summary: gws.PatchStr("v2")}
 	got, err := api.EventsPatch(ctx, "cal", "evt", patchBody)
 	if err != nil {
 		t.Fatalf("EventsPatch: %v", err)
@@ -595,7 +595,7 @@ func (c *countingGws) EventsInsert(ctx context.Context, cal string, body *gws.Ev
 	return c.stubGws.EventsInsert(ctx, cal, body)
 }
 
-func (c *countingGws) EventsPatch(ctx context.Context, cal, id string, body *gws.Event) (*gws.Event, error) {
+func (c *countingGws) EventsPatch(ctx context.Context, cal, id string, body *gws.PatchEvent) (*gws.Event, error) {
 	if c.patchCount != nil {
 		*c.patchCount++
 	}
@@ -620,7 +620,7 @@ func TestDryRunAPI_EventsPatchSuppressesWrite(t *testing.T) {
 	patches := 0
 	inner := &countingGws{stubGws: stubGws{}, patchCount: &patches}
 	api := newDryRunAPI(inner)
-	body := &gws.Event{Summary: "patched"}
+	body := &gws.PatchEvent{Summary: gws.PatchStr("patched")}
 	got, err := api.EventsPatch(context.Background(), "cal", "evt-1", body)
 	if err != nil {
 		t.Fatalf("EventsPatch: %v", err)
@@ -873,7 +873,7 @@ func (p *panicWriteGws) EventsInsert(_ context.Context, calendarID string, body 
 	panic(fmt.Sprintf("panicWriteGws.EventsInsert called - dry-run wrapper failed to suppress write to %s/%s", calendarID, body.ID))
 }
 
-func (p *panicWriteGws) EventsPatch(_ context.Context, calendarID, eventID string, _ *gws.Event) (*gws.Event, error) {
+func (p *panicWriteGws) EventsPatch(_ context.Context, calendarID, eventID string, _ *gws.PatchEvent) (*gws.Event, error) {
 	panic(fmt.Sprintf("panicWriteGws.EventsPatch called - dry-run wrapper failed to suppress patch to %s/%s", calendarID, eventID))
 }
 

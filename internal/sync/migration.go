@@ -114,8 +114,7 @@ func (c *Classifier) doMigrationUpgrade(
 	source, mirrorEvent *gws.Event,
 	desired *gws.Event,
 ) error {
-	desired.ID = ""
-	post, err := c.patchMirrorWithChecksum(ctx, c.TargetCalendarID, mirrorEvent.ID, desired)
+	post, err := c.patchMirrorWithChecksum(ctx, c.TargetCalendarID, mirrorEvent.ID, mirror.BuildPatchPayload(desired))
 	if err != nil {
 		return err
 	}
@@ -144,8 +143,7 @@ func (c *Classifier) doMigrationSourceWon(
 	source, mirrorEvent *gws.Event,
 	desired *gws.Event,
 ) error {
-	desired.ID = ""
-	post, err := c.patchMirrorWithChecksum(ctx, c.TargetCalendarID, mirrorEvent.ID, desired)
+	post, err := c.patchMirrorWithChecksum(ctx, c.TargetCalendarID, mirrorEvent.ID, mirror.BuildPatchPayload(desired))
 	if err != nil {
 		return err
 	}

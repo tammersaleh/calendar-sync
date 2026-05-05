@@ -345,7 +345,7 @@ func (d *dryRunAPI) EventsInsert(_ context.Context, calendarID string, body *gws
 	return dryRunCloneEvent(out), nil
 }
 
-func (d *dryRunAPI) EventsPatch(_ context.Context, calendarID string, eventID string, body *gws.Event) (*gws.Event, error) {
+func (d *dryRunAPI) EventsPatch(_ context.Context, calendarID string, eventID string, body *gws.PatchEvent) (*gws.Event, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -362,18 +362,17 @@ func (d *dryRunAPI) EventsPatch(_ context.Context, calendarID string, eventID st
 	}
 
 	if cached == nil {
-		// No prior insert seen by the wrapper. Body-echo with ID
-		// populated. Tests that don't drive doInsert (e.g. patch-only
-		// stubs) rely on this contract.
-		out := dryRunCloneEvent(body)
-		if out.ID == "" {
-			out.ID = eventID
-		}
+		// No prior insert seen by the wrapper. Synthesize the patch into
+		// an Event so downstream cache reads see the same shape an
+		// EventsInsert would have produced. Tests that don't drive
+		// doInsert (e.g. patch-only stubs) rely on this contract.
+		out := dryRunPatchToEvent(body)
+		out.ID = eventID
 		d.cache[key] = out
 		return dryRunCloneEvent(out), nil
 	}
 
-	merged := dryRunMergeEvent(cached, body)
+	merged := dryRunApplyPatch(cached, body)
 	d.cache[key] = merged
 	return dryRunCloneEvent(merged), nil
 }
@@ -440,50 +439,39 @@ func dryRunCloneEvent(e *gws.Event) *gws.Event {
 	return &out
 }
 
-// dryRunMergeEvent applies Calendar API JSON Merge Patch semantics:
-// non-zero top-level fields in patch REPLACE base; ExtendedProperties
-// (both Private and Shared) merge at the key level so a checksum-only
-// follow-up patch doesn't drop the version + source the Insert wrote.
+// dryRunApplyPatch applies a *gws.PatchEvent to a base *gws.Event with
+// Calendar API JSON Merge Patch semantics: any pointer field set on the
+// patch (non-nil) REPLACES the base value, including the case where the
+// patch points at an empty string ("clear this field"). Pointer fields
+// that are nil leave the base value untouched.
 //
-// Pointer + slice fields in patch (Start, Recurrence, Attendees, ...)
-// replace as a whole when non-nil. Wholesale-replacement matches
-// Calendar API's wire behavior for these fields - a patch with a new
-// `start` replaces the prior start, it doesn't merge sub-fields.
+// ExtendedProperties merges at the key level (rather than replacing
+// wholesale) so a checksum-only follow-up patch doesn't drop the version
+// + source an Insert wrote. The merge mirrors Calendar API wire behavior:
+// keys present in the patch overwrite the base; keys absent from the patch
+// are preserved.
 //
-// Empty-string scalars in patch are NOT applied; calendar-sync's
-// patches never explicitly clear a field, and the wire test suite
-// already exercises the "drop empty in body" pattern via omitempty.
-func dryRunMergeEvent(base, patch *gws.Event) *gws.Event {
+// Recurrence: a non-nil patch.Recurrence pointing at an empty slice
+// CLEARS the field. A nil pointer leaves it alone.
+func dryRunApplyPatch(base *gws.Event, patch *gws.PatchEvent) *gws.Event {
 	out := dryRunCloneEvent(base)
-	if patch.ID != "" {
-		out.ID = patch.ID
+	if patch.Status != nil {
+		out.Status = *patch.Status
 	}
-	if patch.Status != "" {
-		out.Status = patch.Status
+	if patch.Summary != nil {
+		out.Summary = *patch.Summary
 	}
-	if patch.Summary != "" {
-		out.Summary = patch.Summary
+	if patch.Description != nil {
+		out.Description = *patch.Description
 	}
-	if patch.Description != "" {
-		out.Description = patch.Description
+	if patch.Location != nil {
+		out.Location = *patch.Location
 	}
-	if patch.Updated != "" {
-		out.Updated = patch.Updated
+	if patch.Transparency != nil {
+		out.Transparency = *patch.Transparency
 	}
-	if patch.Transparency != "" {
-		out.Transparency = patch.Transparency
-	}
-	if patch.Visibility != "" {
-		out.Visibility = patch.Visibility
-	}
-	if patch.HTMLLink != "" {
-		out.HTMLLink = patch.HTMLLink
-	}
-	if patch.RecurringEventID != "" {
-		out.RecurringEventID = patch.RecurringEventID
-	}
-	if patch.EventType != "" {
-		out.EventType = patch.EventType
+	if patch.Visibility != nil {
+		out.Visibility = *patch.Visibility
 	}
 	if patch.Start != nil {
 		s := *patch.Start
@@ -493,23 +481,14 @@ func dryRunMergeEvent(base, patch *gws.Event) *gws.Event {
 		s := *patch.End
 		out.End = &s
 	}
-	if patch.OriginalStartTime != nil {
-		s := *patch.OriginalStartTime
-		out.OriginalStartTime = &s
-	}
 	if patch.Reminders != nil {
 		r := *patch.Reminders
 		out.Reminders = &r
 	}
 	if patch.Recurrence != nil {
-		r := make([]string, len(patch.Recurrence))
-		copy(r, patch.Recurrence)
+		r := make([]string, len(*patch.Recurrence))
+		copy(r, *patch.Recurrence)
 		out.Recurrence = r
-	}
-	if patch.Attendees != nil {
-		a := make([]gws.Attendee, len(patch.Attendees))
-		copy(a, patch.Attendees)
-		out.Attendees = a
 	}
 	if patch.ExtendedProperties != nil {
 		if out.ExtendedProperties == nil {
@@ -533,4 +512,12 @@ func dryRunMergeEvent(base, patch *gws.Event) *gws.Event {
 		}
 	}
 	return out
+}
+
+// dryRunPatchToEvent synthesizes a fresh *gws.Event from a *gws.PatchEvent,
+// applied as if to a zero-value base. Used when EventsPatch is called
+// without a prior cached EventsInsert: the wrapper has nothing to merge
+// into, but the caller still expects a well-shaped Event back.
+func dryRunPatchToEvent(patch *gws.PatchEvent) *gws.Event {
+	return dryRunApplyPatch(&gws.Event{}, patch)
 }

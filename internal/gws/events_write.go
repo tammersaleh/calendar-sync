@@ -7,23 +7,28 @@ import (
 	"sort"
 )
 
-// patchBodyFields returns the names of the top-level Event fields that are
-// non-zero in body, sorted alphabetically. Used by the debug log to surface
-// what a patch is actually changing without dumping the full payload (which
-// would be noisy and might leak event content).
-func patchBodyFields(body *Event) []string {
+// patchBodyFields returns the names of the top-level PatchEvent fields that
+// are present in body (non-nil), sorted alphabetically. Used by the debug
+// log to surface what a patch is actually changing without dumping the full
+// payload (which would be noisy and might leak event content). Presence is
+// the right signal for the patch type: a non-nil pointer to "" represents
+// an explicit clear, which a value-based "non-empty" check would miss.
+func patchBodyFields(body *PatchEvent) []string {
 	if body == nil {
 		return nil
 	}
 	var fields []string
-	if body.Status != "" {
+	if body.Status != nil {
 		fields = append(fields, "status")
 	}
-	if body.Summary != "" {
+	if body.Summary != nil {
 		fields = append(fields, "summary")
 	}
-	if body.Description != "" {
+	if body.Description != nil {
 		fields = append(fields, "description")
+	}
+	if body.Location != nil {
+		fields = append(fields, "location")
 	}
 	if body.Start != nil {
 		fields = append(fields, "start")
@@ -31,13 +36,13 @@ func patchBodyFields(body *Event) []string {
 	if body.End != nil {
 		fields = append(fields, "end")
 	}
-	if body.Transparency != "" {
+	if body.Transparency != nil {
 		fields = append(fields, "transparency")
 	}
-	if body.Visibility != "" {
+	if body.Visibility != nil {
 		fields = append(fields, "visibility")
 	}
-	if len(body.Recurrence) > 0 {
+	if body.Recurrence != nil {
 		fields = append(fields, "recurrence")
 	}
 	if body.Reminders != nil {
@@ -100,13 +105,18 @@ func (c *Client) EventsInsert(ctx context.Context, calendarID string, body *Even
 }
 
 // EventsPatch sends a partial-update for the event identified by
-// (calendarID, eventID). Only fields present in body are written; unset
-// fields stay at their existing server-side values. Calendar API treats
-// this as a JSON Merge Patch.
+// (calendarID, eventID). Only fields PRESENT (non-nil) in body are written;
+// unset fields stay at their existing server-side values. Calendar API
+// treats this as a JSON Merge Patch.
+//
+// Body is *PatchEvent (not *Event) so callers can express clear-intent on
+// individual fields. A nil PatchEvent pointer is rejected; a non-nil
+// PatchEvent with all fields nil is a no-op patch (Google accepts it,
+// nothing changes server-side, the response is the unchanged resource).
 //
 // The returned *Event is the post-write resource and is again the input to
 // the next checksum per SPEC.md.
-func (c *Client) EventsPatch(ctx context.Context, calendarID, eventID string, body *Event) (*Event, error) {
+func (c *Client) EventsPatch(ctx context.Context, calendarID, eventID string, body *PatchEvent) (*Event, error) {
 	if body == nil {
 		return nil, fmt.Errorf("gws events.patch: body is nil")
 	}

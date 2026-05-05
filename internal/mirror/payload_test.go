@@ -224,3 +224,103 @@ func TestBuildPayload_DescriptionFormatStartsWithExpectedPrefix(t *testing.T) {
 		t.Errorf("description missing expected trailer fragment; got %q", got.Description)
 	}
 }
+
+func TestBuildPayloadWithTimeZone_AllDaySetsTimeZone(t *testing.T) {
+	// SPEC.md: "[[pairs]].time_zone" stamps the IANA name onto mirrored
+	// all-day events. Source's all-day start/end have Date set and
+	// DateTime empty; the override copies the supplied tz onto both.
+	source := &gws.Event{
+		ID:       "evt-allday",
+		Summary:  "Holiday",
+		Start:    &gws.EventDateTime{Date: "2026-07-04"},
+		End:      &gws.EventDateTime{Date: "2026-07-05"},
+		HTMLLink: "https://www.google.com/calendar/event?eid=H",
+	}
+	got := BuildPayloadWithTimeZone("alice@example.com", source, "America/New_York")
+
+	if got.Start == nil || got.Start.TimeZone != "America/New_York" {
+		t.Errorf("Start.TimeZone = %#v, want America/New_York", got.Start)
+	}
+	if got.End == nil || got.End.TimeZone != "America/New_York" {
+		t.Errorf("End.TimeZone = %#v, want America/New_York", got.End)
+	}
+	// Date carries through unchanged.
+	if got.Start.Date != "2026-07-04" {
+		t.Errorf("Start.Date = %q, want 2026-07-04", got.Start.Date)
+	}
+	if got.End.Date != "2026-07-05" {
+		t.Errorf("End.Date = %q, want 2026-07-05", got.End.Date)
+	}
+
+	// The override must NOT mutate the input - callers pass &source.Start
+	// pointers; mutating them would corrupt the source slice between
+	// classify steps.
+	if source.Start.TimeZone != "" {
+		t.Errorf("source.Start.TimeZone mutated to %q; override must clone", source.Start.TimeZone)
+	}
+}
+
+func TestBuildPayloadWithTimeZone_DateTimeEventUntouched(t *testing.T) {
+	// Timed events carry their own tz on the dateTime offset; the override
+	// is narrow and only applies to all-day events.
+	source := &gws.Event{
+		ID:       "evt-timed",
+		Summary:  "Lunch",
+		Start:    &gws.EventDateTime{DateTime: "2026-04-30T12:00:00-07:00", TimeZone: "America/Los_Angeles"},
+		End:      &gws.EventDateTime{DateTime: "2026-04-30T13:00:00-07:00", TimeZone: "America/Los_Angeles"},
+		HTMLLink: "https://www.google.com/calendar/event?eid=L",
+	}
+	got := BuildPayloadWithTimeZone("alice@example.com", source, "America/New_York")
+
+	if got.Start.TimeZone != "America/Los_Angeles" {
+		t.Errorf("Start.TimeZone = %q, want America/Los_Angeles (override must not pollute timed events)",
+			got.Start.TimeZone)
+	}
+	if got.End.TimeZone != "America/Los_Angeles" {
+		t.Errorf("End.TimeZone = %q, want America/Los_Angeles", got.End.TimeZone)
+	}
+	// The struct should be the SAME pointer for timed events (no clone needed).
+	if got.Start != source.Start {
+		t.Errorf("timed Start should pass through verbatim; got copy")
+	}
+}
+
+func TestBuildPayloadWithTimeZone_EmptyTimeZoneIsNoOp(t *testing.T) {
+	// Empty tz disables the override; result identical to BuildPayload.
+	source := &gws.Event{
+		ID:       "evt-allday-2",
+		Start:    &gws.EventDateTime{Date: "2026-07-04"},
+		End:      &gws.EventDateTime{Date: "2026-07-05"},
+		HTMLLink: "https://www.google.com/calendar/event?eid=N",
+	}
+	got := BuildPayloadWithTimeZone("alice@example.com", source, "")
+	if got.Start.TimeZone != "" {
+		t.Errorf("Start.TimeZone = %q, want empty", got.Start.TimeZone)
+	}
+	if got.End.TimeZone != "" {
+		t.Errorf("End.TimeZone = %q, want empty", got.End.TimeZone)
+	}
+	if got.Start != source.Start {
+		t.Errorf("empty tz should pass through verbatim; got copy")
+	}
+}
+
+func TestBuildInstancePayloadWithTimeZone_AllDayInstanceSetsTimeZone(t *testing.T) {
+	// Instance-level all-day exceptions get the same override.
+	source := &gws.Event{
+		ID:               "exc-allday",
+		RecurringEventID: "parent-1",
+		Start:            &gws.EventDateTime{Date: "2026-07-04"},
+		End:              &gws.EventDateTime{Date: "2026-07-05"},
+	}
+	got := BuildInstancePayloadWithTimeZone("c@example.com", source, "Europe/Berlin")
+	if got.Start.TimeZone != "Europe/Berlin" {
+		t.Errorf("Start.TimeZone = %q, want Europe/Berlin", got.Start.TimeZone)
+	}
+	if got.End.TimeZone != "Europe/Berlin" {
+		t.Errorf("End.TimeZone = %q, want Europe/Berlin", got.End.TimeZone)
+	}
+	if got.Recurrence != nil {
+		t.Errorf("Recurrence should be omitted on instance payloads; got %v", got.Recurrence)
+	}
+}

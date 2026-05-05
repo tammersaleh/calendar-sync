@@ -17,7 +17,7 @@ import (
 // was cancelled) or running the standard inventory-hit reconciliation
 // against the fetched resource.
 func (c *Classifier) doInsert(ctx context.Context, source *gws.Event) error {
-	payload := mirror.BuildPayload(c.SourceCalendarID, source)
+	payload := mirror.BuildPayloadWithTimeZone(c.SourceCalendarID, source, c.TimeZone)
 
 	inserted, err := c.API.EventsInsert(ctx, c.TargetCalendarID, payload)
 	if err == nil {
@@ -83,7 +83,7 @@ func (c *Classifier) completeInsert(ctx context.Context, source, inserted *gws.E
 // The user-facing action stays "insert" (the effect on the user's mirror
 // calendar is the same as a fresh insert); reason stays source_updated.
 func (c *Classifier) reviveCancelledMirror(ctx context.Context, source, existing *gws.Event) error {
-	payload := mirror.BuildPayload(c.SourceCalendarID, source)
+	payload := mirror.BuildPayloadWithTimeZone(c.SourceCalendarID, source, c.TimeZone)
 	payload.ID = ""
 	payload.Status = gws.EventStatusConfirmed
 

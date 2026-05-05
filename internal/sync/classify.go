@@ -86,9 +86,14 @@ type Classifier struct {
 	SourceCalendarID string
 	TargetCalendarID string
 	SourceWritable   bool
-	Inventory        *Inventory
-	Recurring        *recurring.Handler
-	Output           Output
+	// TimeZone is the per-pair `[[pairs]].time_zone` override applied to
+	// all-day mirrored events. Empty means "no override"; the destination
+	// calendar's default tz then wins. Threaded through to
+	// mirror.BuildPayloadWithTimeZone.
+	TimeZone  string
+	Inventory *Inventory
+	Recurring *recurring.Handler
+	Output    Output
 	// Log is the per-step diagnostic logger; nil silences output. The
 	// reconciler-side wiring populates this from the Reconciler's Log
 	// field; tests typically leave it nil.

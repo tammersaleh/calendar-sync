@@ -42,7 +42,7 @@ func (c *Classifier) reconcileNormal(ctx context.Context, source *gws.Event) err
 	// Build desired BEFORE computing the drift signal so ComputeDriftSignal
 	// can include the FieldsDisagree comparison (B23: live-vs-desired
 	// managed-field check that catches stale bookkeeping).
-	desired := mirror.BuildPayload(c.SourceCalendarID, source)
+	desired := mirror.BuildPayloadWithTimeZone(c.SourceCalendarID, source, c.TimeZone)
 	signal := mirror.ComputeDriftSignal(source, mirrorEvent, desired)
 
 	c.debug("sync.reconcileNormal: inventory hit",

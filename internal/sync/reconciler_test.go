@@ -1236,6 +1236,79 @@ func TestBuildClassifier_PerPDirGate(t *testing.T) {
 	}
 }
 
+// ---------- Per-pair time_zone plumbing ----------
+
+// TestBuildClassifier_TimeZonePropagatesToClassifierAndHandler pins SPEC's
+// `[[pairs]].time_zone` plumbing: the Reconciler-level buildClassifier
+// must propagate pd.TimeZone to both the Classifier and the embedded
+// recurring.Handler so both layers' BuildPayload calls stamp the override
+// onto all-day mirrored events.
+func TestBuildClassifier_TimeZonePropagatesToClassifierAndHandler(t *testing.T) {
+	r := New(nil, &config.Canonical{})
+	pd := makeTestPDir("p1", "src-A", "tgt-A", true)
+	pd.TimeZone = "America/New_York"
+
+	c, _ := r.buildClassifier(pd, NewInventory("tgt-A"), &Counts{})
+	if c.TimeZone != "America/New_York" {
+		t.Errorf("Classifier.TimeZone = %q, want America/New_York", c.TimeZone)
+	}
+	if c.Recurring.TimeZone != "America/New_York" {
+		t.Errorf("recurring.Handler.TimeZone = %q, want America/New_York", c.Recurring.TimeZone)
+	}
+}
+
+// TestFullSync_AllDayInsertCarriesPairTimeZone is the end-to-end pin:
+// a pdir with TimeZone set, an all-day source event, and a successful
+// insert path. The recorded EventsInsert body must carry the TimeZone on
+// both Start and End.
+func TestFullSync_AllDayInsertCarriesPairTimeZone(t *testing.T) {
+	api := newStubAPI()
+	pd := makeTestPDir("p1", "src-A", "tgt-A", true)
+	pd.TimeZone = "America/New_York"
+	canonical := makeCanonical(pd)
+
+	src := &gws.Event{
+		ID:           "evt-allday",
+		Summary:      "Holiday",
+		Status:       gws.EventStatusConfirmed,
+		Transparency: gws.TransparencyOpaque,
+		Start:        &gws.EventDateTime{Date: "2026-05-04"},
+		End:          &gws.EventDateTime{Date: "2026-05-05"},
+		Updated:      "2026-04-29T20:00:00Z",
+		HTMLLink:     "https://www.google.com/calendar/event?eid=H",
+	}
+	api.queueListFull("src-A", []gws.Event{*src}, "tok-1")
+	queueEmptyInventory(api, "tgt-A")
+	inserted := &gws.Event{ID: "mirror-1", Summary: src.Summary, Updated: "2026-04-29T20:00:01Z"}
+	api.queueInsert(inserted)
+	api.queuePatch(inserted) // checksum followup
+
+	r := newTestReconciler(api, canonical)
+	if _, err := r.FullSync(context.Background()); err != nil {
+		t.Fatalf("FullSync error: %v", err)
+	}
+
+	// Find the EventsInsert call's body.
+	inserts := api.callsByOp("EventsInsert")
+	if len(inserts) != 1 {
+		t.Fatalf("expected 1 EventsInsert; got %d", len(inserts))
+	}
+	body := inserts[0].Body
+	if body == nil || body.Start == nil || body.End == nil {
+		t.Fatalf("insert body missing start/end: %+v", body)
+	}
+	if body.Start.TimeZone != "America/New_York" {
+		t.Errorf("insert body Start.TimeZone = %q, want America/New_York", body.Start.TimeZone)
+	}
+	if body.End.TimeZone != "America/New_York" {
+		t.Errorf("insert body End.TimeZone = %q, want America/New_York", body.End.TimeZone)
+	}
+	// Date passes through unchanged.
+	if body.Start.Date != "2026-05-04" {
+		t.Errorf("insert body Start.Date = %q, want 2026-05-04", body.Start.Date)
+	}
+}
+
 // ---------- Per-pair horizon scoping ----------
 
 // TestReconciler_FullListSourcesUsesMaxHorizonAcrossPdirs pins SPEC's

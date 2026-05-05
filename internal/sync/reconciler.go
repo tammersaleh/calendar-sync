@@ -699,6 +699,7 @@ func (r *Reconciler) buildClassifier(
 		SourceCalendarID: pd.SourceCalendar,
 		TargetCalendarID: pd.TargetCalendar,
 		SourceWritable:   effectiveSourceWritable,
+		TimeZone:         pd.TimeZone,
 		Inventory:        inv,
 		Output:           wrapped,
 		Log:              r.Log,
@@ -714,6 +715,7 @@ func (r *Reconciler) buildClassifier(
 		SourceCalendarID: pd.SourceCalendar,
 		TargetCalendarID: pd.TargetCalendar,
 		SourceWritable:   effectiveSourceWritable,
+		TimeZone:         pd.TimeZone,
 		Log:              r.Log,
 		LookupMirrorParent: func(s mirror.SourceTuple) (*gws.Event, bool) {
 			return inv.Lookup(s)

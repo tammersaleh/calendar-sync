@@ -147,6 +147,12 @@ type Handler struct {
 	// propagate; when false, to revert.
 	SourceWritable bool
 
+	// TimeZone is the per-pair `[[pairs]].time_zone` override applied to
+	// all-day mirrored events. Empty means no override. Threaded through
+	// to mirror.BuildPayloadWithTimeZone /
+	// mirror.BuildInstancePayloadWithTimeZone.
+	TimeZone string
+
 	// LookupMirrorParent is the per-target inventory query the sync layer
 	// supplies (see MirrorParentLookup).
 	LookupMirrorParent MirrorParentLookup
@@ -376,7 +382,7 @@ func (h *Handler) locateMirrorInstance(ctx context.Context, source, mirrorParent
 // events.patch carries the event ID in the request URL, not the body.
 // Returns the post-checksum mirror-parent resource.
 func (h *Handler) forceRewriteMirrorParent(ctx context.Context, sourceParent *gws.Event, mirrorParentID string) (*gws.Event, error) {
-	payload := mirror.BuildPayload(h.SourceCalendarID, sourceParent)
+	payload := mirror.BuildPayloadWithTimeZone(h.SourceCalendarID, sourceParent, h.TimeZone)
 	payload.ID = ""
 	return h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorParentID, payload)
 }
@@ -464,7 +470,7 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 	// Build desired BEFORE computing the drift signal so ComputeDriftSignal
 	// can include the FieldsDisagree comparison (B23: live-vs-desired
 	// managed-field check that catches stale bookkeeping).
-	desired := mirror.BuildInstancePayload(h.SourceCalendarID, source)
+	desired := mirror.BuildInstancePayloadWithTimeZone(h.SourceCalendarID, source, h.TimeZone)
 	signal := mirror.ComputeDriftSignal(source, mirrorInstance, desired)
 	// An auto-materialized recurring-instance mirror inherits the parent's
 	// extended properties, so its calendar-sync:source points at the source
@@ -572,7 +578,7 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 			return Result{}, err
 		}
 		// Re-write the mirror instance using the source's NEW state.
-		desiredFromPatched := mirror.BuildInstancePayload(h.SourceCalendarID, patchedSource)
+		desiredFromPatched := mirror.BuildInstancePayloadWithTimeZone(h.SourceCalendarID, patchedSource, h.TimeZone)
 		desiredFromPatched.ID = ""
 		post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, desiredFromPatched)
 		if err != nil {
@@ -614,7 +620,7 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 // insert.go's reviveCancelledMirror (ActionInsert + ReasonSourceUpdated):
 // from the user's POV the mirror reappears.
 func (h *Handler) reviveCancelledMirrorInstance(ctx context.Context, source, mirrorInstance *gws.Event) (Result, error) {
-	desired := mirror.BuildInstancePayload(h.SourceCalendarID, source)
+	desired := mirror.BuildInstancePayloadWithTimeZone(h.SourceCalendarID, source, h.TimeZone)
 	desired.ID = ""
 	desired.Status = gws.EventStatusConfirmed
 	post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID, desired)

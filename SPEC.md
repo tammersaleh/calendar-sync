@@ -886,7 +886,11 @@ The plist generated:
 
 #### Upgrades via Homebrew
 
-`brew upgrade calendar-sync` replaces the on-disk binary at `/opt/homebrew/bin/calendar-sync`, but launchd does NOT bounce the daemon when the binary file is replaced - the running process keeps executing the prior binary's mmap'd code. The Homebrew cask's `postflight` hook bridges the gap: it runs `launchctl kickstart -k gui/<uid>/org.calendar-sync.agent` whenever the agent is currently loaded, restarting the daemon against the new binary. Cold installs (no agent loaded yet) skip the kickstart so a first-time `brew install` doesn't fail; the user runs `calendar-sync install` once after install to load the agent for the first time. `kickstart` failures are non-fatal (`must_succeed: false`) so a transient launchctl issue won't block the upgrade itself - the user's next `calendar-sync status` will surface a stale binary if anything went wrong.
+`brew upgrade calendar-sync` replaces the Homebrew-managed `calendar-sync` symlink, but launchd does NOT bounce the daemon when the binary file is replaced - the running process keeps executing the prior binary's mmap'd code. The Homebrew cask's `postflight` hook bridges the gap: it runs `launchctl kickstart -k gui/<uid>/org.calendar-sync.agent` whenever the agent is currently loaded, restarting the daemon against the new binary.
+
+Cold installs (no agent loaded yet) skip the kickstart so a first-time `brew install` doesn't fail; the user runs `calendar-sync install` once to load the agent for the first time. `kickstart` failures are non-fatal (`must_succeed: false`) so a transient launchctl issue won't block the upgrade itself. To verify the daemon picked up the new binary, run `calendar-sync version` (which prints the binary version on disk) and compare with `launchctl print gui/$(id -u)/org.calendar-sync.agent | grep pid` and the daemon's startup time in its log file - a stale daemon would have a `started_at` predating the upgrade.
+
+The hook only knows the default launchd label (`org.calendar-sync.agent`). Users who installed with `calendar-sync install --label <custom>` need to keep using the manual `calendar-sync uninstall && calendar-sync install` dance after `brew upgrade`.
 
 #### Errors
 

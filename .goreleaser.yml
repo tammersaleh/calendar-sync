@@ -49,16 +49,28 @@ homebrew_casks:
             # executing the prior binary's mmap'd code (kernel caches
             # the file, on-disk replacement doesn't bounce the process)
             # and the user has to run `calendar-sync uninstall &&
-            # calendar-sync install` by hand. Cold install: launchctl
-            # print fails (agent not loaded), the kickstart skips, and
-            # the user runs `calendar-sync install` to load it the first
-            # time. must_succeed: false keeps brew from failing the
-            # upgrade if launchctl misbehaves.
+            # calendar-sync install` by hand.
+            #
+            # Cold install: launchctl print fails (agent not loaded),
+            # the kickstart skips, and the user runs `calendar-sync
+            # install` to load the agent for the first time. The
+            # probe's stderr is suppressed so a normal cold install
+            # doesn't print "Could not find service" through brew.
+            #
+            # Custom-label installs (`calendar-sync install --label
+            # foo`) are NOT covered by this hook - the postflight only
+            # knows the default label. Users who customized the label
+            # need to keep using the manual uninstall/install dance on
+            # upgrade.
+            #
+            # must_succeed: false on both calls so a transient
+            # launchctl issue doesn't fail the brew upgrade itself.
             uid = Process.uid
             label = "org.calendar-sync.agent"
             loaded = system_command "/bin/launchctl",
               args: ["print", "gui/#{uid}/#{label}"],
-              must_succeed: false
+              must_succeed: false,
+              print_stderr: false
             if loaded.success?
               system_command "/bin/launchctl",
                 args: ["kickstart", "-k", "gui/#{uid}/#{label}"],

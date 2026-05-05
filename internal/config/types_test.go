@@ -58,6 +58,18 @@ func TestCalendarRef_UnmarshalTOML(t *testing.T) {
 			wantErr:     true,
 			wantErrText: "must be a string or inline table",
 		},
+		{
+			name:        "non-string summary value rejected",
+			toml:        `source = {summary = 42}`,
+			wantErr:     true,
+			wantErrText: `field "summary" must be a string`,
+		},
+		{
+			name:        "non-string account value rejected",
+			toml:        `source = {summary = "X", account = true}`,
+			wantErr:     true,
+			wantErrText: `field "account" must be a string`,
+		},
 	}
 
 	for _, tc := range tests {

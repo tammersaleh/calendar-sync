@@ -161,16 +161,39 @@ func (r *CalendarRef) UnmarshalTOML(data any) error {
 				return fmt.Errorf("calendar ref table has unknown field %q; allowed: summary, account", k)
 			}
 		}
-		summary, _ := v["summary"].(string)
-		account, _ := v["account"].(string)
-		// Allow empty summary at unmarshal time; validatePair surfaces
-		// the missing-field error through the normal validation envelope.
+		// A missing key produces the zero value; a non-string value is a
+		// user error worth a clear message. Silent coercion would surface
+		// later as a confusing "required field missing" from validatePair.
+		summary, err := stringField(v, "summary")
+		if err != nil {
+			return err
+		}
+		account, err := stringField(v, "account")
+		if err != nil {
+			return err
+		}
 		r.Summary = summary
 		r.Account = account
 		return nil
 	default:
 		return fmt.Errorf("calendar ref must be a string or inline table, got %T", data)
 	}
+}
+
+// stringField returns m[key] as a string. Missing keys return "" with no
+// error (the inline-table form's required-fields rule lives in
+// validatePair). Non-string values are rejected at unmarshal time so a
+// typo'd `summary = 42` surfaces as a clear type error.
+func stringField(m map[string]any, key string) (string, error) {
+	raw, ok := m[key]
+	if !ok {
+		return "", nil
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("calendar ref table field %q must be a string, got %T", key, raw)
+	}
+	return s, nil
 }
 
 // MarshalJSON emits the user-facing wire shape used by `pair list` /

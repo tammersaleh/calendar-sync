@@ -28,6 +28,13 @@ var instanceSuffixRE = regexp.MustCompile(`_\d{8}T\d{6}Z$`)
 // source override and propagate.
 const reasonMirrorOnlyOverride mirror.Reason = "mirror_only_override"
 
+// reasonSourceOrphan is the skip reason emitted when a target-delta event
+// references a non-recurring source that no longer exists (events.get
+// returned 404). The orphan walk's existing prune pass cleans the mirror;
+// target-delta's job is just to surface the observation in the JSONL
+// stream so the action log isn't silently incomplete.
+const reasonSourceOrphan mirror.Reason = "source_orphan"
+
 // runTargetDeltaPhase runs B17's per-target delta reconciliation. For each
 // writable-source target, list the events.list delta against the seeded
 // targetSyncToken; for each delta event that is a calendar-sync mirror,
@@ -196,22 +203,26 @@ func (r *Reconciler) processTargetDeltaEvent(
 	sourceEvent, err := r.API.EventsGet(ctx, tuple.CalendarID, sourceEventID)
 	if err != nil {
 		if errors.Is(err, gws.ErrAPINotFound) {
-			// Two cases collapse here:
-			//   - source orphan: the source was deleted between the last
-			//     full-sync and this delta. The orphan walk on the next
-			//     FullSync will clean up the mirror. Silent skip.
+			// Two cases collapse here, both emit a skip outcome so the
+			// JSONL action stream is complete:
+			//   - source orphan (non-recurring): the source was deleted
+			//     between the last full-sync and this delta. The orphan
+			//     walk's prune pass cleans up the mirror; we only need to
+			//     surface the observation.
 			//   - mirror-only override (recurring instance): the user edited
 			//     a single occurrence on the mirror that the source has no
 			//     override for. SPEC's existing limitation; Phase 2 (deferred)
-			//     would create the source override and propagate. For now,
-			//     emit a skip so the user sees the no-op in the JSONL stream.
+			//     would create the source override and propagate.
+			reason := reasonSourceOrphan
 			if mirrorEvent.RecurringEventID != "" {
-				r.emitTargetDeltaSkip(counts, mirrorEvent, sourceEventID, reasonMirrorOnlyOverride, pd)
+				reason = reasonMirrorOnlyOverride
 			}
+			r.emitTargetDeltaSkip(counts, mirrorEvent, sourceEventID, reason, pd)
 			r.debug("sync.targetDelta: source 404; skipping",
 				"target", target,
 				"target_event", mirrorEvent.ID,
 				"source_event", sourceEventID,
+				"reason", string(reason),
 			)
 			return nil
 		}
@@ -254,9 +265,10 @@ func (r *Reconciler) processTargetDeltaEvent(
 	return nil
 }
 
-// emitTargetDeltaSkip emits a skip outcome for the Phase 1
-// mirror-only-override case. Wired through the reconciler's Output sink so
-// it appears in the JSONL stream alongside the source-delta outcomes.
+// emitTargetDeltaSkip emits a skip outcome for one of the target-delta
+// 404 paths (mirror_only_override or source_orphan). Wired through the
+// reconciler's Output sink so it appears in the JSONL stream alongside
+// the source-delta outcomes.
 func (r *Reconciler) emitTargetDeltaSkip(
 	counts *Counts,
 	mirrorEvent *gws.Event,

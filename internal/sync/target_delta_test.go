@@ -393,6 +393,61 @@ func TestTargetDeltaPhase_InheritedInstanceEdit_Phase1Skip(t *testing.T) {
 	}
 }
 
+// ---------- 4b. Non-recurring source orphan -> skip(source_orphan) ----------
+
+func TestTargetDeltaPhase_NonRecurringSourceOrphanEmitsSkip(t *testing.T) {
+	api := newStubAPI()
+	pd := makeWritablePDir("p1", "src-A", "tgt-A")
+	canonical := makeCanonical(pd)
+
+	// Non-recurring mirror whose source has been deleted. The user edit on
+	// the mirror is irrelevant - the source 404 short-circuits the dispatch
+	// before drift detection runs.
+	m := makeMirrorWithUserEdit("mirror-1", "src-A:src-evt",
+		"2026-04-29T20:00:00Z", "2026-04-30T11:00:00Z",
+		"Standup", "Standup-edited")
+
+	r := newTestReconciler(api, canonical)
+	r.targetSyncTokens["tgt-A"] = "tok-tgt-old"
+	r.inventories["tgt-A"] = NewInventory("tgt-A")
+	r.syncTokens["src-A"] = "tok-src-old"
+
+	queueTargetIncrDelta(api, "tgt-A", []gws.Event{*m}, "tok-tgt-new")
+	api.queueListIncr("src-A", nil, "tok-src-new")
+
+	// Source returns 404 - it was deleted between FullSync and this delta.
+	api.queueGetErr("src-A", "src-evt",
+		&gws.Error{Code: gws.CodeAPINotFound, ExitCode: 1})
+
+	sink, captured := captureOutputs()
+	r.Output = sink
+
+	if _, err := r.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	// Expect exactly one skip outcome with reason=source_orphan.
+	var skip *Outcome
+	for i := range *captured {
+		o := (*captured)[i]
+		if o.Action == mirror.ActionSkip && o.Reason == reasonSourceOrphan {
+			skip = &o
+			break
+		}
+	}
+	if skip == nil {
+		t.Fatalf("expected skip(source_orphan); got %+v", *captured)
+	}
+	if skip.SourceEventID != "src-evt" || skip.TargetEventID != "mirror-1" {
+		t.Errorf("skip IDs = src=%q tgt=%q, want src-evt + mirror-1",
+			skip.SourceEventID, skip.TargetEventID)
+	}
+	// Token advances - skip is success-shaped per the dispatch path.
+	if got := r.targetSyncTokens["tgt-A"]; got != "tok-tgt-new" {
+		t.Errorf("targetSyncTokens[tgt-A] = %q, want tok-tgt-new (skip != error)", got)
+	}
+}
+
 // ---------- 5. Self-write suppression for normal mirror ----------
 
 func TestTargetDeltaPhase_SelfWriteSuppression(t *testing.T) {

@@ -176,6 +176,13 @@ func (r *Reconciler) processTargetDeltaEvent(
 	// instances, the tuple's EventID may be the parent (inherited form) or
 	// the instance's own id (managed form).
 	sourceEventID := tuple.EventID
+	// inheritedInstance flags an inherited-form recurring-instance mirror:
+	// the source-tuple's EventID equals the source PARENT's id (no `_<UTC>`
+	// suffix) because Google copied the parent's extendedProperties to the
+	// auto-materialized instance. Used below to skip the inventory refresh
+	// that would otherwise shadow the real parent entry with the child
+	// instance.
+	inheritedInstance := false
 	if mirrorEvent.RecurringEventID != "" {
 		// Inherited form: the tuple's EventID is the source PARENT's id,
 		// which equals the mirror parent's id only via the
@@ -183,6 +190,7 @@ func (r *Reconciler) processTargetDeltaEvent(
 		// the parent's id with the mirror's own `_<UTC>` suffix appended.
 		// Managed form: the tuple's EventID already has the suffix; use as-is.
 		if !instanceSuffixRE.MatchString(tuple.EventID) {
+			inheritedInstance = true
 			suffix, ok := extractInstanceSuffix(mirrorEvent.ID)
 			if !ok {
 				// The mirror instance lacks a parseable suffix. This is a
@@ -255,7 +263,25 @@ func (r *Reconciler) processTargetDeltaEvent(
 	// the target-delta event IS the live mirror with the user's edit
 	// applied. Set the inventory to this live event so the Classifier's
 	// drift detection compares against the user's new value.
-	inv.Set(tuple, mirrorEvent)
+	//
+	// Exception: inherited-form recurring instances. The source-tuple's
+	// EventID for an inherited instance is the source PARENT's id, so
+	// inv.Set under that key would OVERWRITE the parent's inventory entry
+	// with the child instance. The recurring handler's resolveMirrorParent
+	// then looks up that same parent tuple and gets the shadowed child
+	// back, after which locateMirrorInstance issues events.instances against
+	// the child's id - the same B16-class shadow the inventory builder's
+	// pass-2 filter exists to prevent.
+	//
+	// Skipping the refresh here is safe: the recurring handler doesn't
+	// consume the per-instance inventory entry during dispatch. It queries
+	// events.instances live and runs drift detection off the result, then
+	// classify.classifyRecurringInstance writes the post-write resource at
+	// (SourceCalendarID, source.ID) - the proper per-instance key, not the
+	// parent's tuple - after the handler returns.
+	if !inheritedInstance {
+		inv.Set(tuple, mirrorEvent)
+	}
 
 	if err := classifier.Classify(ctx, sourceEvent); err != nil {
 		// Surface as a target-delta error so the caller pins the token.

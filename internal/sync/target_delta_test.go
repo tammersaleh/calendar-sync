@@ -615,6 +615,147 @@ func TestTargetDeltaPhase_InheritedAutoMaterializedNoUserEdit(t *testing.T) {
 			t.Errorf("inherited bootstrap must not patch source; got %+v", c)
 		}
 	}
+
+	// events.instances must be queried against the MIRROR PARENT's id, not
+	// the child instance's id. If the inv.Set shadow ever returns, the
+	// recurring handler's resolveMirrorParent step would pick up the child
+	// (cached at the parent's tuple) and locate-instance would query the
+	// child's id - which would 404 / return zero results from Calendar API
+	// in production but happens to pass the stub here.
+	instanceCalls := api.callsByOp("EventsInstances")
+	if len(instanceCalls) == 0 {
+		t.Fatal("expected at least one events.instances call")
+	}
+	for _, c := range instanceCalls {
+		if c.EventID != "mirror-parent" {
+			t.Errorf("events.instances must query the mirror parent id; got %q", c.EventID)
+		}
+	}
+
+	// The parent inventory entry must still point at the parent (not the
+	// child instance). Pinning this protects the recurring handler's parent
+	// lookup against future regressions of the inv.Set shadow.
+	parentTuple := mirror.SourceTuple{CalendarID: "src-A", EventID: "src-parent"}
+	got, ok := inv.Lookup(parentTuple)
+	if !ok {
+		t.Fatalf("parent inventory entry missing after target-delta")
+	}
+	if got.ID != "mirror-parent" {
+		t.Errorf("parent inventory entry shadowed; got id=%q want %q", got.ID, "mirror-parent")
+	}
+	if got.RecurringEventID != "" {
+		t.Errorf("parent inventory entry shadowed (got a child instance with RecurringEventID=%q)",
+			got.RecurringEventID)
+	}
+}
+
+// TestTargetDeltaPhase_InheritedInstance_DoesNotShadowParentInInventory
+// pins the Finding-1 fix: an inherited-form recurring instance must NOT
+// overwrite the parent's inventory entry. Before the fix, inv.Set(tuple,
+// mirrorEvent) used the source-tuple parsed from the inherited instance -
+// which equals the parent's tuple - and silently shadowed the parent with
+// the child instance. The recurring handler's resolveMirrorParent would
+// then return the child, and locateMirrorInstance would query
+// events.instances against the child's id (B16-class data corruption).
+//
+// This is the simpler shadow-pin variant of
+// TestTargetDeltaPhase_InheritedAutoMaterializedNoUserEdit: it doesn't
+// exercise the inherited_upgrade path, just the inventory-shape invariant.
+func TestTargetDeltaPhase_InheritedInstance_DoesNotShadowParentInInventory(t *testing.T) {
+	api := newStubAPI()
+	pd := makeWritablePDir("p1", "src-A", "tgt-A")
+	canonical := makeCanonical(pd)
+
+	// Inherited-form mirror instance. parentTupleStr = "src-A:src-parent"
+	// has no `_<UTC>` suffix, so the source-tuple parses as the parent's
+	// tuple - exactly the value that would shadow the parent on inv.Set.
+	instanceID := "mirror-parent_20260520T160000Z"
+	parentTupleStr := "src-A:src-parent"
+	start := &gws.EventDateTime{DateTime: "2026-05-20T16:00:00Z"}
+	end := &gws.EventDateTime{DateTime: "2026-05-20T17:00:00Z"}
+	clean := makeCleanCurrentMirror(instanceID, parentTupleStr,
+		"2026-04-29T20:00:00Z", "2026-04-30T10:00:00Z",
+		"Lunch", start, end)
+	clean.RecurringEventID = "mirror-parent"
+	clean.OriginalStartTime = start
+
+	// Pre-seed: parent in inventory at the parent's tuple. This is the
+	// canonical shape BuildInventory's pass-2 produces (parent kept,
+	// inherited child filtered).
+	r := newTestReconciler(api, canonical)
+	r.targetSyncTokens["tgt-A"] = "tok-tgt-old"
+	inv := NewInventory("tgt-A")
+	parentTuple := mirror.SourceTuple{CalendarID: "src-A", EventID: "src-parent"}
+	mirrorParent := &gws.Event{
+		ID:         "mirror-parent",
+		Status:     gws.EventStatusConfirmed,
+		Summary:    "Series",
+		Recurrence: []string{"RRULE:FREQ=WEEKLY"},
+		ExtendedProperties: &gws.ExtendedProperties{
+			Private: map[string]string{
+				mirror.ExtKeySource:  parentTupleStr,
+				mirror.ExtKeyVersion: mirror.SchemaVersion,
+			},
+		},
+	}
+	inv.Set(parentTuple, mirrorParent)
+	r.inventories["tgt-A"] = inv
+	r.syncTokens["src-A"] = "tok-src-old"
+
+	queueTargetIncrDelta(api, "tgt-A", []gws.Event{*clean}, "tok-tgt-new")
+	api.queueListIncr("src-A", nil, "tok-src-new")
+
+	// Source instance exists. Drives the recurring handler down the
+	// inherited-upgrade path; we don't assert on the outcome here, just on
+	// the inventory shape afterward.
+	srcInstance := &gws.Event{
+		ID:                "src-parent_20260520T160000Z",
+		RecurringEventID:  "src-parent",
+		Status:            gws.EventStatusConfirmed,
+		Summary:           "Lunch",
+		Description:       "Lunch",
+		Start:             start,
+		End:               end,
+		OriginalStartTime: start,
+		Updated:           "2026-04-29T20:00:00Z",
+		Transparency:      gws.TransparencyOpaque,
+		HTMLLink:          "https://www.google.com/calendar/event?eid=ABC",
+	}
+	api.queueGet("src-A", "src-parent_20260520T160000Z", srcInstance)
+	api.queueInstances([]gws.Event{*clean})
+	post := *clean
+	api.queuePatch(&post)
+	api.queuePatch(&post)
+
+	sink, _ := captureOutputs()
+	r.Output = sink
+
+	if _, err := r.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	// Pin: the parent inventory entry still points at the PARENT, not the
+	// child. With the pre-fix code, this fails because inv.Set(parentTuple,
+	// childInstance) overwrites the parent.
+	got, ok := inv.Lookup(parentTuple)
+	if !ok {
+		t.Fatalf("parent inventory entry missing after target-delta of inherited instance")
+	}
+	if got.ID != "mirror-parent" {
+		t.Errorf("parent inventory entry shadowed by child; got id=%q want mirror-parent", got.ID)
+	}
+	if got.RecurringEventID != "" {
+		t.Errorf("parent inventory shadowed by recurring instance; got RecurringEventID=%q", got.RecurringEventID)
+	}
+
+	// Also: the recurring handler's events.instances must query the parent's
+	// id. If the shadow happens, mirrorParent.ID becomes the child's id and
+	// events.instances goes there.
+	for _, c := range api.callsByOp("EventsInstances") {
+		if c.EventID != "mirror-parent" {
+			t.Errorf("events.instances queried the wrong event id (parent shadowed?); got %q", c.EventID)
+		}
+	}
 }
 
 // ---------- 7. Non-mirror events in target-delta are skipped silently ----------

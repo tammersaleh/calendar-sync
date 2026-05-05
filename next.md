@@ -96,12 +96,7 @@ This is independent of E2E testing but would benefit from it: target-edit propag
 
 ### Codex full-codebase correctness review
 
-Queued. Catches anything the recent B15/B16/B18/B19/B20/B22/B23 fixes might have missed. Probably worth running AFTER E2E testing infrastructure exists, so the review can include test coverage analysis.
-
-### Cleanup
-
-- `backlog/B18-per-event-error-tolerance.md` is stale (B18 shipped). Canonical doc lives in SPEC.md and `doc/bugs.md`. Safe to delete.
-- `backlog/B17-target-syncToken.md` is still relevant.
+Shipped in v2.3.0 (2026-05-05). 7 findings surfaced; addressed across 1 `feat:` (PatchEvent type) + 9 `fix:` commits. Stderr has been silent for the ~9 hours since the upgrade - the retry layer (finding 4) hasn't needed to fire once. See `doc/bugs.md` for the running record.
 
 ## Out of scope
 

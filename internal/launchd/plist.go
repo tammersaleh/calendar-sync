@@ -2,6 +2,7 @@ package launchd
 
 import (
 	"bytes"
+	"encoding/xml"
 	"fmt"
 	"text/template"
 )
@@ -52,24 +53,24 @@ const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key><string>{{.Label}}</string>
+    <key>Label</key><string>{{xmlEscape .Label}}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{{.BinaryPath}}</string>
+        <string>{{xmlEscape .BinaryPath}}</string>
         <string>watch</string>
     </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
     <key>ProcessType</key><string>Interactive</string>
-    <key>StandardOutPath</key><string>{{.StdoutPath}}</string>
-    <key>StandardErrorPath</key><string>{{.StderrPath}}</string>
+    <key>StandardOutPath</key><string>{{xmlEscape .StdoutPath}}</string>
+    <key>StandardErrorPath</key><string>{{xmlEscape .StderrPath}}</string>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>PATH</key><string>{{.PATH}}</string>
+        <key>PATH</key><string>{{xmlEscape .PATH}}</string>
     </dict>
     <key>WatchPaths</key>
     <array>
-        <string>{{.ConfigPath}}</string>
+        <string>{{xmlEscape .ConfigPath}}</string>
     </array>
 </dict>
 </plist>
@@ -78,7 +79,33 @@ const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 // compiledPlistTemplate is parsed once at package init. Parse errors here
 // would be a developer bug (the literal above isn't user-supplied), so we
 // panic rather than defer the failure to the first install call.
-var compiledPlistTemplate = template.Must(template.New("plist").Parse(plistTemplate))
+//
+// xmlEscape is registered as a template function so every substituted
+// field has its `&`, `<`, `>`, `'`, `"` escaped per XML rules. text/template
+// does no escaping by default; without this any path containing an XML
+// metacharacter (e.g. a directory name like "Tom & Jerry") would produce
+// invalid XML and `launchctl load` would reject the plist.
+var compiledPlistTemplate = template.Must(
+	template.New("plist").Funcs(template.FuncMap{
+		"xmlEscape": xmlEscape,
+	}).Parse(plistTemplate),
+)
+
+// xmlEscape returns s with the five XML metacharacters replaced by their
+// entity references using encoding/xml's canonical escaper. The escaper
+// writes to an io.Writer; we wrap a bytes.Buffer because text/template
+// passes the function's return value through fmt.Fprint, which would
+// re-stringify any Writer-shaped output incorrectly. On error (which
+// xml.EscapeText doesn't actually raise for in-memory writes), fall
+// through to the unescaped string - the install path's downstream
+// xml.NewDecoder validation will catch any malformed output.
+func xmlEscape(s string) string {
+	var buf bytes.Buffer
+	if err := xml.EscapeText(&buf, []byte(s)); err != nil {
+		return s
+	}
+	return buf.String()
+}
 
 // renderPlist substitutes p into SPEC's plist template and returns the
 // rendered XML. Returns an error if any required field is empty - the

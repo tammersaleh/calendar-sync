@@ -146,6 +146,89 @@ func TestRenderPlist_SubstitutesAllFields(t *testing.T) {
 	}
 }
 
+// TestRenderPlist_EscapesXMLMetacharacters pins the XML-safety guarantee:
+// when a user's config path or log directory contains an XML
+// metacharacter (`&`, `<`, `>`, `'`, `"`), the rendered plist must still
+// be valid XML so launchctl can load it. text/template does no escaping
+// by default; the renderer registers an xmlEscape template function on
+// every substituted field.
+func TestRenderPlist_EscapesXMLMetacharacters(t *testing.T) {
+	got, err := renderPlist(plistInputs{
+		Label:      "org.example.with&amp;char",
+		BinaryPath: "/path/with<bracket>/calendar-sync",
+		StdoutPath: "/log/Tom & Jerry/out.log",
+		StderrPath: "/log/with\"quote/err.log",
+		PATH:       "/usr/bin:/path/with'apos",
+		ConfigPath: "/conf/with<>&'\".toml",
+	})
+	if err != nil {
+		t.Fatalf("renderPlist: %v", err)
+	}
+
+	// The rendered output must parse as well-formed XML.
+	dec := xml.NewDecoder(strings.NewReader(string(got)))
+	for {
+		_, err := dec.Token()
+		if err != nil {
+			if err.Error() == "EOF" {
+				break
+			}
+			t.Fatalf("xml decode failed; rendered plist is not valid XML: %v\nrendered:\n%s", err, got)
+		}
+	}
+
+	// Sanity-check: the ConfigPath's literal `<` `>` `&` `'` `"` characters
+	// must NOT appear unescaped between <string>...</string> tags. We look
+	// for the entity forms in their place.
+	wantSubstring := "&lt;&gt;&amp;&#39;&#34;.toml"
+	if !strings.Contains(string(got), wantSubstring) {
+		t.Errorf("expected ConfigPath chars escaped to %q in rendered plist; got:\n%s",
+			wantSubstring, got)
+	}
+}
+
+// TestRenderPlist_RoundTripsLabelEntities pins that an already-encoded
+// XML entity in the input survives as a literal character in the parsed
+// plist, NOT as the entity itself. ("&amp;" in input → "&amp;amp;" in
+// output → parses back to "&amp;" - which is wrong.) The escaper's job
+// is to be idempotent in the OPPOSITE direction: input is treated as
+// raw text. This pins that contract.
+func TestRenderPlist_RoundTripsLabelEntities(t *testing.T) {
+	got, err := renderPlist(plistInputs{
+		Label:      "org.example & co",
+		BinaryPath: "/bin/calendar-sync",
+		StdoutPath: "/tmp/out.log",
+		StderrPath: "/tmp/err.log",
+		PATH:       "/usr/bin",
+		ConfigPath: "/tmp/config.toml",
+	})
+	if err != nil {
+		t.Fatalf("renderPlist: %v", err)
+	}
+	type plist struct {
+		Dict struct {
+			Keys    []string `xml:"key"`
+			Strings []string `xml:"string"`
+		} `xml:"dict"`
+	}
+	var p plist
+	if err := xml.Unmarshal(got, &p); err != nil {
+		t.Fatalf("xml unmarshal: %v\nrendered:\n%s", err, got)
+	}
+	// Find the Label string by walking key/string pairs.
+	var label string
+	for i, k := range p.Dict.Keys {
+		if k == "Label" && i < len(p.Dict.Strings) {
+			label = p.Dict.Strings[i]
+			break
+		}
+	}
+	if label != "org.example & co" {
+		t.Errorf("decoded Label = %q, want %q (escape must be idempotent through XML round-trip)",
+			label, "org.example & co")
+	}
+}
+
 // TestRenderPlist_WatchPathsContainsConfig pins B7: the rendered plist
 // includes a launchd `WatchPaths` directive listing the resolved config
 // path. launchd watches the listed paths and restarts the daemon when

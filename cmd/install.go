@@ -1,6 +1,9 @@
 package cmd
 
 import (
+	"fmt"
+	"path/filepath"
+
 	"github.com/tammersaleh/calendar-sync/internal/config"
 	"github.com/tammersaleh/calendar-sync/internal/launchd"
 )
@@ -26,12 +29,16 @@ type InstallCmd struct {
 // the default path; launchd accepts a watched path that's missing on
 // install and fires events when it's later created.
 func (c *InstallCmd) Run(rt *Runtime) error {
+	configPath, err := resolveInstallConfigPath(rt.Globals.Config)
+	if err != nil {
+		return err
+	}
 	cfg := launchd.Config{
 		Label:      c.Label,
 		LogDir:     c.LogDir,
 		Force:      c.Force,
 		NoLoad:     c.NoLoad,
-		ConfigPath: config.FindPath(rt.Globals.Config),
+		ConfigPath: configPath,
 	}
 	res, err := launchd.Install(rt.Ctx, cfg, launchd.ExecRunner{})
 	if err != nil {
@@ -41,6 +48,26 @@ func (c *InstallCmd) Run(rt *Runtime) error {
 	p.Emit(installResult{Plist: res.PlistPath, Loaded: res.Loaded})
 	p.Meta(metaCount{Count: 1})
 	return nil
+}
+
+// resolveInstallConfigPath returns the absolute path to config.toml that
+// should be stamped into the plist's WatchPaths directive. The path is
+// canonicalized to absolute form via filepath.Abs because launchd
+// resolves WatchPaths entries against the daemon's working directory at
+// load time, not the operator's cwd at install time - a user who
+// installed via `calendar-sync install --config ./config.toml` would
+// otherwise produce a plist that watches a non-existent relative path.
+//
+// configFlag is whatever the user passed to --config (or empty for the
+// default precedence chain); config.FindPath applies the same
+// --config / $CALENDAR_SYNC_CONFIG / XDG-default order used everywhere
+// else.
+func resolveInstallConfigPath(configFlag string) (string, error) {
+	abs, err := filepath.Abs(config.FindPath(configFlag))
+	if err != nil {
+		return "", fmt.Errorf("resolve config path: %w", err)
+	}
+	return abs, nil
 }
 
 // installResult is SPEC line 760's wire shape.

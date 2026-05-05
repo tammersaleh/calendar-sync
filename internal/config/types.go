@@ -147,7 +147,13 @@ func (r CalendarRef) IsSummaryRef() bool { return r.Summary != "" }
 // CalendarRef. An empty string is rejected here; an empty summary on the
 // table form is allowed at unmarshal time so validatePair can surface
 // the missing-required-field error through the normal JSON envelope.
+//
+// Wipes the receiver up front so a reused struct (decode object, then
+// re-decode as string) doesn't leave the prior union variant's field set
+// alongside the new one - IsSummaryRef would otherwise flip true on a
+// pure ID-form ref.
 func (r *CalendarRef) UnmarshalTOML(data any) error {
+	*r = CalendarRef{}
 	switch v := data.(type) {
 	case string:
 		if v == "" {
@@ -215,7 +221,11 @@ func (r CalendarRef) MarshalJSON() ([]byte, error) {
 // ID-form ref, a JSON object becomes a summary-form ref. Required so test
 // code (and any future caller) can decode the wire shape back into a typed
 // CalendarRef.
+//
+// Wipes the receiver up front so a reused struct doesn't leave a stale
+// union variant's field set; see UnmarshalTOML for the same reason.
 func (r *CalendarRef) UnmarshalJSON(data []byte) error {
+	*r = CalendarRef{}
 	var s string
 	if err := json.Unmarshal(data, &s); err == nil {
 		r.ID = s

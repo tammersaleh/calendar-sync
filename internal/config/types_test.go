@@ -220,6 +220,60 @@ func TestCalendarRef_UnmarshalJSON_RoundTrips(t *testing.T) {
 	}
 }
 
+// TestCalendarRef_UnmarshalTOML_ClearsStaleUnionState pins the wipe-on-
+// decode behavior: re-decoding the same struct with a string ref must
+// not leave a stale Summary/Account from the prior table-form decode,
+// which would otherwise flip IsSummaryRef true on a pure ID-form ref.
+func TestCalendarRef_UnmarshalTOML_ClearsStaleUnionState(t *testing.T) {
+	var dest struct {
+		Source CalendarRef `toml:"source"`
+	}
+	if _, err := toml.Decode(`source = {summary = "TripIt", account = "alice@example.com"}`, &dest); err != nil {
+		t.Fatalf("first decode: %v", err)
+	}
+	if !dest.Source.IsSummaryRef() {
+		t.Fatalf("setup precondition failed: first decode should set Summary")
+	}
+	if _, err := toml.Decode(`source = "alice@example.com"`, &dest); err != nil {
+		t.Fatalf("second decode: %v", err)
+	}
+	if dest.Source.IsSummaryRef() {
+		t.Errorf("Summary stuck around after string-form re-decode: %+v", dest.Source)
+	}
+	if dest.Source.Account != "" {
+		t.Errorf("Account stuck around after string-form re-decode: %+v", dest.Source)
+	}
+	if dest.Source.ID != "alice@example.com" {
+		t.Errorf("ID = %q, want alice@example.com", dest.Source.ID)
+	}
+}
+
+// TestCalendarRef_UnmarshalJSON_ClearsStaleUnionState mirrors the TOML
+// wipe test for the JSON inverse path. The cmd-level pair_test.go decodes
+// the same payload struct repeatedly; a stale union would silently flip
+// IsSummaryRef.
+func TestCalendarRef_UnmarshalJSON_ClearsStaleUnionState(t *testing.T) {
+	var ref CalendarRef
+	if err := json.Unmarshal([]byte(`{"summary":"TripIt","account":"alice@example.com"}`), &ref); err != nil {
+		t.Fatalf("first decode: %v", err)
+	}
+	if !ref.IsSummaryRef() {
+		t.Fatalf("setup precondition failed: first decode should set Summary")
+	}
+	if err := json.Unmarshal([]byte(`"alice@example.com"`), &ref); err != nil {
+		t.Fatalf("second decode: %v", err)
+	}
+	if ref.IsSummaryRef() {
+		t.Errorf("Summary stuck around after string re-decode: %+v", ref)
+	}
+	if ref.Account != "" {
+		t.Errorf("Account stuck around after string re-decode: %+v", ref)
+	}
+	if ref.ID != "alice@example.com" {
+		t.Errorf("ID = %q, want alice@example.com", ref.ID)
+	}
+}
+
 // TestCalendarRef_IsSummaryRef pins the predicate: any non-empty Summary
 // flips the bit; ID-only refs are NOT summary refs even if Account is set
 // (validatePair rejects the latter shape, but the predicate itself must

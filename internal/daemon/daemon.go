@@ -217,7 +217,7 @@ func (d *Daemon) runTick(
 	store.recordTick(doneAt, res, d.inventorySizes())
 	printer.emitMeta(len(res.PDirs), res.Aggregated, time.Duration(res.DurationMS)*time.Millisecond)
 	sch.recordTickRan(doneAt)
-	if anyNeedsFullResync(res.PerSource) {
+	if anyNeedsFullResync(res.PerSource) || anyTargetNeedsFullResync(res.PerTarget) {
 		sch.requestFastTrackFullSync()
 	}
 	return nil
@@ -245,6 +245,20 @@ func (d *Daemon) inventorySizes() map[string]int {
 // scheduler's fast-track flag after a Tick or FullSync.
 func anyNeedsFullResync(perSource map[string]syncpkg.SourceStatus) bool {
 	for _, st := range perSource {
+		if st.NeedsFullResync {
+			return true
+		}
+	}
+	return false
+}
+
+// anyTargetNeedsFullResync mirrors anyNeedsFullResync for the per-target
+// status map. A 410 GONE on a target-syncToken stream sets
+// PerTarget[t].NeedsFullResync=true; the daemon must re-seed that token
+// via a fast-track FullSync rather than coasting until the next periodic
+// re-sync.
+func anyTargetNeedsFullResync(perTarget map[string]syncpkg.TargetStatus) bool {
+	for _, st := range perTarget {
 		if st.NeedsFullResync {
 			return true
 		}

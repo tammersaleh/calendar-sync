@@ -199,6 +199,41 @@ func makeDaemon(t *testing.T, api *stubAPI, clock *fakeClock) (*Daemon, *bytes.B
 	return d, stdout
 }
 
+// makeWritableDaemon mirrors makeDaemon but flips SourceWritable +
+// PropagateTargetEdits on so the target-delta phase actually runs (the
+// uniqueWritableTargets gate). Tests that exercise B17's per-target
+// syncToken machinery use this variant.
+func makeWritableDaemon(t *testing.T, api *stubAPI, clock *fakeClock) (*Daemon, *bytes.Buffer) {
+	t.Helper()
+	canonical := &config.Canonical{
+		Settings: config.Settings{
+			PollInterval:     mustDuration("60s"),
+			FullSyncInterval: mustDuration("24h"),
+		},
+		PDirs: []config.PDir{
+			{
+				PairName:             "p1",
+				Direction:            config.PDirAtoB,
+				SourceCalendar:       "src",
+				TargetCalendar:       "tgt",
+				SourceWritable:       true,
+				PropagateTargetEdits: true,
+			},
+		},
+	}
+	rec := syncpkg.New(api, canonical, syncpkg.WithNow(clock.Now))
+	stdout := &bytes.Buffer{}
+	d := &Daemon{
+		Reconciler: rec,
+		Canonical:  canonical,
+		SocketPath: tmpSocketPath(t),
+		Clock:      clock,
+		Stdout:     stdout,
+	}
+	t.Cleanup(func() { os.Remove(d.SocketPath) })
+	return d, stdout
+}
+
 // runDaemonAsync starts d.Run in a goroutine and returns the cancel func
 // + a channel that closes on Run return. Tests cancel and wait on the
 // channel to ensure clean shutdown.
@@ -396,6 +431,57 @@ func TestDaemon_NeedsFullResyncTriggersFastTrack(t *testing.T) {
 	// two inventory queries) without further clock advancement.
 	waitFor(t, "fast-track FullSync runs", 2*time.Second, func() bool {
 		return api.listCalls.Load() >= startCalls+4 // 1 tick (410) + 3 fullSync
+	})
+}
+
+// TestDaemon_TargetNeedsFullResyncTriggersFastTrack mirrors
+// TestDaemon_NeedsFullResyncTriggersFastTrack but on the TARGET side. A
+// 410 GONE on the target-delta incremental list sets
+// PerTarget[t].NeedsFullResync=true; the daemon must fold that into a
+// fast-track FullSync request rather than coasting until the periodic
+// re-sync (which is up to 24h away).
+func TestDaemon_TargetNeedsFullResyncTriggersFastTrack(t *testing.T) {
+	api := newStubAPI()
+	api.listTokens["src"] = "tok-src-1"
+	api.listTokens["tgt"] = "tok-tgt-1"
+	clock := newFakeClock(time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC))
+	d, _ := makeWritableDaemon(t, api, clock)
+
+	cancel, done := runDaemonAsync(d)
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	// FullSync fires source-list + target seed + inventory rebuilds.
+	waitFor(t, "first FullSync done", 2*time.Second, func() bool {
+		return api.listCalls.Load() >= 5 // 1 src + 1 tgt seed + 3 inventory
+	})
+
+	// Queue a 410 on the next incremental list against the TARGET. The
+	// reconciler's target-delta phase clears the target token and sets
+	// PerTarget[tgt].NeedsFullResync=true.
+	api.mu.Lock()
+	api.listIncrErrs["tgt"] = &gws.Error{Code: gws.CodeAPIGone, ExitCode: 1}
+	api.mu.Unlock()
+
+	startCalls := api.listCalls.Load()
+
+	// Advance past poll interval to trigger Tick.
+	clock.advance(120 * time.Second)
+
+	// Wait for the Tick's incremental lists to land (target-delta + source-
+	// delta both consume one tickListCalls each).
+	waitFor(t, "Tick with target-410", 2*time.Second, func() bool {
+		return api.tickListCalls.Load() >= 2
+	})
+
+	// The fast-track FullSync fires immediately (delay=0). After it lands,
+	// listCalls should have grown by enough to cover Tick (target-incr +
+	// source-incr) plus the FullSync (source-list + target seed + 3
+	// inventory rebuilds).
+	waitFor(t, "fast-track FullSync runs", 2*time.Second, func() bool {
+		return api.listCalls.Load() >= startCalls+7 // 2 tick + 5 FullSync
 	})
 }
 

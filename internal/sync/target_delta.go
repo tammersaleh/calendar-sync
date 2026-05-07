@@ -153,8 +153,11 @@ func (r *Reconciler) runTargetDeltaPhase(ctx context.Context, res *TickResult) {
 }
 
 // processTargetDeltaEvent dispatches one target-delta event through the
-// reconcile path. Skips silently for non-mirror events, mirrors with no
-// owning pdir, and the Phase 1 mirror-only-override case.
+// reconcile path. Skips silently for non-mirror events and mirrors with
+// no owning pdir. For inherited-form recurring instances whose source
+// has no override at the occurrence (404 on events.get), Phase 2
+// materializes the source override via materializeSourceOverride
+// instead of skipping.
 //
 // Routing rules (per Codex must-fix #4):
 //
@@ -321,10 +324,13 @@ func (r *Reconciler) processTargetDeltaEvent(
 	return nil
 }
 
-// emitTargetDeltaSkip emits a skip outcome for one of the target-delta
-// 404 paths (mirror_only_override or source_orphan). Wired through the
-// reconciler's Output sink so it appears in the JSONL stream alongside
-// the source-delta outcomes.
+// emitTargetDeltaSkip emits a skip outcome for the non-recurring source-
+// orphan 404 path. Wired through the reconciler's Output sink so the
+// observation appears in the JSONL stream alongside the source-delta
+// outcomes. The recurring-instance mirror-only-override case used to
+// share this helper under Phase 1; Phase 2 routes it through
+// materializeSourceOverride instead, emitting a propagate via the
+// Classifier-scoped output sink.
 func (r *Reconciler) emitTargetDeltaSkip(
 	counts *Counts,
 	mirrorEvent *gws.Event,

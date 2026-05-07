@@ -458,6 +458,23 @@ func TestTargetDeltaPhase_MirrorOnlyOverride_PromotesToPropagate(t *testing.T) {
 		t.Errorf("source patch Recurrence MUST be nil (B16 guardrail); got %v",
 			srcPatchBody.Recurrence)
 	}
+
+	// Pin the inventory write at the per-instance source tuple. Without
+	// this, a regression in materializeSourceOverride's inv.Set would not
+	// surface in any other assertion - and the failure mode is bad:
+	// next tick re-enters the Phase 2 path (mirror's calendar-sync:source
+	// still resolves to the parent, source.get on the parent+suffix still
+	// 404s if inventory hasn't moved to managed form), producing a fresh
+	// duplicate source-override every tick until a FullSync rebuilds the
+	// inventory.
+	managedTuple := mirror.SourceTuple{CalendarID: "src-A", EventID: expectedSrcInstID}
+	got, ok := r.inventories["tgt-A"].Lookup(managedTuple)
+	if !ok {
+		t.Fatalf("inventory missing managed-form entry at %+v after Phase 2", managedTuple)
+	}
+	if got.ID != post.ID {
+		t.Errorf("inventory entry id = %q, want %q (post-rewrite mirror)", got.ID, post.ID)
+	}
 }
 
 // TestTargetDeltaPhase_MirrorOnlyOverride_DoesNotIncludeRecurrenceInPatch is

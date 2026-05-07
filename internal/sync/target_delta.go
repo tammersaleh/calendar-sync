@@ -21,11 +21,12 @@ import (
 // prefix.
 var instanceSuffixRE = regexp.MustCompile(`_\d{8}T\d{6}Z$`)
 
-// reasonMirrorOnlyOverride is the skip reason emitted when a target-delta
-// event references a recurring instance the source has no override for.
-// SPEC's "Limitation: mirror-only recurring instance overrides" explains
-// why Phase 1 leaves this case alone; Phase 2 (deferred) would create the
-// source override and propagate.
+// reasonMirrorOnlyOverride is the propagate reason emitted when a target-
+// delta event references a recurring instance the source has no override
+// for. B17 Phase 2 (live as of v2.5.0) materializes the user's edit by
+// patching the constructed source-instance ID, creating the source override.
+// The reason name is preserved for stream continuity with the v2.4.0 Phase 1
+// shape (`skip(mirror_only_override)`); only the action changed.
 const reasonMirrorOnlyOverride mirror.Reason = "mirror_only_override"
 
 // reasonSourceOrphan is the skip reason emitted when a target-delta event
@@ -239,26 +240,31 @@ func (r *Reconciler) processTargetDeltaEvent(
 	sourceEvent, err := r.API.EventsGet(ctx, tuple.CalendarID, sourceEventID)
 	if err != nil {
 		if errors.Is(err, gws.ErrAPINotFound) {
-			// Two cases collapse here, both emit a skip outcome so the
-			// JSONL action stream is complete:
-			//   - source orphan (non-recurring): the source was deleted
-			//     between the last full-sync and this delta. The orphan
-			//     walk's prune pass cleans up the mirror; we only need to
-			//     surface the observation.
-			//   - mirror-only override (recurring instance): the user edited
-			//     a single occurrence on the mirror that the source has no
-			//     override for. SPEC's existing limitation; Phase 2 (deferred)
-			//     would create the source override and propagate.
-			reason := reasonSourceOrphan
+			// 404 on the source events.get splits two ways:
+			//
+			//   - Non-recurring source orphan: the source was deleted between
+			//     the last FullSync and this delta. The orphan-walk's prune
+			//     pass cleans the mirror at the next FullSync; target-delta's
+			//     job is just to surface the observation in the JSONL stream
+			//     so the action log isn't silently incomplete.
+			//
+			//   - Recurring-instance mirror-only override (B17 Phase 2): the
+			//     user edited a single occurrence on the mirror that has no
+			//     source counterpart at that occurrence. We materialize the
+			//     override on source by patching the constructed source-
+			//     instance ID with the mirror's managed fields, then rewrite
+			//     the mirror from the post-patch source state. See
+			//     materializeSourceOverride for the per-step shape and the
+			//     B16 guardrail (recurrence MUST NOT appear in the patch
+			//     body).
 			if mirrorEvent.RecurringEventID != "" {
-				reason = reasonMirrorOnlyOverride
+				return r.materializeSourceOverride(ctx, pd, mirrorEvent, tuple, sourceEventID, counts)
 			}
-			r.emitTargetDeltaSkip(counts, mirrorEvent, sourceEventID, reason, pd)
-			r.debug("sync.targetDelta: source 404; skipping",
+			r.emitTargetDeltaSkip(counts, mirrorEvent, sourceEventID, reasonSourceOrphan, pd)
+			r.debug("sync.targetDelta: source 404; non-recurring orphan skip",
 				"target", target,
 				"target_event", mirrorEvent.ID,
 				"source_event", sourceEventID,
-				"reason", string(reason),
 			)
 			return nil
 		}
@@ -384,4 +390,88 @@ func extractInstanceSuffix(mirrorID string) (string, bool) {
 		return "", false
 	}
 	return mirrorID[loc[0]:], true
+}
+
+// materializeSourceOverride is B17 Phase 2's promotion of the recurring-
+// instance mirror-only-override case from skip to propagate. The user edited
+// an occurrence on the mirror that has no source counterpart (events.get on
+// the constructed source-instance ID returned 404); this method creates the
+// source override and rewrites the mirror to reflect the post-write source
+// state.
+//
+// The flow mirrors the source-side propagate path in sync/drift.go's
+// doPropagate, with two structural differences:
+//
+//   - The patch body is built via mirror.BuildSourceOverridePatchBody (full
+//     managed fields, recurrence omitted by construction) rather than
+//     mirror.BuildPropagatePatchBody (drifted-fields subset). The source
+//     instance doesn't exist yet, so we materialize the user's full state
+//     to source rather than computing a drift diff.
+//
+//   - The outcome reason is reasonMirrorOnlyOverride rather than
+//     mirror.ReasonTargetEdited, so the JSONL stream stays self-describing
+//     about the bootstrap-from-mirror-only nature of this case.
+//
+// The B16 guardrail is structural: BuildSourceOverridePatchBody NEVER emits
+// recurrence regardless of the mirror's live recurrence value, so the
+// per-instance patch can't be reinterpreted by Google as a parent-level
+// update.
+//
+// Errors propagate up to runTargetDeltaPhase, which keeps the targetSyncToken
+// pinned so the next tick re-delivers the user's edit.
+func (r *Reconciler) materializeSourceOverride(
+	ctx context.Context,
+	pd config.PDir,
+	mirrorEvent *gws.Event,
+	tuple mirror.SourceTuple,
+	sourceInstanceID string,
+	counts *Counts,
+) error {
+	inv := r.inventories[pd.TargetCalendar]
+	classifier, _ := r.buildClassifier(pd, inv, counts)
+
+	// 1. Patch the source instance to materialize the override. The body
+	//    omits recurrence by construction (B16 guardrail).
+	patchedSource, err := r.API.EventsPatch(ctx, tuple.CalendarID, sourceInstanceID,
+		mirror.BuildSourceOverridePatchBody(mirrorEvent))
+	if err != nil {
+		return fmt.Errorf("target-delta source-override patch %s/%s: %w",
+			tuple.CalendarID, sourceInstanceID, err)
+	}
+
+	// 2. Rewrite the mirror from the post-patch source state, refreshing
+	//    calendar-sync:source_updated and (via the checksum follow-up)
+	//    calendar-sync:checksum so subsequent ticks classify as unchanged.
+	//    Use BuildInstancePayloadWithTimeZone (NOT BuildPayload): this is
+	//    always an instance, so recurrence on the rewritten mirror is nil.
+	rewritten := mirror.BuildInstancePayloadWithTimeZone(tuple.CalendarID, patchedSource, pd.TimeZone)
+	post, err := classifier.patchMirrorWithChecksum(ctx, pd.TargetCalendar, mirrorEvent.ID,
+		mirror.BuildPatchPayload(rewritten))
+	if err != nil {
+		return fmt.Errorf("target-delta source-override mirror rewrite %s/%s: %w",
+			pd.TargetCalendar, mirrorEvent.ID, err)
+	}
+
+	// 3. Update inventory at the per-instance source tuple. The override
+	//    now exists at (tuple.CalendarID, sourceInstanceID); the mirror's
+	//    calendar-sync:source updates to that managed-form tuple as part of
+	//    the BuildInstancePayload rewrite, so subsequent ticks treat the
+	//    instance as managed-form rather than inherited.
+	inv.Set(mirror.SourceTuple{CalendarID: tuple.CalendarID, EventID: sourceInstanceID}, post)
+
+	// 4. Emit the propagate outcome through the same wrapped sink the
+	//    Classifier uses, so Counts and Output get wired identically.
+	classifier.emit(Outcome{
+		Action:        mirror.ActionPropagate,
+		Reason:        reasonMirrorOnlyOverride,
+		SourceEventID: sourceInstanceID,
+		TargetEventID: post.ID,
+		Summary:       mirrorEvent.Summary,
+	})
+	r.debug("sync.targetDelta: materialized source override",
+		"target", pd.TargetCalendar,
+		"target_event", post.ID,
+		"source_event", sourceInstanceID,
+	)
+	return nil
 }

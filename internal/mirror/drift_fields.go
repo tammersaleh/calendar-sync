@@ -96,6 +96,51 @@ func recurrenceEqual(a, b []string) bool {
 	return true
 }
 
+// BuildSourceOverridePatchBody constructs the events.patch body sent to a
+// source recurring-instance ID when target-delta phase needs to materialize
+// a mirror-only override onto the source (B17 Phase 2). Differs from
+// BuildPropagatePatchBody in two structural ways:
+//
+//  1. The body carries the mirror's FULL managed fields rather than a
+//     drift-filtered subset. The source instance doesn't exist yet (we got
+//     here because events.get on the constructed source-instance ID
+//     returned 404), so there's no source-side state to merge against - the
+//     mirror's live managed fields ARE the desired source state.
+//
+//  2. The recurrence field is NEVER included by construction. This is the
+//     B16 guardrail: per-instance patches that include recurrence get
+//     reinterpreted by Google as parent-level updates, silently corrupting
+//     every future occurrence of the meeting. Omitting recurrence by
+//     construction (rather than conditionally) makes that bug class
+//     structurally impossible. A future change that "just needs to add
+//     recurrence here" must instead route through the parent's events.patch
+//     endpoint via the standard propagate path.
+//
+// Description trailer-stripping and explicit-clear semantics for empty
+// strings match BuildPropagatePatchBody so the two helpers are symmetric on
+// the user-edit-side semantics. Status is intentionally NOT set: target
+// edits don't carry status mutations through this path (a target-side
+// status change is handled by the deleteOrSkip cancellation flow).
+//
+// Reminders and ExtendedProperties are NOT set: source-side reminders are
+// the source's responsibility, and the source's extended-property namespace
+// is not ours to write into. The helper is deliberately narrow.
+func BuildSourceOverridePatchBody(live *gws.Event) *gws.PatchEvent {
+	stripped, _ := StripTrailer(live.Description)
+	body := &gws.PatchEvent{
+		Summary:      gws.PatchStr(live.Summary),
+		Description:  gws.PatchStr(stripped),
+		Location:     gws.PatchStr(live.Location),
+		Start:        live.Start,
+		End:          live.End,
+		Transparency: gws.PatchStr(live.Transparency),
+		Visibility:   gws.PatchStr(live.Visibility),
+	}
+	// body.Recurrence stays nil. Do NOT add recurrence handling here. See
+	// the doc comment above for the B16 rationale.
+	return body
+}
+
 // BuildPropagatePatchBody constructs the events.patch body sent to the source
 // when propagating mirror drift back. The body carries only the drifted
 // fields per SPEC.md "Field-level propagate" (so untouched source fields

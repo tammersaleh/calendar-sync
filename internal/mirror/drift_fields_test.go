@@ -431,3 +431,136 @@ func TestBuildPropagatePatchBody_IncludesRecurrence(t *testing.T) {
 		t.Errorf("Summary should not be set (not in drifted list); got %v", body.Summary)
 	}
 }
+
+// ---------- BuildSourceOverridePatchBody (B17 Phase 2) ----------
+//
+// BuildSourceOverridePatchBody is the per-instance variant of
+// BuildPropagatePatchBody used when target-delta phase hits a 404 on the
+// source instance lookup (Phase 2's mirror-only override path). Unlike
+// BuildPropagatePatchBody, the body is built from the mirror's full managed
+// fields (we're materializing the user's complete state to the source's
+// previously-auto-materialized occurrence), and the recurrence field is
+// NEVER included by construction.
+//
+// The recurrence omission is the B16 guardrail: Google reinterprets a
+// per-instance patch with recurrence as a parent-level update, silently
+// corrupting every future occurrence of the meeting. The helper omitting
+// recurrence by construction (rather than conditionally) makes that class
+// of bug structurally impossible.
+
+func TestBuildSourceOverridePatchBody_IncludesAllManagedFieldsExceptRecurrence(t *testing.T) {
+	// Pin every managed field appears in the body output, EXCEPT recurrence.
+	// This is what the helper has to do to materialize the user's full state
+	// onto the source's instance override.
+	live := &gws.Event{
+		Summary:      "Lunch-edited",
+		Description:  "real body\n\n---\nSource: https://www.google.com/calendar/event?eid=ABC",
+		Location:     "Cafe",
+		Start:        &gws.EventDateTime{DateTime: "2026-05-20T16:30:00Z"},
+		End:          &gws.EventDateTime{DateTime: "2026-05-20T17:30:00Z"},
+		Transparency: gws.TransparencyTransparent,
+		Visibility:   gws.VisibilityPublic,
+		Recurrence:   []string{"RRULE:FREQ=WEEKLY;COUNT=4"}, // must NOT propagate
+	}
+	body := BuildSourceOverridePatchBody(live)
+
+	if body.Summary == nil || *body.Summary != "Lunch-edited" {
+		t.Errorf("Summary = %v, want %q", body.Summary, "Lunch-edited")
+	}
+	if body.Description == nil || *body.Description != "real body" {
+		t.Errorf("Description = %v, want trailer-stripped 'real body'", body.Description)
+	}
+	if body.Location == nil || *body.Location != "Cafe" {
+		t.Errorf("Location = %v, want %q", body.Location, "Cafe")
+	}
+	if body.Start == nil || body.Start.DateTime != "2026-05-20T16:30:00Z" {
+		t.Errorf("Start = %+v", body.Start)
+	}
+	if body.End == nil || body.End.DateTime != "2026-05-20T17:30:00Z" {
+		t.Errorf("End = %+v", body.End)
+	}
+	if body.Transparency == nil || *body.Transparency != gws.TransparencyTransparent {
+		t.Errorf("Transparency = %v", body.Transparency)
+	}
+	if body.Visibility == nil || *body.Visibility != gws.VisibilityPublic {
+		t.Errorf("Visibility = %v", body.Visibility)
+	}
+	if body.Recurrence != nil {
+		t.Errorf("Recurrence MUST be omitted (B16 guardrail); got %v", body.Recurrence)
+	}
+}
+
+func TestBuildSourceOverridePatchBody_NeverIncludesRecurrence(t *testing.T) {
+	// Belt-and-suspenders: regardless of what shape the live mirror's
+	// recurrence is in (nil, empty, populated, multi-line), the output body's
+	// recurrence field stays nil. This guards against a future change adding
+	// recurrence handling to the helper - which would resurrect the B16 bug
+	// class (per-instance patch with recurrence -> Google reinterprets as
+	// parent update -> corrupts every future occurrence).
+	tests := []struct {
+		name       string
+		recurrence []string
+	}{
+		{"nil", nil},
+		{"empty", []string{}},
+		{"single RRULE", []string{"RRULE:FREQ=DAILY"}},
+		{"RRULE+EXDATE", []string{"RRULE:FREQ=DAILY", "EXDATE;TZID=UTC:20260507T120000"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			live := &gws.Event{
+				Summary:    "x",
+				Recurrence: tt.recurrence,
+			}
+			body := BuildSourceOverridePatchBody(live)
+			if body.Recurrence != nil {
+				t.Errorf("Recurrence must be nil; got %v (recurrence in: %v)",
+					body.Recurrence, tt.recurrence)
+			}
+		})
+	}
+}
+
+func TestBuildSourceOverridePatchBody_StripsTrailerFromDescription(t *testing.T) {
+	// Same trailer-stripping behavior as BuildPropagatePatchBody: the user's
+	// edit on the mirror description is the live value with the calendar-sync
+	// trailer appended; sending that to the source would snowball the trailer
+	// on the next round-trip.
+	live := &gws.Event{
+		Summary:     "Real summary",
+		Description: "user-typed body\n\n---\nSource: https://www.google.com/calendar/event?eid=ABC",
+		Start:       &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"},
+		End:         &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z"},
+	}
+	body := BuildSourceOverridePatchBody(live)
+	if body.Description == nil || *body.Description != "user-typed body" {
+		t.Errorf("Description = %v, want trailer-stripped 'user-typed body'", body.Description)
+	}
+}
+
+func TestBuildSourceOverridePatchBody_ClearsEmptyFields(t *testing.T) {
+	// Same explicit-clear semantics as BuildPropagatePatchBody: a user who
+	// erased the description on the mirror (or any string field) must reach
+	// the source as a non-nil pointer to "" so Calendar API's merge-patch
+	// semantics overwrite the existing value rather than preserve it via
+	// omitempty. Without this, a cleared mirror description would round-trip
+	// the source's stale description back onto the mirror via the post-patch
+	// rewrite.
+	live := &gws.Event{
+		Summary:     "",
+		Description: "",
+		Location:    "",
+		Start:       &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"},
+		End:         &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z"},
+	}
+	body := BuildSourceOverridePatchBody(live)
+	if body.Summary == nil || *body.Summary != "" {
+		t.Errorf("Summary must be present in patch body even when empty (clear-intent); got %v", body.Summary)
+	}
+	if body.Description == nil || *body.Description != "" {
+		t.Errorf("Description must be present in patch body even when empty (clear-intent); got %v", body.Description)
+	}
+	if body.Location == nil || *body.Location != "" {
+		t.Errorf("Location must be present in patch body even when empty (clear-intent); got %v", body.Location)
+	}
+}

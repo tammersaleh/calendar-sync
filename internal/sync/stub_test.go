@@ -329,6 +329,15 @@ func (s *stubAPI) queuePatch(e *gws.Event) {
 	s.patchResp = append(s.patchResp, e)
 }
 
+// queuePatchErr enqueues an error for the next EventsPatch call. The
+// dequeue path returns early on the error and does NOT consume the response
+// queue, so callers must not push placeholder responses alongside an error
+// (doing so would pollute later successful calls). Pair with queuePatch
+// only for tests that chain a successful patch AFTER a failed one.
+func (s *stubAPI) queuePatchErr(err error) {
+	s.patchErrors = append(s.patchErrors, err)
+}
+
 func (s *stubAPI) callsByOp(op string) []recordedCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -335,9 +335,20 @@ func TestTargetDeltaPhase_ManagedInstanceEdit(t *testing.T) {
 	}
 }
 
-// ---------- 4. Inherited recurring instance edit -> Phase 1 skip ----------
+// ---------- 4. Inherited recurring instance edit -> Phase 2 propagate ----------
 
-func TestTargetDeltaPhase_InheritedInstanceEdit_Phase1Skip(t *testing.T) {
+// TestTargetDeltaPhase_MirrorOnlyOverride_PromotesToPropagate is the Phase 2
+// happy path. A mirror has user-edited fields on a recurring instance whose
+// source has no override at that occurrence (events.get on the constructed
+// source-instance ID returns 404). Phase 2 materializes the user's edit by
+// patching the source instance with the mirror's managed fields (creating
+// the source override), then rewrites the mirror from the post-patch source
+// to refresh checksum + source_updated bookkeeping.
+//
+// Replaces the deferred Phase 1 skip: SPEC's "Limitation: mirror-only
+// recurring instance overrides" no longer applies because the override
+// propagates within one tick.
+func TestTargetDeltaPhase_MirrorOnlyOverride_PromotesToPropagate(t *testing.T) {
 	api := newStubAPI()
 	pd := makeWritablePDir("p1", "src-A", "tgt-A")
 	canonical := makeCanonical(pd)
@@ -353,6 +364,11 @@ func TestTargetDeltaPhase_InheritedInstanceEdit_Phase1Skip(t *testing.T) {
 		"Lunch", "Lunch-edited")
 	m.RecurringEventID = "mirror-parent"
 	m.OriginalStartTime = &gws.EventDateTime{DateTime: "2026-05-20T16:00:00Z"}
+	// Pin a recurrence on the live mirror to make sure the source-override
+	// patch body NEVER carries it (B16 guardrail). Production mirror
+	// instances don't have their own recurrence; including one here is
+	// defensive paranoia for the test, not a representative wire shape.
+	m.Recurrence = []string{"RRULE:FREQ=WEEKLY"}
 
 	r := newTestReconciler(api, canonical)
 	r.targetSyncTokens["tgt-A"] = "tok-tgt-old"
@@ -363,10 +379,32 @@ func TestTargetDeltaPhase_InheritedInstanceEdit_Phase1Skip(t *testing.T) {
 	api.queueListIncr("src-A", nil, "tok-src-new")
 
 	// events.get on the constructed source-instance ID returns 404
-	// (mirror-only override territory).
+	// (mirror-only override territory). Phase 2 then promotes to propagate:
 	expectedSrcInstID := "src-parent_20260520T160000Z"
 	api.queueGetErr("src-A", expectedSrcInstID,
 		&gws.Error{Code: gws.CodeAPINotFound, ExitCode: 1})
+
+	// 1. events.patch on source instance creates the override.
+	postSrcInstance := &gws.Event{
+		ID:                expectedSrcInstID,
+		RecurringEventID:  "src-parent",
+		Status:            gws.EventStatusConfirmed,
+		Summary:           "Lunch-edited",
+		Description:       "",
+		Start:             m.Start,
+		End:               m.End,
+		OriginalStartTime: &gws.EventDateTime{DateTime: "2026-05-20T16:00:00Z"},
+		Transparency:      gws.TransparencyOpaque,
+		Updated:           "2026-04-30T12:00:00Z",
+		HTMLLink:          "https://www.google.com/calendar/event?eid=ABC",
+	}
+	api.queuePatch(postSrcInstance) // source-instance create-override patch.
+	// 2. Mirror rewrite (BuildInstancePayload over post-patch source) +
+	//    checksum follow-up.
+	post := *m
+	post.Updated = "2026-04-30T12:00:01Z"
+	api.queuePatch(&post) // main mirror rewrite
+	api.queuePatch(&post) // checksum follow-up
 
 	sink, captured := captureOutputs()
 	r.Output = sink
@@ -375,21 +413,167 @@ func TestTargetDeltaPhase_InheritedInstanceEdit_Phase1Skip(t *testing.T) {
 		t.Fatalf("Tick: %v", err)
 	}
 
-	// Expect exactly one skip outcome with reason=mirror_only_override.
-	var skip *Outcome
+	// Expect a propagate outcome with reason=mirror_only_override.
+	var propagated *Outcome
 	for i := range *captured {
 		o := (*captured)[i]
-		if o.Action == mirror.ActionSkip && o.Reason == reasonMirrorOnlyOverride {
-			skip = &o
+		if o.Action == mirror.ActionPropagate && o.Reason == reasonMirrorOnlyOverride {
+			propagated = &o
 			break
 		}
 	}
-	if skip == nil {
-		t.Fatalf("expected skip(mirror_only_override); got %+v", *captured)
+	if propagated == nil {
+		t.Fatalf("expected propagate(mirror_only_override); got %+v", *captured)
 	}
-	// Token still advances - skip is success-shaped per the dispatch path.
+	if propagated.SourceEventID != expectedSrcInstID {
+		t.Errorf("SourceEventID = %q, want %q", propagated.SourceEventID, expectedSrcInstID)
+	}
+	if propagated.TargetEventID != instanceID {
+		t.Errorf("TargetEventID = %q, want %q", propagated.TargetEventID, instanceID)
+	}
+
+	// Token advanced.
 	if got := r.targetSyncTokens["tgt-A"]; got != "tok-tgt-new" {
-		t.Errorf("targetSyncTokens[tgt-A] = %q, want tok-tgt-new (skip != error)", got)
+		t.Errorf("targetSyncTokens[tgt-A] = %q, want tok-tgt-new", got)
+	}
+
+	// Pin the source-instance patch body shape: must include the user's
+	// edited summary AND must NOT carry recurrence (B16 guardrail). We find
+	// the source-side EventsPatch call by calendar+event id.
+	var srcPatchBody *gws.PatchEvent
+	for _, c := range api.callsByOp("EventsPatch") {
+		if c.CalendarID == "src-A" && c.EventID == expectedSrcInstID {
+			srcPatchBody = c.PatchBody
+			break
+		}
+	}
+	if srcPatchBody == nil {
+		t.Fatalf("expected events.patch on src-A/%s; got %+v",
+			expectedSrcInstID, api.callsByOp("EventsPatch"))
+	}
+	if srcPatchBody.Summary == nil || *srcPatchBody.Summary != "Lunch-edited" {
+		t.Errorf("source patch Summary = %v, want %q", srcPatchBody.Summary, "Lunch-edited")
+	}
+	if srcPatchBody.Recurrence != nil {
+		t.Errorf("source patch Recurrence MUST be nil (B16 guardrail); got %v",
+			srcPatchBody.Recurrence)
+	}
+}
+
+// TestTargetDeltaPhase_MirrorOnlyOverride_DoesNotIncludeRecurrenceInPatch is
+// the integration-level B16 guardrail: pin that the gws.PatchEvent reaching
+// EventsPatch has Recurrence=nil. Belt-and-suspenders alongside the
+// helper-level test (TestBuildSourceOverridePatchBody_NeverIncludesRecurrence)
+// because a future change adding recurrence handling at the call site
+// (rather than the helper) would only fail this test.
+func TestTargetDeltaPhase_MirrorOnlyOverride_DoesNotIncludeRecurrenceInPatch(t *testing.T) {
+	api := newStubAPI()
+	pd := makeWritablePDir("p1", "src-A", "tgt-A")
+	canonical := makeCanonical(pd)
+
+	instanceID := "mirror-parent_20260520T160000Z"
+	parentTupleStr := "src-A:src-parent"
+	srcInstanceID := "src-parent_20260520T160000Z"
+
+	m := makeMirrorWithUserEdit(instanceID, parentTupleStr,
+		"2026-04-29T20:00:00Z", "2026-04-30T11:00:00Z",
+		"Lunch", "Lunch-edited")
+	m.RecurringEventID = "mirror-parent"
+	m.OriginalStartTime = &gws.EventDateTime{DateTime: "2026-05-20T16:00:00Z"}
+	// EVERY shape of recurrence on the input must produce nil on the wire.
+	m.Recurrence = []string{"RRULE:FREQ=DAILY", "EXDATE;TZID=UTC:20260507T120000"}
+
+	r := newTestReconciler(api, canonical)
+	r.targetSyncTokens["tgt-A"] = "tok-tgt-old"
+	r.inventories["tgt-A"] = NewInventory("tgt-A")
+	r.syncTokens["src-A"] = "tok-src-old"
+
+	queueTargetIncrDelta(api, "tgt-A", []gws.Event{*m}, "tok-tgt-new")
+	api.queueListIncr("src-A", nil, "tok-src-new")
+	api.queueGetErr("src-A", srcInstanceID,
+		&gws.Error{Code: gws.CodeAPINotFound, ExitCode: 1})
+
+	postSrcInstance := &gws.Event{
+		ID:                srcInstanceID,
+		RecurringEventID:  "src-parent",
+		Status:            gws.EventStatusConfirmed,
+		Summary:           "Lunch-edited",
+		Start:             m.Start,
+		End:               m.End,
+		OriginalStartTime: &gws.EventDateTime{DateTime: "2026-05-20T16:00:00Z"},
+		Transparency:      gws.TransparencyOpaque,
+		Updated:           "2026-04-30T12:00:00Z",
+		HTMLLink:          "https://www.google.com/calendar/event?eid=ABC",
+	}
+	api.queuePatch(postSrcInstance)
+	post := *m
+	post.Updated = "2026-04-30T12:00:01Z"
+	api.queuePatch(&post)
+	api.queuePatch(&post)
+
+	sink, _ := captureOutputs()
+	r.Output = sink
+
+	if _, err := r.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	for _, c := range api.callsByOp("EventsPatch") {
+		if c.CalendarID != "src-A" {
+			continue
+		}
+		if c.PatchBody == nil {
+			t.Fatalf("source-side patch body nil; call=%+v", c)
+		}
+		if c.PatchBody.Recurrence != nil {
+			t.Errorf("source patch %s/%s carried recurrence (B16 guardrail breach); got %v",
+				c.CalendarID, c.EventID, c.PatchBody.Recurrence)
+		}
+	}
+}
+
+// TestTargetDeltaPhase_MirrorOnlyOverride_PatchFailureDoesNotAdvanceToken pins
+// that a source-patch failure during the Phase 2 promotion keeps the target
+// syncToken pinned so the next tick re-delivers the mirror edit. Mirrors
+// the existing TestTargetDeltaPhase_TokenStaysOnError shape (write-side
+// errors are NEVER transient per the B18 matrix).
+func TestTargetDeltaPhase_MirrorOnlyOverride_PatchFailureDoesNotAdvanceToken(t *testing.T) {
+	api := newStubAPI()
+	pd := makeWritablePDir("p1", "src-A", "tgt-A")
+	canonical := makeCanonical(pd)
+
+	instanceID := "mirror-parent_20260520T160000Z"
+	parentTupleStr := "src-A:src-parent"
+	srcInstanceID := "src-parent_20260520T160000Z"
+
+	m := makeMirrorWithUserEdit(instanceID, parentTupleStr,
+		"2026-04-29T20:00:00Z", "2026-04-30T11:00:00Z",
+		"Lunch", "Lunch-edited")
+	m.RecurringEventID = "mirror-parent"
+	m.OriginalStartTime = &gws.EventDateTime{DateTime: "2026-05-20T16:00:00Z"}
+
+	r := newTestReconciler(api, canonical)
+	r.targetSyncTokens["tgt-A"] = "tok-tgt-old"
+	r.inventories["tgt-A"] = NewInventory("tgt-A")
+	r.syncTokens["src-A"] = "tok-src-old"
+
+	queueTargetIncrDelta(api, "tgt-A", []gws.Event{*m}, "tok-tgt-new")
+	api.queueListIncr("src-A", nil, "tok-src-new")
+	api.queueGetErr("src-A", srcInstanceID,
+		&gws.Error{Code: gws.CodeAPINotFound, ExitCode: 1})
+	// Source-side patch fails with a non-transient code. Token must stay.
+	api.queuePatchErr(&gws.Error{
+		Op:       "events.patch",
+		Code:     gws.CodeAPIAuthFailed,
+		ExitCode: 2,
+	})
+
+	if _, err := r.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	if got := r.targetSyncTokens["tgt-A"]; got != "tok-tgt-old" {
+		t.Errorf("token must NOT advance on patch error; got %q want tok-tgt-old", got)
 	}
 }
 

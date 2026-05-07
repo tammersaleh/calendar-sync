@@ -9,7 +9,8 @@ calendar-sync is feature-complete on the planned scope. Recent work history:
 1. **E2E test infrastructure** (`internal/e2e/`, build tag `e2e`, run with `mise run test:e2e`). 14 scenarios against real Google Calendar, ~200s wall-clock. Auto-creates and tears down its own fixture calendars by name (`calendar-sync-e2e-source` / `calendar-sync-e2e-target`); anyone with `gws auth` can clone and run. See `doc/e2e-design.md`.
 2. **F1 + F2** (calendar refs by display summary + single-command brew upgrade). Shipped in v2.3.0.
 3. **Codex correctness pass** (v2.3.0): 7 findings addressed across 1 `feat:` (PatchEvent type) + 9 `fix:` commits.
-4. **B17 target-syncToken** (v2.4.0): target-side edits propagate within ~one tick (~60s) instead of waiting for the 24h FullSync. Per-target syncToken stream, target-delta phase before source-delta on every Tick. 19 unit tests + 1 E2E + B17 fast-follow test added this session.
+4. **B17 target-syncToken** (v2.4.0): target-side edits propagate within ~one tick (~60s) instead of waiting for the 24h FullSync. Per-target syncToken stream, target-delta phase before source-delta on every Tick.
+5. **B17 Phase 2** (v2.5.0): mirror-only recurring instance overrides now propagate. When a user edits a single occurrence of a recurring mirror with no source counterpart, the daemon creates the source-side override via `events.patch` and updates the mirror's checksum, all within a tick. Closes the last known limitation in two-way sync. New helper `mirror.BuildSourceOverridePatchBody` is structurally guarded against the B16-class trap (the helper signature can't carry recurrence; pinned by helper-level + integration-level tests).
 
 ## Versions
 
@@ -18,52 +19,46 @@ calendar-sync is feature-complete on the planned scope. Recent work history:
 - v2.1.x series: B15/B16/B18/B19/B20/B22/B23 fixes
 - v2.2.0: F1 (calendar refs by summary) + F2 (brew postflight)
 - v2.3.0: Codex correctness pass
-- **v2.4.0**: B17 target-syncToken. Shipped 2026-05-05.
+- v2.4.0: B17 Phase 1 target-syncToken. Shipped 2026-05-05.
+- **v2.5.0**: B17 Phase 2 mirror-only override propagation. Shipped 2026-05-07.
 
 ## Daemon state
 
-Daemon as of end of session (~16:00Z 2026-05-05): running v2.4.0, pid 76065, started 15:32:04Z. Two pairs: `work-personal` (tsaleh@coreweave.com → me@tammersaleh.com) and `personal-to-work` (reverse). 149 + 72 mirrors. Stderr silent since the v2.4.0 startup BuildInventory.
+Daemon as of end of session: running v2.5.0, pid 64943, started 2026-05-07T21:58:27Z. Two pairs: `work-personal` (tsaleh@coreweave.com → me@tammersaleh.com) and `personal-to-work` (reverse). Just bounced via the F2 postflight; FullSync still warming up at end-of-session, so the IPC `mirrors` count was still 0 in the snapshot — expected, populates within minutes of the first FullSync completing per the integration test pinned in `TestDaemon_StartupFullSyncPopulatesSnapshot`.
 
-## Open question: IPC status was empty for the first ~23 minutes after v2.4.0 startup
+## v2.4.0 startup IPC observation (still open, but lower priority)
 
-After `brew upgrade` to v2.4.0, the daemon ran cleanly per stderr (BuildInventory complete at 15:32:38Z, no warnings since), and `_meta` lines streamed to stdout per tick. But `calendar-sync status` reported `mirrors:0` and omitted `last_full_sync_at`, `last_tick_at`, `last_tick_status` for ~23 minutes. Around 15:55:49Z those fields populated correctly and have stayed that way.
+After the v2.4.0 upgrade earlier this week, the daemon ran cleanly per stderr but `calendar-sync status` reported empty `last_full_sync_at`/`last_tick_at`/`mirrors` for ~23 minutes before populating. The follow-up daemon-level integration test (`TestDaemon_StartupFullSyncPopulatesSnapshot`, commit `6fcb0cd`) drives a real `Daemon.Run` end-to-end and the snapshot fields populate correctly — so the in-process path is sound. The production observation was likely environmental (slow real-clock gws calls, a launchd startup race, or similar).
 
-Curious: when the IPC eventually populated (`last_full_sync_at = 15:55:49Z`), no fresh BuildInventory entries appeared in stderr. That implies either (a) `recordFullSync` was called from a non-FullSync path (no caller of that exists in the code), or (b) the FullSync ran but its `BuildInventory` calls didn't log - which contradicts `inventory.go:219`'s unconditional `if log != nil` log emission.
-
-A daemon-level integration test (`TestDaemon_StartupFullSyncPopulatesSnapshot`, commit `6fcb0cd`) now drives a real `Daemon.Run` end-to-end and asserts the snapshot fields populate after the startup FullSync. The test PASSES, which means the in-process `runFullSync → recordFullSync → snapshot → IPC` path is correct. The production observation was therefore likely environmental (slow real-clock gws calls, a launchd startup/restart race, or similar) rather than a code bug. The test guards against a real future regression in this path.
-
-For now: daemon IS functioning - mirrors maintained, stderr clean, target-edit propagation working in real-time. If the IPC empty-field window recurs after a future daemon restart, that's worth investigating further; the integration test would have caught a code-level cause.
+If the empty-window pattern recurs after the v2.5.0 bounce or any future upgrade, that's the signal to dig deeper. Otherwise, treat as a one-off.
 
 ## What's left
 
-### 1. Watch v2.4.0 for a quiet week
+### 1. Watch v2.5.0 for a quiet week
 
-Per next.md history's deletion criteria: when v2.4.0 has run a quiet week without target-edit-related anomalies, the B17 backlog file (`backlog/B17-target-syncToken.md`) is safe to delete. Earliest delete-by date: 2026-05-12.
+After a quiet week of v2.4.0 + v2.5.0 in production with no target-edit-related anomalies, `backlog/B17-target-syncToken.md` is safe to delete. Earliest delete-by date (counting from v2.5.0): 2026-05-14.
 
-Active monitoring should look for:
-- `propagate` outcomes (target-delta phase firing on real edits) - confirms B17 working in production.
-- `target_sync_token` related warnings - none expected.
-- The ~23min IPC blank window from this session's startup - did this reproduce after any later daemon restart?
+Active monitoring:
+- `propagate(mirror_only_override)` outcomes — confirms Phase 2 working in production. Most users won't see any until they actually drag a recurring instance on the mirror; the existing 5/20 Lunch & Reading instance is presumably stable now.
+- `target_sync_token` related warnings — none expected.
+- Any patch on the source side that produces a recurrence-bearing body for a per-instance ID — would be the canary for a B16-class regression in the new helper. The `BuildSourceOverridePatchBody` signature makes this structurally impossible, but worth watching if the daemon does anything weird around recurring instances.
 
-### 2. Phase 2 of B17 (deferred, may not ship)
-
-`backlog/B17-target-syncToken.md` documents Phase 2: when target-delta hits a `source_orphan` (404 on `events.get` for the source instance), automatically create the source override via `events.patch` so the user's mirror-only edit propagates instead of being skipped.
-
-Today's Phase 1 emits `skip(reason=mirror_only_override)` for this case. SPEC §"Limitation: mirror-only recurring instance overrides" already documents this as a known limitation.
-
-Recommend: leave Phase 2 deferred until you observe the limitation actually hurting in practice.
-
-### 3. Upstream blocker for retry-after honoring
+### 2. Upstream blocker for retry-after honoring
 
 `internal/gws/retry.go` has a comment pointing at `googleworkspace/cli#777`. The gws CLI doesn't expose `Retry-After` in its error envelope, so calendar-sync's retry layer can't honor it. Two-line change in retry.go once the upstream lands.
 
-### 4. Backlog files
+### 3. Backlog files
 
-`backlog/B17-target-syncToken.md` is now stale (B17 shipped). Per the design doc's last section: safe to delete after a quiet week of v2.4.0 in production. `backlog/` is otherwise empty.
+`backlog/B17-target-syncToken.md` is now stale (B17 Phase 1 + Phase 2 both shipped). Per the design doc's last section: safe to delete after a quiet week. `backlog/` is otherwise empty.
 
-## This session's commits
+## This session's commits (across two days)
 
 ```
+7d7ac7f docs: drop Phase 1 references from target_delta.go comments
+6fd6ca1 test: assert inventory write in B17 Phase 2 happy path
+84c7aff docs: SPEC and bugs.md updates for B17 Phase 2
+0e38824 feat: B17 Phase 2 propagate mirror-only recurring instance overrides
+1a2a21b docs: next.md - integration test gap closed; remove dry-run.err artifact
 6fcb0cd test: pin daemon-IPC integration after startup FullSync
 8140518 docs: update next.md handoff after v2.4.0 ship
 3c42af8 test: cover empty-nextToken branch in runTargetDeltaPhase
@@ -71,7 +66,7 @@ Recommend: leave Phase 2 deferred until you observe the limitation actually hurt
 e258a63 chore: pass release PR JSON via env to bash auto-merge step
 ```
 
-The workflow fix (e258a63) was needed because release-please's auto-merge step embedded the PR JSON inside a bash single-quoted string, and v2.4.0's changelog had "don't" in two commit messages. The apostrophe broke the surrounding quotes, then markdown-link parens broke the parser. Fixed by passing the JSON via env var. PR #19 had to be manually merged for v2.4.0 to ship.
+The workflow fix (`e258a63`) was needed because release-please's auto-merge step embedded the PR JSON inside a bash single-quoted string, and v2.4.0's changelog had "don't" in two commit messages. The apostrophe broke the surrounding quotes, then markdown-link parens broke the parser. Fixed by passing the JSON via env var. PR #19 had to be manually merged for v2.4.0 to ship; PR #20 (v2.5.0) auto-merged cleanly, confirming the fix.
 
 ## Out of scope (per prior next.md history; nothing changed)
 
@@ -89,12 +84,16 @@ These are recent additions that shape what's possible:
 
 - **`Reconciler.targetSyncTokens`** (B17, v2.4.0): per-target syncToken map alongside the existing per-source one. Seeded BEFORE inventory rebuild on FullSync (critical ordering). Target-delta phase runs BEFORE source-delta on every Tick (critical ordering). Both invariants pinned by tests.
 
+- **`mirror.BuildSourceOverridePatchBody`** (B17 Phase 2, v2.5.0): produces the per-instance source-override patch body. Takes `*gws.Event`, not a `driftedFields []string` slice — recurrence is omitted by construction so a future change can't opt it in. This is the B16 guardrail; pinned by `TestBuildSourceOverridePatchBody_NeverIncludesRecurrence` (helper-level) + `TestTargetDeltaPhase_MirrorOnlyOverride_DoesNotIncludeRecurrenceInPatch` (integration-level, inspects the actual `gws.PatchEvent` reaching the stub).
+
+- **`Reconciler.materializeSourceOverride`** (B17 Phase 2, v2.5.0): the new write path that creates source-side instance overrides. Reuses the Classifier-scoped `patchMirrorWithChecksum` helper rather than duplicating it. Flow: patch source instance → rewrite mirror via `BuildInstancePayload(post-patch source)` + checksum follow-up → `inv.Set` at the per-instance source tuple → emit `propagate(mirror_only_override)`. The inventory write IS load-bearing — without it, the next tick would re-enter Phase 2 and create duplicate source overrides every tick. Pinned by the inventory assertion in `TestTargetDeltaPhase_MirrorOnlyOverride_PromotesToPropagate`.
+
 - **E2E harness conventions** (`internal/e2e/harness_test.go`): `Setup(t, SetupOptions{...})` returns a `*Harness` with calendars provisioned. `t.Cleanup` wipes events + tears down. `startWatch(t, h)` for daemon-mode scenarios; `h.Run(ctx, ...)` for one-shot. `OutcomeMatch` filtered by `SourceEvent` to ignore tombstone noise from prior tests.
 
 - **`CalendarRef`** (`internal/config/types.go`, v2.2.0): `source` and `target` accept either a TOML string OR an inline table `{summary = "...", account = "..."}`. Match against `summaryOverride` (user-visible name) with fallback to raw `summary`. Account disambiguation prefers `dataOwner` equality, falls back to ID-substring.
 
-- **Release workflow shell-safety** (this session): `.github/workflows/release.yml` passes the release PR JSON via env var, not direct `${{ }}` interpolation. Required because changelog bodies include commit messages that may contain apostrophes (or other shell-special characters).
+- **Release workflow shell-safety**: `.github/workflows/release.yml` passes the release PR JSON via env var, not direct `${{ }}` interpolation. Required because changelog bodies include commit messages that may contain apostrophes (or other shell-special characters). v2.5.0's auto-merge of PR #20 confirmed the fix.
 
 ## When this file becomes useless
 
-When v2.4.0 has run a quiet week, AND the gws Retry-After upstream issue is closed, AND the IPC startup quirk is either reproduced+fixed or confirmed environmental, delete this file. History lives in `doc/bugs.md`; design context in `SPEC.md` and `CLAUDE.md`; backlog architecture in `backlog/B17-target-syncToken.md` (until that's deleted too).
+When v2.5.0 has run a quiet week, AND the gws Retry-After upstream issue is closed, AND the v2.4.0 IPC startup observation has not recurred after any subsequent daemon restart, delete this file. History lives in `doc/bugs.md`; design context in `SPEC.md` and `CLAUDE.md`; backlog architecture in `backlog/B17-target-syncToken.md` (until that's deleted too).

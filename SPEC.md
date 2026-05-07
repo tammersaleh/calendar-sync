@@ -12,7 +12,7 @@ For each user-declared pair of calendars, calendar-sync mirrors busy events from
 - **State on events. State in memory. Nothing on disk except config.** Mirror provenance lives in `extendedProperties.private` on each mirror event. Sync tokens, mirror inventories, and reconciliation state live in process memory and are rebuilt on a cold start. The only file under `~/.config/calendar-sync/` is `config.toml`.
 - **Single-process serialization.** Because the daemon is a single long-running process, there's no overlap window and no need for advisory locks. Manual `calendar-sync run` invocations refuse if the daemon is reachable via its IPC socket (regardless of how it was started). Deterministic mirror event IDs provide additional protection against the racey case where a daemon starts mid-`run`.
 - **Idempotent.** Reconciliation logic is keyed on stable identifiers (source event IDs, mirror checksum/source_updated). A daemon crash mid-sync or a cold restart re-derives the same state from Google.
-- **Edits flow both ways.** Source edits flow to the mirror (always). Mirror edits flow back to the source if the source is writable; otherwise the mirror is reverted to the source's values on the next sync cycle. The decision is determined by the source calendar's `accessRole` at config-load time. Read-only sources (subscribed iCal feeds, holiday calendars, `accessRole=reader` shares) are never written to. One carve-out: a user-created override on a recurring mirror with no source counterpart at the same recurrence time (i.e. the user dragged one occurrence to a different time on the mirror, and the source has no override at that occurrence) is not reconciled - see "Limitation: mirror-only instance overrides" below for the rationale.
+- **Edits flow both ways.** Source edits flow to the mirror (always). Mirror edits flow back to the source if the source is writable; otherwise the mirror is reverted to the source's values on the next sync cycle. The decision is determined by the source calendar's `accessRole` at config-load time. Read-only sources (subscribed iCal feeds, holiday calendars, `accessRole=reader` shares) are never written to. Recurring instance overrides created on the mirror side with no source counterpart at the same recurrence time (i.e. the user dragged one occurrence to a different time on the mirror, and the source has no override at that occurrence) are propagated by materializing the override on the source - see "Mirror-only recurring instance override propagation" below.
 
 ## Architecture
 
@@ -572,7 +572,7 @@ A given `reason` is paired with one of six `action` values: `insert`, `patch`, `
 | `migration_upgrade`        | `patch`                     | A legacy mirror (v1 or v2) with no source change and no drift, re-written at the current `version` with a fresh `calendar-sync:checksum`. One-time per pre-existing mirror. |
 | `inherited_upgrade`        | `patch`                     | A recurring-instance mirror auto-materialized by Google from a parent we wrote, with no actual drift, re-written so the instance carries per-instance `calendar-sync:source` and `:checksum`. One-time per inherited instance. See "Inherited recurring-instance handling". |
 | `orphaned`                 | `delete`                    | Prune pass found a mirror whose source no longer exists.                                                                                 |
-| `mirror_only_override`     | `skip`                      | Target-delta saw a recurring instance whose source has no override at that occurrence. Phase 1 limitation; SPEC §"Limitation: mirror-only recurring instance overrides" + B17 Phase 2 follow-up. |
+| `mirror_only_override`     | `propagate`                 | Target-delta saw a recurring instance whose source has no override at that occurrence; the daemon materialized the override on source by patching the constructed source-instance ID. See §"Mirror-only recurring instance override propagation". |
 | `source_orphan`            | `skip`                      | Target-delta event references a source that no longer exists. The orphan-walk's existing prune pass cleans the mirror; target-delta's job is just to surface the observation. |
 
 Server-side `eventTypes` filtering means events of excluded types (`birthday`, `fromGmail`, `workingLocation`) never appear on the wire and so don't produce a `skip` event.
@@ -1047,7 +1047,7 @@ Every `poll_interval`, the internal scheduler fires the per-tick path.
      - **Managed form** (`source_event_id` already has the `_<UTC>` suffix): use it directly.
      - **Inherited form** (`source_event_id` is the source PARENT id without suffix): construct the source-instance id as `source_event_id + suffix`, where `suffix` is the `_<UTC>` portion of `E.id`.
      - `events.get(source_cal, source_instance_id)` and dispatch through the Classifier (which routes recurring instances to the recurring handler at step 2 of classification).
-   - 404 on the source `events.get`: for non-recurring or parents, treat as a future orphan-walk concern and skip; for recurring instances, this is **mirror-only override** territory and Phase 1 emits `skip(reason=mirror_only_override)` (see "Limitation: mirror-only recurring instance overrides").
+   - 404 on the source `events.get`: for non-recurring or parents, treat as a future orphan-walk concern and emit `skip(reason=source_orphan)`; for recurring instances, this is **mirror-only override** territory - patch the constructed source-instance ID with the mirror's managed fields (recurrence omitted; see "Mirror-only recurring instance override propagation"), rewrite the mirror from the post-patch source state, and emit `propagate(reason=mirror_only_override)`.
    - 410 GONE on the target-syncToken stream: clear `targetSyncToken[T]`, surface `NeedsFullResync=true` for `T`, skip the rest of this phase for `T`. The next FullSync re-seeds.
    - Token advancement: replace `targetSyncToken[T]` with the response's `nextSyncToken` only if every event in the delta was processed without error. Errors leave the token unchanged so the next tick re-delivers.
 
@@ -1118,13 +1118,12 @@ Step 5 closes the gap that the per-tick path can't: incremental deltas via `sync
 What this catches:
 
 - **Horizon ingress.** Events that crossed into `[now, now + horizon]` simply by passage of time, without changing. Incremental sync wouldn't return them; full sync does.
-- **Mirror drift on currently-eligible source events.** A user edited a mirror but its source hasn't changed since the last delta. Most cases are also caught at tick granularity by the per-tick target-delta phase (B17), but full sync visits every source event regardless and remains the safety net for cases the target-delta path can't reach (e.g. parent-induced inherited instance reshapes, mirror-only overrides per "Limitation: mirror-only recurring instance overrides").
+- **Mirror drift on currently-eligible source events.** A user edited a mirror but its source hasn't changed since the last delta. Most cases are also caught at tick granularity by the per-tick target-delta phase (B17), including mirror-only recurring instance overrides (the target-delta phase materializes the source override on the spot - see §"Mirror-only recurring instance override propagation"). Full sync remains the safety net for cases the target-delta path can't reach (e.g. parent-induced inherited instance reshapes).
 - **Orphans.** Mirrors whose source was deleted, moved beyond horizon, or made ineligible (transparency, declined, tentative) while the daemon was down. The orphan walk in step 5 handles these.
 - **`accessRole` changes on calendars.** Step 1 re-fetches access roles. A target that lost writer access stops accepting writes; a source that gained writer access starts having its mirror drift propagated.
 
 What this does NOT catch (still documented limitations):
 
-- **Mirror-only recurring instance overrides** (a user-created override at a recurrence time the source has no override for). See the dedicated limitation section.
 - **Config changes.** Editing `config.toml` while the daemon is running has no effect; restart the daemon (`calendar-sync uninstall && calendar-sync install`) for changes to take effect.
 
 After each full re-sync the in-memory inventories are replaced atomically.
@@ -1204,21 +1203,23 @@ In both cases the action JSON includes a `fields` array listing the drifted fiel
 {"action":"revert","pair":"tripit-personal","direction":"a_to_b","source_event":"xyz","target_event":"def","reason":"target_edited","fields":["summary"]}
 ```
 
-### Limitation: mirror-only recurring instance overrides
+### Mirror-only recurring instance override propagation
 
-If a user moves or cancels an *individual occurrence* of a recurring mirror (creating an override on the mirror side that has no source counterpart), the daemon does not currently propagate the change. The B17 target-delta phase detects the edit (it shows up in the per-target events.list delta) but the dispatch's `events.get` against the source instance returns 404 - there's no existing source override to drive the propagate path against. Phase 1 of B17 emits `skip(reason=mirror_only_override)` for the JSONL stream and stops there.
+If a user moves or cancels an *individual occurrence* of a recurring mirror (creating an override on the mirror side that has no source counterpart), the B17 target-delta phase detects the edit and materializes the override on the source. The phase's `events.get` against the constructed source-instance ID returns 404 (no source override yet); the daemon then issues `events.patch(source_calendar, source_instance_id, body)` where `body` carries the mirror's managed fields with `recurrence` omitted. Calendar API treats the patch on a previously-auto-materialized occurrence as override creation, so the source ends up with the user's edited values. The daemon then rewrites the mirror from the post-patch source state and runs the standard checksum follow-up so subsequent ticks classify as `unchanged`.
 
-Why Phase 1 stops:
+The action shape: `propagate(reason=mirror_only_override)`. The reason name is preserved for stream continuity with the v2.4.0 Phase 1 shape (`skip(mirror_only_override)`); only the action changed.
 
-- The classification logic iterates over source events; with no corresponding source override at the same `originalStartTime`, there's nothing to compare against from the source-delta side.
-- Listing all materialized instances on the mirror side via `events.instances` doesn't cleanly distinguish user-modified overrides from auto-generated occurrences without round-trip comparison against the parent's RRULE projection - and Google does not document a "delete this override to restore the auto-generated occurrence" semantic, so a `revert` primitive isn't safely available.
-- Drift on the recurring **parent** itself (summary, description, start/end, recurrence rule, etc.) IS detected by the standard reconciliation path. Drift on instances that the source also overrides IS detected by the recurring-instance handler.
+#### Why `recurrence` MUST be omitted from the patch body
 
-Phase 2 (deferred): when the source-instance `events.get` returns 404, `events.patch` the source PARENT'S occurrence (creating the source override) with the mirror's managed fields minus `recurrence`, then re-fetch and dispatch normally. This introduces a new source-side write path and is gated on user demand.
+Google's events API reinterprets a per-instance patch that includes `recurrence` as a parent-level update. A mirror instance whose live `Recurrence` field happens to carry the parent's RRULE (e.g. through a marshalling round-trip) would, if forwarded verbatim, silently overwrite the parent's recurrence rule and corrupt every future occurrence. This is the exact bug class B16 fixed. The patch body is built via `mirror.BuildSourceOverridePatchBody`, which omits `recurrence` by construction (not conditionally). A future change adding recurrence handling at this site would resurrect the bug class and is structurally rejected by the helper's signature - the helper takes `*gws.Event` (not a "drifted fields" slice) so there's no mechanism to flag recurrence as eligible for inclusion.
 
-Consequence: until Phase 2 ships, a mirror-only instance override persists until either (a) the source's parent recurrence changes (which triggers a parent re-reconciliation, but doesn't directly clean up the override), (b) the user manually deletes it, or (c) the user runs `calendar-sync mirror prune <calendar> --pair <name>` to remove all of that pdir's mirrors and let them regenerate.
+#### What still falls back to FullSync
 
-The standard drift detection covers parents and source-corresponding instances, which together cover the vast majority of practical edits.
+- The target-delta phase only sees mirrors that show up in the per-target `events.list` delta. Mirrors whose target-side edits landed before B17's per-target syncToken existed (or before the daemon installed B17) are caught at the next FullSync's source-list pass via the standard recurring-instance drift matrix.
+- Out-of-horizon overrides: `events.list` with `syncToken` rejects time-window filters, so a target-delta event past `now+horizon` reaches `processTargetDeltaEvent`; the dispatch falls through to the recurring handler, which applies the same horizon eligibility check the source-delta path uses.
+- Source-side cancellation while the daemon is down: a source instance cancelled offline while the user simultaneously edited the mirror is reconciled by the next FullSync's orphan walk, not the target-delta phase.
+
+The standard drift detection covers parents and source-corresponding instances; the target-delta phase covers mirror-only overrides; FullSync remains the safety net.
 
 ### Mirror event payload (insert and patch)
 
@@ -1352,9 +1353,9 @@ The mirror payload for an instance patch (used by `patch`, `revert`, and the pos
 
 The checksum on a mirror instance is computed over the same managed fields as on a non-recurring event, with `recurrence` always omitted.
 
-#### Mirror-only instance overrides (limitation)
+#### Mirror-only instance overrides
 
-If the user creates an override on the mirror side with no source counterpart (e.g. dragging one occurrence of a recurring mirror to a new time), the daemon does not reconcile it. See "Limitation: mirror-only recurring instance overrides" in the Sync Algorithm section for the full justification. Drift on the recurring parent and on instances that the source also overrides is fully detected.
+If the user creates an override on the mirror side with no source counterpart (e.g. dragging one occurrence of a recurring mirror to a new time), the target-delta phase materializes the override on the source by patching the constructed source-instance ID with the mirror's managed fields. See "Mirror-only recurring instance override propagation" in the Sync Algorithm section for the full shape and the B16 guardrail rationale (recurrence MUST NOT appear in the patch body).
 
 #### What this handler does *not* cover
 
@@ -1551,7 +1552,6 @@ The following are intentionally not part of this version. None require structura
 - **Multi-account support.** calendar-sync uses whatever account `gws auth status` reports. No `[accounts.<name>]` config table, no `--account` flag. Users with calendars across multiple Google accounts share calendars between accounts (Google Calendar's sharing UI) so a single `gws`-authenticated account has access to everything.
 - **Webhook push notifications via `events.watch`.** Requires a verified HTTPS domain in Google Search Console and a publicly-reachable always-on endpoint. Doesn't fit a laptop deployment. Polling with `syncToken` gets near-real-time latency at low API cost on a long-running daemon, which is sufficient.
 - **Per-pair redaction modes.** Mirror events copy source title and description verbatim. There are no `title_template`, `redact_description`, or similar config knobs. Users who need redaction control writer access to the destination calendar instead.
-- **Mirror-only recurring instance overrides (Phase 2).** A user dragging one occurrence of a recurring mirror to a different time creates an override the source doesn't have. B17 Phase 1 detects the edit at tick rate and emits `skip(reason=mirror_only_override)` but doesn't propagate; Phase 2 (deferred) would create the source override and propagate. Workaround until Phase 2: `calendar-sync mirror prune <calendar> --pair <name>` and let the next sync regenerate. See "Limitation: mirror-only recurring instance overrides" in Sync Algorithm.
 - **Parallel pdir execution.** Each tick processes pdirs sequentially. Wall-clock cost is dominated by Google API latency, not local CPU; parallelism would reduce latency at the cost of complexity.
 - **Multi-machine sync coordination.** A single user running `watch` on multiple machines simultaneously would have both machines making redundant API calls. Don't do this; pick one host. There's no state arbitration to make multi-host correct.
 - **Linux/Windows.** `install`/`uninstall` write a launchd plist; running on non-Darwin platforms exits with `not_macos`. The sync engine itself is portable Go and could be built on Linux for ad-hoc `run` invocations, but no service-installation story is provided for non-macOS hosts.

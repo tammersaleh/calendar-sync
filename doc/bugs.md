@@ -55,24 +55,41 @@ Phase 1 fix adds a per-target `targetSyncToken` stream and a target-delta phase 
 - Recurring-instance dispatch handles both managed form (calendar-sync:source already has `_<UTC>` suffix) and inherited form (parent's id, no suffix - the case that bit B16). Inherited form computes source_instance_id by appending the suffix parsed from the mirror's own id via regex `_\d{8}T\d{6}Z$`.
 - 410 GONE clears the per-target token and surfaces `NeedsFullResync` so the next FullSync re-seeds.
 
-Phase 1 explicitly defers the mirror-only-override case: when the source-instance `events.get` returns 404, emit `skip(reason=mirror_only_override)` and stop. SPEC's existing "Limitation: mirror-only recurring instance overrides" section covers this. Phase 2 would create the source override via patch-of-source-parent's-occurrence and propagate normally.
+Phase 1 (v2.4.0) deferred the mirror-only-override case: when the source-instance `events.get` returned 404, the dispatch emitted `skip(reason=mirror_only_override)` and stopped. Phase 2 (v2.5.0) promotes that branch to a real propagate.
+
+Phase 2 fix:
+
+- New helper `mirror.BuildSourceOverridePatchBody(*gws.Event) *gws.PatchEvent`. Carries the mirror's full managed fields (summary/description/location/start/end/transparency/visibility) with the description trailer stripped and explicit-clear semantics for empty strings. Recurrence is omitted by construction - the helper takes `*gws.Event` (not a "drifted fields" slice) so there's no mechanism for a future change to opt recurrence in. This is the structural B16 guardrail: a per-instance patch carrying recurrence gets reinterpreted by Google as a parent-level update and silently corrupts every future occurrence.
+- `Reconciler.materializeSourceOverride` replaces the recurring-instance 404 skip branch. Calls `events.patch(source_calendar, source_instance_id, BuildSourceOverridePatchBody(mirror))` to create the override, then rewrites the mirror via `BuildInstancePayloadWithTimeZone(post-patch source)` + checksum follow-up so subsequent ticks classify as `unchanged`. Inventory updates at the per-instance source tuple (the override now exists at `(tuple.CalendarID, source_instance_id)`; the mirror's `calendar-sync:source` upgrades from inherited form to managed form as part of the rewrite).
+- Outcome shape changed: `skip(mirror_only_override)` -> `propagate(mirror_only_override)`. Reason name preserved for stream continuity.
+- Source-side patch failures keep the `targetSyncToken` pinned (write errors are never transient per the B18 matrix), so the next tick re-delivers the user's edit.
 
 Test pins (`internal/sync/target_delta_test.go`):
-- `TestTargetDeltaPhase_NonRecurringEdit` - non-recurring target edit propagates.
-- `TestTargetDeltaPhase_RecurringParentEdit` - recurring parent edit propagates.
-- `TestTargetDeltaPhase_ManagedInstanceEdit` - managed-form recurring instance edit propagates via the recurring handler.
-- `TestTargetDeltaPhase_InheritedInstanceEdit_Phase1Skip` - inherited-form recurring instance edit hits 404 on source-instance lookup and emits `skip(mirror_only_override)`.
-- `TestTargetDeltaPhase_SelfWriteSuppression` - post-write delta of an unchanged mirror classifies as `unchanged`, no extra patches.
-- `TestTargetDeltaPhase_InheritedAutoMaterializedNoUserEdit` - inherited auto-materialized instance routes through B15's bootstrap path (`inherited_upgrade`), no source-side patch.
-- `TestTargetDeltaPhase_NotMirror` / `TestTargetDeltaPhase_NoOwningPdir` - skips silently.
-- `TestTargetDeltaPhase_NonWritableTarget` - target with no writable-source pdir is never listed.
-- `TestTargetDeltaPhase_410Recovery` - clears the target token, surfaces NeedsFullResync.
-- `TestTargetDeltaPhase_TokenAdvancementOnSuccess` / `TestTargetDeltaPhase_TokenStaysOnError` - conditional advancement.
-- `TestSeedTargetSyncTokens_RunsBeforeInventoryRebuild` - phase ordering pinned via the recorded-call log.
-- `TestTickPhaseOrdering_TargetBeforeSource` - target-delta runs before source-delta in `Tick`.
-- `TestTick_PropagatesTargetEdit_OneTick` - regression: full-sync, then user edit on target, then Tick - propagate within a single tick.
+- Phase 1 (v2.4.0):
+  - `TestTargetDeltaPhase_NonRecurringEdit` - non-recurring target edit propagates.
+  - `TestTargetDeltaPhase_RecurringParentEdit` - recurring parent edit propagates.
+  - `TestTargetDeltaPhase_ManagedInstanceEdit` - managed-form recurring instance edit propagates via the recurring handler.
+  - `TestTargetDeltaPhase_NonRecurringSourceOrphanEmitsSkip` - non-recurring 404 still emits `skip(source_orphan)`.
+  - `TestTargetDeltaPhase_SelfWriteSuppression` - post-write delta of an unchanged mirror classifies as `unchanged`, no extra patches.
+  - `TestTargetDeltaPhase_InheritedAutoMaterializedNoUserEdit` - inherited auto-materialized instance routes through B15's bootstrap path (`inherited_upgrade`), no source-side patch.
+  - `TestTargetDeltaPhase_NotMirror` / `TestTargetDeltaPhase_NoOwningPdir` - skips silently.
+  - `TestTargetDeltaPhase_NonWritableTarget` - target with no writable-source pdir is never listed.
+  - `TestTargetDeltaPhase_410Recovery` - clears the target token, surfaces NeedsFullResync.
+  - `TestTargetDeltaPhase_TokenAdvancementOnSuccess` / `TestTargetDeltaPhase_TokenStaysOnError` - conditional advancement.
+  - `TestSeedTargetSyncTokens_RunsBeforeInventoryRebuild` - phase ordering pinned via the recorded-call log.
+  - `TestTickPhaseOrdering_TargetBeforeSource` - target-delta runs before source-delta in `Tick`.
+  - `TestTick_PropagatesTargetEdit_OneTick` - regression: full-sync, then user edit on target, then Tick - propagate within a single tick.
+- Phase 2 (v2.5.0):
+  - `TestTargetDeltaPhase_MirrorOnlyOverride_PromotesToPropagate` - inherited-form recurring instance edit, source 404, daemon materializes the override and emits `propagate(mirror_only_override)`. Pins the source-patch body's `Recurrence=nil` (B16 guardrail).
+  - `TestTargetDeltaPhase_MirrorOnlyOverride_DoesNotIncludeRecurrenceInPatch` - integration-level B16 guardrail: regardless of the mirror's live `Recurrence`, the source-side patch body's `Recurrence` field stays nil.
+  - `TestTargetDeltaPhase_MirrorOnlyOverride_PatchFailureDoesNotAdvanceToken` - source-patch failure pins `targetSyncToken` so the next tick re-delivers.
+- Helper-level tests (`internal/mirror/drift_fields_test.go`):
+  - `TestBuildSourceOverridePatchBody_IncludesAllManagedFieldsExceptRecurrence`
+  - `TestBuildSourceOverridePatchBody_NeverIncludesRecurrence` (table: nil / empty / single RRULE / RRULE+EXDATE)
+  - `TestBuildSourceOverridePatchBody_StripsTrailerFromDescription`
+  - `TestBuildSourceOverridePatchBody_ClearsEmptyFields`
 
-SPEC §"In-memory state", §"Daemon lifecycle: startup" (step 5a), §"Daemon lifecycle: per-tick reconciliation" (step 0), §"What full re-sync catches", and §"Limitation: mirror-only recurring instance overrides" updated with the new phase + Phase 2 deferral note.
+SPEC §"In-memory state", §"Daemon lifecycle: startup" (step 5a), §"Daemon lifecycle: per-tick reconciliation" (step 0), §"What full re-sync catches", §"Mirror-only recurring instance override propagation" (replaces the prior "Limitation" section), and the §"Edits flow both ways" carve-out updated with Phase 2's behavior. The "Out of scope" Phase 2 deferral bullet was removed.
 
 ### B19 - stale inventory after partial recurring-instance repair-path failure
 

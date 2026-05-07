@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.5.0](https://github.com/tammersaleh/calendar-sync/compare/v2.4.0...v2.5.0) (2026-05-07)
+
+
+### Features
+
+* B17 Phase 2 propagate mirror-only recurring instance overrides ([0e38824](https://github.com/tammersaleh/calendar-sync/commit/0e38824a4a1f79eaa274dbc29f16d235cdf9a072))
+
 ## [2.4.0](https://github.com/tammersaleh/calendar-sync/compare/v2.3.0...v2.4.0) (2026-05-05)
 
 

@@ -6,6 +6,7 @@ Google Calendar event mirroring tool. Replaces the calendar-syncing piece of Rec
 
 Work is driven by `SPEC.md`. Every change - feature, bug fix, perf fix, refactor - follows the same workflow. No shortcuts for "small" fixes:
 
+0. **Check CI before starting any work.** Run `gh run list --workflow=ci.yml --limit 3` and `gh run list --workflow=release.yml --limit 3` (or the equivalent `gh pr checks` for an open release PR). If a recent run is failing or in progress with errors, STOP and ask the user whether to fix that first before proceeding with the new task. Don't stack new work on top of a broken pipeline - a failing release workflow blocks shipment, and a failing CI signals a regression worth understanding before adding more changes.
 1. Read `SPEC.md` for the relevant command/feature. Also check `doc/progress.md` if it exists; it captures handoff state from prior autonomous sessions.
 2. Create a feature branch off main (or work directly on main for hot fixes - still follow every other step).
 3. Red-green-refactor: write failing tests first, then implement, then clean up. See "Implementation strategy" below for how to spawn the implementation work.

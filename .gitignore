@@ -19,10 +19,17 @@
 # OS
 .DS_Store
 
-# Local Claude Code config (user-specific, not shared)
+# CLAUDE.local.md anywhere (personal, never shared)
 CLAUDE.local.md
-.claude/CLAUDE.local.md
-.claude/scheduled_tasks.lock
+
+# Claude Code: ignore all local state under .claude/, then allow-list the
+# shared bits. Must be .claude/* not .claude/ - git can't re-include a
+# child of an excluded directory.
+.claude/*
+!.claude/settings.json
+!.claude/commands/
+!.claude/agents/
+!.claude/skills/
 
 # Local state and crit artifacts (per-machine)
 state.json

@@ -7,14 +7,14 @@ Google Calendar event mirroring tool. Replaces the calendar-syncing piece of Rec
 Work is driven by `SPEC.md`. Every change - feature, bug fix, perf fix, refactor - follows the same workflow. No shortcuts for "small" fixes:
 
 0. **Check CI before starting any work.** Run `gh run list --workflow=ci.yml --limit 3` and `gh run list --workflow=release.yml --limit 3` (or the equivalent `gh pr checks` for an open release PR). If a recent run is failing or in progress with errors, STOP and ask the user whether to fix that first before proceeding with the new task. Don't stack new work on top of a broken pipeline - a failing release workflow blocks shipment, and a failing CI signals a regression worth understanding before adding more changes.
-1. Read `SPEC.md` for the relevant command/feature. Also check `doc/progress.md` if it exists; it captures handoff state from prior autonomous sessions.
+1. Read `SPEC.md` for the relevant command/feature. Also read `next.md` (repo root); it captures handoff state from prior sessions. Bug history lives in `doc/bugs.md`.
 2. Create a feature branch off main (or work directly on main for hot fixes - still follow every other step).
 3. Red-green-refactor: write failing tests first, then implement, then clean up. See "Implementation strategy" below for how to spawn the implementation work.
 4. Run both `mise run test` and `mise run lint` after every change. Both must pass before committing.
 5. Keep commits small and conventional. Commit types drive releases - see "Release versioning" below.
 6. **MANDATORY code review before push** (code changes only - skip for docs-only changes where every modified file is Markdown or plain-text documentation): spawn a `feature-dev:code-reviewer` sub-agent on the pending changes (`git diff main...HEAD` for a branch, or on the commits about to push for direct-to-main work). Tell the reviewer to scrutinize tests: look for tests that don't actually test what they claim, useless tests, and missing test coverage. Address every important or critical finding. **Re-run the reviewer after addressing feedback** to confirm the fixes are clean - "before and after" reviews are both required. Never push code without a clean review pass. Skipping is not acceptable regardless of how small a code change looks; the docs carve-out is the only exception.
-7. Merge to main and **push** - this is the standing default, do not ask. After pushing a release-triggering commit (`feat:`/`fix:`), **wait for the release to cut, then install it**: watch release-please open and auto-merge the release PR, watch GoReleaser build and update the Homebrew tap, then `brew upgrade calendar-sync` and confirm `calendar-sync version` reports the new tag. The job isn't done at "pushed" - it's done when the released binary is installed and the daemon is running it. The ONLY exception is the SSH agent being unreachable: then leave the commit stacked locally and tell the user - never block waiting for auth. See "Git" below.
-8. Retrospective: review your approach and these instructions. Update CLAUDE.md with anything you learned that would help future sessions. Update `doc/progress.md` so the next session can pick up.
+7. Merge to main and **push** - this is the standing default, do not ask. After pushing a release-triggering commit (`feat:`/`fix:`), **wait for the release to cut, then install and run it** per "Installing a release" below. The job isn't done at "pushed" - it's done when the released binary is installed AND the restarted daemon is running it. The ONLY exception is the SSH agent being unreachable: then leave the commit stacked locally and tell the user - never block waiting for auth. See "Git" below.
+8. Retrospective: review your approach and these instructions. Update CLAUDE.md with anything you learned that would help future sessions. Update `next.md` so the next session can pick up; add a `doc/bugs.md` entry for any bug fixed.
 9. Move on to the next feature.
 
 ## Implementation strategy
@@ -34,7 +34,7 @@ The reviewer subagent's UUID is reusable: continue the conversation via `SendMes
 
 ## Release versioning
 
-Releases are fully automated via release-please + GoReleaser. Release-please watches main; when a commit with a version-bumping type lands, it opens a release PR which auto-merges once CI passes. The merged PR cuts a tag + GitHub Release; GoReleaser builds binaries and pushes an updated Formula to `tammersaleh/homebrew-tap`. Nobody runs `git tag` by hand - and nobody clicks Merge on the release PR either.
+Releases are fully automated via release-please + GoReleaser. Release-please watches main; when a commit with a version-bumping type lands, it opens a release PR which auto-merges once CI passes. The merged PR cuts a tag + GitHub Release; GoReleaser builds binaries and pushes an updated **Cask** (`.goreleaser.yml` `homebrew_casks:`) to `tammersaleh/homebrew-tap`. Nobody runs `git tag` by hand - and nobody clicks Merge on the release PR either.
 
 This means commit type is not a style choice. It is the entire release trigger. A `feat:` or `fix:` commit pushed to main ships as a new Homebrew release within minutes. A `chore:` or `docs:` commit pushed to main ships nothing. Pick the type based on user-facing impact, not diff size:
 
@@ -50,6 +50,22 @@ Rules:
 - Don't downgrade a type to avoid a release. If it's user-facing, it's `feat:` or `fix:`.
 - Don't upgrade a type to force a release. Internal refactors are `refactor:` even if the change is large.
 - Write the subject in imperative mood and keep it under ~70 chars.
+
+## Installing a release
+
+Once the release PR auto-merges, poll for the tag: `gh release list --limit 1`. GoReleaser then pushes a Cask to the tap. Install is NOT just `brew upgrade calendar-sync` - several traps bite in order:
+
+- It's a **cask**, not a formula. Use `brew upgrade --cask calendar-sync`. `brew info --formula` returns "No available formula".
+- First time on a machine, Homebrew refuses a cask from an untrusted third-party tap: `brew trust tammersaleh/tap` (it's our own tap; safe).
+- `brew update` can run BEFORE GoReleaser pushes the cask bump, leaving the local tap clone stale (its `Casks/calendar-sync.rb` still shows the old version while the tag is already out). Force it: `git -C "$(brew --repository)/Library/Taps/tammersaleh/homebrew-tap" pull --ff-only`, then upgrade.
+
+`brew upgrade` relinks the binary but does NOT restart the daemon - the running launchd process holds the old inode, and `WatchPaths` watches `config.toml`, not the binary. Restart it explicitly:
+
+```sh
+launchctl kickstart -k "gui/$(id -u)/org.calendar-sync.agent"
+```
+
+Verify: `calendar-sync version` reports the new tag, and the restarted daemon is healthy. Right after restart `calendar-sync status` shows `mirrors:0` for a minute (known IPC-snapshot lag; see `next.md`) - confirm health from the logs instead: `~/Library/Logs/calendar-sync/calendar-sync.err.log` should show fresh `sync.BuildInventory complete` lines with the expected `total_mirrors` counts.
 
 ## Autonomy
 
@@ -82,7 +98,7 @@ internal/
   gws/             # gws subprocess wrapper (events.list, events.insert, etc.) + typed errors
   sync/            # core algorithm: list, classify, reconcile, prune
   mirror/          # mirror payload construction, extended-property layout, drift handling
-  recurring/       # recurring-instance handler, originalStart helpers
+  recurring/       # recurring-instance handler, occurrence-key / instance-id helpers
   daemon/          # lifecycle, scheduler, IPC socket
   output/          # JSONL printer, _meta trailer, error stderr writer
   launchd/         # plist generation, launchctl wrappers
@@ -256,6 +272,14 @@ The resolved path comes from `config.FindPath(rt.Globals.Config)`, the same prec
 Editor-save behavior: most editors (vim, neovim, VS Code) save-and-swap (write to a temp file, rename over the target). launchd handles the rename cleanly because it tracks the path, not the inode - the rename fires a single kqueue event. Editors that write-in-place without atomic rename (some legacy tools) may produce two events: one for the truncate, one for the write. launchd will fire WatchPaths twice in quick succession; KeepAlive's debouncer typically collapses these into one effective restart.
 
 The feature is macOS-only by virtue of `launchd.Install` already returning `ErrNotMacOS` on non-Darwin platforms (`internal/launchd/install.go:86`). Linux users still don't get a daemon at all.
+
+### Recurring mirror instances are located by constructed ID, not `originalStart` (B24)
+
+`recurring.locateMirrorInstance` builds the deterministic instance ID `<mirrorParent.ID>_<occurrenceKey>` and fetches it with `events.get`. `occurrenceKey` (in `helpers.go`) is the substring after the LAST `_` in the SOURCE instance's ID - Google's own occurrence key, copied rather than re-derived. The key is identical across both series because `mirror.BuildPayload` copies the source's start/timezone verbatim into the mirror parent (all-day overrides only TimeZone, not Date); the last-underscore rule also handles anchored `_R...` parents.
+
+Do NOT go back to `events.instances?originalStart=...`: Google's `originalStart` filter does not return an instance once it has been moved off its native slot (`start != originalStartTime`), which froze every previously-moved recurring instance against future source edits (B24). The repair boundary is a 404 from `events.get` (not an empty list): re-fetch source parent, force-rewrite the mirror parent, rebuild the ID against the repaired parent, retry the get; a second 404 is the genuine `instance_unmaterializable`. A post-get sanity check aborts (returns an error, no write) when the located instance's `RecurringEventID` names a different parent - a constructed-ID collision.
+
+Known pre-existing gap (`doc/bugs.md` B24 follow-up): `patchMirrorWithChecksum` drops the post-main resource if the checksum follow-up patch fails, so the force-rewrite repair path can still lose the B19 inventory propagation on that one sub-path.
 
 ## Sandbox
 

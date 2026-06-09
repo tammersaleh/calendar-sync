@@ -40,6 +40,20 @@ Fix sketch: switch to `html/template` (handles XML-class escaping for content), 
 
 ## Fixed
 
+### B24 - moved recurring instances became permanently unsyncable (CRITICAL)
+
+Surfaced live: user rescheduled the `Lunch & Reading` 6/10 instance on personal (source) back to 11:30; the cw mirror stayed at 12:00. The daemon was healthy and ticking, the source change WAS delivered in the incremental delta, but every tick logged `skip(instance_unmaterializable)` for that instance.
+
+Root cause: the recurring handler located the mirror instance via `events.instances?eventId=<mirrorParent>&originalStart=<src.originalStartTime>&...`. Google's `originalStart` filter does NOT return an instance once it has been moved off its native recurrence slot (`start != originalStartTime`). Verified live: the un-moved 6/9 instance matched the filter; the moved 6/10 instance returned zero in every tz format, while a plain timeMin/timeMax window (no filter) returned it. The repair path re-fetched the source parent, force-rewrote the mirror parent recurrence, and retried the SAME filtered lookup - still zero - so it skipped forever.
+
+Self-perpetuating: a mirror instance becomes a moved exception precisely because a prior sync moved it successfully. So any recurring instance ever moved was permanently frozen against future source edits.
+
+SPEC.md encoded the wrong mental model ("empty = the mirror parent's recurrence is stale"). The recurrence was fine; the filter just doesn't match moved exceptions.
+
+Fix: locate by constructing the deterministic instance ID `<mirrorParent.id>_<occurrenceKey>` (occurrenceKey = the substring after the last `_` of the source instance ID; identical across both series because the mirror parent copies the source DTSTART grid) and fetching via `events.get`. A 404 (not an empty list) is the repair trigger; retry GET against the repaired parent; a second 404 is the genuine `instance_unmaterializable`. `events.get` returns moved exceptions, cancelled instances, and 404s out-of-series occurrences cleanly. A post-get sanity check aborts if the located instance names a different `RecurringEventID` (constructed-ID collision). Live-verified against the real calendars before and after. See `doc/plans/moved-exception-locate-fix.md`.
+
+Known follow-up (pre-existing, not introduced here): `patchMirrorWithChecksum` drops the post-main parent resource if the checksum follow-up patch fails, so the force-rewrite repair path can still lose B19 inventory propagation on that narrow sub-path. Shared by every checksum write path; deserves its own fix.
+
 ### B17 - target-edit propagation lagged 24h instead of one tick
 
 Surfaced live during the personal->cw rollout: user edited the `Lunch & Reading` 5/20 instance on the cw target by +30 min. The daemon's incremental ticks were idle for hours because nothing on personal had changed, and a manual `calendar-sync run --pair personal-to-work` (which does a full source-list) was needed to catch it.

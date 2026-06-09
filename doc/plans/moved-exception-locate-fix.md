@@ -2,7 +2,14 @@
 
 ## Status
 
-In progress. Branch: `fix/locate-moved-exception`.
+Done (B24). Branch: `fix/locate-moved-exception`. Code + tests + SPEC landed;
+`mise run test` + `mise run lint` green; Codex design review + independent
+`feature-dev:code-reviewer` (3 passes) clean. Not yet merged/pushed - awaiting
+user (a `fix:` push to main auto-ships a Homebrew release).
+
+Follow-up filed in `doc/bugs.md` B24: `patchMirrorWithChecksum` can still drop
+the post-main parent on a checksum-follow-up failure (pre-existing B19 gap on
+that narrow sub-path).
 
 ## Symptom (verified)
 

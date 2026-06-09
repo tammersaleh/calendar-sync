@@ -6,6 +6,7 @@ Handoff for the next session. Read this first, then `SPEC.md`, then `CLAUDE.md`.
 
 calendar-sync is feature-complete on the planned scope. Recent work history:
 
+0. **B24 - moved recurring instances were permanently unsyncable** (branch `fix/locate-moved-exception`, NOT yet merged/pushed at end of session). The recurring handler located mirror instances with Google's `events.instances?originalStart=...` filter, which silently fails to return an instance once it's been moved off its native slot - so any recurring instance ever moved (e.g. the `Lunch & Reading` overrides) froze against future source edits with `skip(instance_unmaterializable)`. Now locates by constructing the deterministic instance ID and `events.get`. See `doc/bugs.md` B24 + `doc/plans/moved-exception-locate-fix.md`. A `fix:` commit is stacked on the branch; pushing to main auto-ships a release, so it's left for the user to merge. Follow-up: the pre-existing `patchMirrorWithChecksum` B19 gap noted in B24.
 1. **E2E test infrastructure** (`internal/e2e/`, build tag `e2e`, run with `mise run test:e2e`). 14 scenarios against real Google Calendar, ~200s wall-clock. Auto-creates and tears down its own fixture calendars by name (`calendar-sync-e2e-source` / `calendar-sync-e2e-target`); anyone with `gws auth` can clone and run. See `doc/e2e-design.md`.
 2. **F1 + F2** (calendar refs by display summary + single-command brew upgrade). Shipped in v2.3.0.
 3. **Codex correctness pass** (v2.3.0): 7 findings addressed across 1 `feat:` (PatchEvent type) + 9 `fix:` commits.

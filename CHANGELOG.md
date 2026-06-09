@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.5.1](https://github.com/tammersaleh/calendar-sync/compare/v2.5.0...v2.5.1) (2026-06-09)
+
+
+### Bug Fixes
+
+* locate recurring mirror instances by id, not originalStart filter ([bfc4bb3](https://github.com/tammersaleh/calendar-sync/commit/bfc4bb3d3b35a1c3b23abb4d533cbe92f2bf2242))
+
 ## [2.5.0](https://github.com/tammersaleh/calendar-sync/compare/v2.4.0...v2.5.0) (2026-05-07)
 
 

@@ -45,8 +45,13 @@ var errInsertCollisionRead = errors.New("post-409 events.get is part of an inser
 //
 //	events.get:
 //	  CodeBackendError      - 500/503 during recurring-handler parent
-//	                          fetch.
+//	                          fetch or mirror-instance locate.
 //	  CodeAPINotFound       - 404 during recurring-handler parent fetch.
+//	                          (The mirror-instance locate handles its own
+//	                          404 internally: a first-get 404 drives the
+//	                          parent-repair path and a retry 404 yields
+//	                          instance_unmaterializable, neither of which
+//	                          surfaces here as an error.)
 //
 // 400 on events.get is intentionally NOT in the matrix: a request-shape
 // rejection there is much more likely to indicate a programmer bug than

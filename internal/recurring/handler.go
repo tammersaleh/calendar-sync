@@ -14,6 +14,7 @@ package recurring
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/tammersaleh/calendar-sync/internal/gws"
 	"github.com/tammersaleh/calendar-sync/internal/mirror"
@@ -25,7 +26,6 @@ import (
 // of the fake-gws harness per CLAUDE.md "Testing".
 type API interface {
 	EventsGet(ctx context.Context, calendarID, eventID string) (*gws.Event, error)
-	EventsInstances(ctx context.Context, params gws.EventsInstancesParams) ([]gws.Event, error)
 	EventsPatch(ctx context.Context, calendarID, eventID string, body *gws.PatchEvent) (*gws.Event, error)
 }
 
@@ -138,8 +138,8 @@ type Handler struct {
 	// the API's EventsGet calls.
 	SourceCalendarID string
 
-	// TargetCalendarID is the canonical target calendar ID; passed to all
-	// EventsInstances and mirror-side EventsPatch calls.
+	// TargetCalendarID is the canonical target calendar ID; passed to the
+	// mirror-instance EventsGet and mirror-side EventsPatch calls.
 	TargetCalendarID string
 
 	// SourceWritable mirrors pdir.source_writable from SPEC.md "Validation
@@ -170,6 +170,13 @@ type Handler struct {
 func (h *Handler) debug(msg string, args ...any) {
 	if h.Log != nil {
 		h.Log.Debug(msg, args...)
+	}
+}
+
+// warn is a nil-safe wrapper around h.Log.Warn.
+func (h *Handler) warn(msg string, args ...any) {
+	if h.Log != nil {
+		h.Log.Warn(msg, args...)
 	}
 }
 
@@ -211,7 +218,7 @@ func (h *Handler) Handle(ctx context.Context, source *gws.Event) (Result, error)
 	if parentAfterRepair != nil {
 		// Step 2's repair path force-rewrote the mirror parent; surface that
 		// to the sync layer alongside any step-1 write. Done BEFORE the
-		// error check so an error on the retry events.instances doesn't
+		// error check so an error on the retry events.get doesn't
 		// drop the post-rewrite resource (B19): the rewrite already
 		// completed, and the sync layer's inventory must reflect that
 		// even when the rest of step 2 failed.
@@ -308,39 +315,53 @@ type instanceLocateStatus struct {
 // it), and a status carrying the unmaterializable signal. Callers should
 // use the parentAfterRepair value if non-nil; otherwise the original parent
 // passed in is still authoritative.
+//
+// The mirror instance is located by constructing its deterministic instance
+// ID - "<mirrorParent.ID>_<occurrenceKey>" - and fetching it directly via
+// events.get. The occurrence key is the original start in compact UTC (timed)
+// or YYYYMMDD (all-day), carried as the suffix of the SOURCE instance's ID.
+// Both series share the same DTSTART grid (mirror.BuildPayload copies the
+// source start/timezone verbatim; all-day only overrides TimeZone, not Date),
+// so the mirror instance has the same occurrence-key suffix as the source.
+//
+// This replaces the previous events.instances?originalStart=... filter, which
+// Google does NOT match once an instance has been moved off its native
+// recurrence slot (start != originalStartTime). A moved exception became
+// permanently unsyncable under the filter; events.get returns it (and
+// cancelled instances, and out-of-series 404s) by its constructed ID.
 func (h *Handler) locateMirrorInstance(ctx context.Context, source, mirrorParent *gws.Event) (instance, parentAfterRepair *gws.Event, status instanceLocateStatus, err error) {
-	originalStart, err := computeOriginalStart(source.OriginalStartTime)
-	if err != nil {
+	key, ok := occurrenceKey(source.ID)
+	if !ok {
+		// Programmer error: this handler is only called for recurring
+		// instances, whose IDs always carry a "_<occurrenceKey>" suffix.
+		return nil, nil, instanceLocateStatus{}, errors.New("recurring: source.ID has no occurrence-key suffix: " + source.ID)
+	}
+
+	mirrorInstanceID := mirrorParent.ID + "_" + key
+	first, err := h.API.EventsGet(ctx, h.TargetCalendarID, mirrorInstanceID)
+	if err == nil {
+		h.debug("recurring.locateMirrorInstance: first try hit",
+			"source_event", source.ID,
+			"mirror_parent", mirrorParent.ID,
+			"mirror_instance", mirrorInstanceID,
+		)
+		if err := h.sanityCheckInstance(first, source, mirrorParent.ID); err != nil {
+			return nil, nil, instanceLocateStatus{}, err
+		}
+		return first, nil, instanceLocateStatus{}, nil
+	}
+	if !errors.Is(err, gws.ErrAPINotFound) {
+		// A real read failure (5xx, timeout, auth). Don't trigger repair.
 		return nil, nil, instanceLocateStatus{}, err
 	}
 
-	first, err := h.API.EventsInstances(ctx, gws.EventsInstancesParams{
-		CalendarID:    h.TargetCalendarID,
-		EventID:       mirrorParent.ID,
-		OriginalStart: originalStart,
-		MaxResults:    1,
-		ShowDeleted:   true,
-	})
-	if err != nil {
-		return nil, nil, instanceLocateStatus{}, err
-	}
-	h.debug("recurring.locateMirrorInstance: first try",
+	// 404: the constructed ID didn't resolve. Re-fetch the source parent,
+	// force-rewrite the mirror parent, rebuild the ID against the repaired
+	// parent, and retry the get once. Per SPEC.md "Step 2" repair path.
+	h.debug("recurring.locateMirrorInstance: 404 -> repair path",
 		"source_event", source.ID,
 		"mirror_parent", mirrorParent.ID,
-		"original_start", originalStart,
-		"items", len(first),
-	)
-	if len(first) > 0 {
-		inst := first[0]
-		return &inst, nil, instanceLocateStatus{}, nil
-	}
-
-	// Repair path: re-fetch the source parent, force-rewrite the mirror
-	// parent, retry the lookup once. Per SPEC.md "Zero-result instance
-	// lookup".
-	h.debug("recurring.locateMirrorInstance: repair path",
-		"source_event", source.ID,
-		"mirror_parent", mirrorParent.ID,
+		"mirror_instance", mirrorInstanceID,
 	)
 	sourceParent, err := h.API.EventsGet(ctx, h.SourceCalendarID, source.RecurringEventID)
 	if err != nil {
@@ -352,29 +373,80 @@ func (h *Handler) locateMirrorInstance(ctx context.Context, source, mirrorParent
 		return nil, nil, instanceLocateStatus{}, err
 	}
 
-	second, err := h.API.EventsInstances(ctx, gws.EventsInstancesParams{
-		CalendarID:    h.TargetCalendarID,
-		EventID:       repaired.ID,
-		OriginalStart: originalStart,
-		MaxResults:    1,
-		ShowDeleted:   true,
-	})
-	if err != nil {
-		return nil, repaired, instanceLocateStatus{}, err
+	retryInstanceID := repaired.ID + "_" + key
+	second, err := h.API.EventsGet(ctx, h.TargetCalendarID, retryInstanceID)
+	if err == nil {
+		h.debug("recurring.locateMirrorInstance: repair retry hit",
+			"source_event", source.ID,
+			"repaired_parent", repaired.ID,
+			"mirror_instance", retryInstanceID,
+		)
+		if err := h.sanityCheckInstance(second, source, repaired.ID); err != nil {
+			// Surface the repaired parent for B19 inventory propagation even
+			// though the located instance failed verification.
+			return nil, repaired, instanceLocateStatus{}, err
+		}
+		return second, repaired, instanceLocateStatus{}, nil
 	}
-	h.debug("recurring.locateMirrorInstance: repair retry",
-		"source_event", source.ID,
-		"repaired_parent", repaired.ID,
-		"items", len(second),
-	)
-	if len(second) == 0 {
+	if errors.Is(err, gws.ErrAPINotFound) {
+		// Genuinely unmaterializable: even after force-rewriting the parent's
+		// recurrence, the occurrence key doesn't resolve to an instance.
+		h.debug("recurring.locateMirrorInstance: repair retry 404 -> unmaterializable",
+			"source_event", source.ID,
+			"repaired_parent", repaired.ID,
+			"mirror_instance", retryInstanceID,
+		)
 		return nil, repaired, instanceLocateStatus{
 			unmaterializable: true,
 			sourceRecurrence: sourceParent.Recurrence,
 		}, nil
 	}
-	inst := second[0]
-	return &inst, repaired, instanceLocateStatus{}, nil
+	// Retry returned a real read failure. Surface the error but still return
+	// the repaired parent so the sync layer's inventory reflects the
+	// completed force-rewrite (B19).
+	return nil, repaired, instanceLocateStatus{}, err
+}
+
+// sanityCheckInstance verifies a located mirror instance matches the
+// expectations implied by its constructed ID. Two checks with different
+// severities:
+//
+//   - RecurringEventID, when present, must equal the mirror parent. If it
+//     names a DIFFERENT parent, the constructed ID resolved to an event that
+//     is NOT a child of this parent (only reachable via an external ID
+//     collision - mirror instances are only ever created by calendar-sync).
+//     Continuing would let the caller patch or cancel an unrelated event, so
+//     this ABORTS with an error rather than risk a write to the wrong
+//     resource. An empty RecurringEventID is not verifiable (sparse resources
+//     can omit it) and is tolerated.
+//   - OriginalStartTime should match the source exception's. A mismatch only
+//     warns: the comparison is a raw-string check that benign offset/format
+//     normalization can trip, and the resource fetched by the constructed ID
+//     is still authoritative for that ID.
+func (h *Handler) sanityCheckInstance(inst, source *gws.Event, mirrorParentID string) error {
+	if inst.RecurringEventID != "" && inst.RecurringEventID != mirrorParentID {
+		return fmt.Errorf("recurring: located instance %q has RecurringEventID %q, want mirror parent %q (constructed-ID collision)",
+			inst.ID, inst.RecurringEventID, mirrorParentID)
+	}
+	if !originalStartMatches(inst.OriginalStartTime, source.OriginalStartTime) {
+		h.warn("recurring.locateMirrorInstance: located instance originalStart mismatch",
+			"source_event", source.ID,
+			"mirror_instance", inst.ID,
+		)
+	}
+	return nil
+}
+
+// originalStartMatches compares two EventDateTimes by DateTime, falling back
+// to Date. A nil on either side is treated as a non-match unless both are nil.
+func originalStartMatches(a, b *gws.EventDateTime) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	if a.DateTime != "" || b.DateTime != "" {
+		return a.DateTime == b.DateTime
+	}
+	return a.Date == b.Date
 }
 
 // forceRewriteMirrorParent rebuilds the mirror parent payload from the

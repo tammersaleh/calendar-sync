@@ -302,14 +302,15 @@ func (r *Reconciler) processTargetDeltaEvent(
 	// inv.Set under that key would OVERWRITE the parent's inventory entry
 	// with the child instance. The recurring handler's resolveMirrorParent
 	// then looks up that same parent tuple and gets the shadowed child
-	// back, after which locateMirrorInstance issues events.instances against
-	// the child's id - the same B16-class shadow the inventory builder's
-	// pass-2 filter exists to prevent.
+	// back, after which locateMirrorInstance constructs the mirror instance
+	// id from the child's id (not the parent's) - the same B16-class shadow
+	// the inventory builder's pass-2 filter exists to prevent.
 	//
 	// Skipping the refresh here is safe: the recurring handler doesn't
-	// consume the per-instance inventory entry during dispatch. It queries
-	// events.instances live and runs drift detection off the result, then
-	// classify.classifyRecurringInstance writes the post-write resource at
+	// consume the per-instance inventory entry during dispatch. It fetches
+	// the mirror instance live via events.get and runs drift detection off
+	// the result, then classify.classifyRecurringInstance writes the
+	// post-write resource at
 	// (SourceCalendarID, source.ID) - the proper per-instance key, not the
 	// parent's tuple - after the handler returns.
 	if !inheritedInstance {

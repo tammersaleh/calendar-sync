@@ -565,7 +565,7 @@ A given `reason` is paired with one of six `action` values: `insert`, `patch`, `
 | `parent_not_eligible`      | `skip`                      | A recurring instance arrived but its source parent is itself filtered out (cancelled, transparent, declined, tentative, outside_horizon). |
 | `unchanged`                | `skip`                      | Both drift signals false: mirror up-to-date and unmodified relative to source.                                                            |
 | `pair_disabled`            | `skip`                      | The pdir is `enabled=false`. Emitted only when the user explicitly named the pair via `--pair`.                                          |
-| `instance_unmaterializable`| `skip`                      | Recurring-instance lookup returned zero results even after re-patching the mirror parent (rare; see "Zero-result instance lookup").       |
+| `instance_unmaterializable`| `skip`                      | Recurring-instance `events.get` 404'd even after re-patching the mirror parent (rare; see "404 instance lookup").       |
 | `source_updated`           | `insert` or `patch`         | `source_changed=true && mirror_drifted=false`, or no mirror exists yet (then `insert`). Also covers `source_changed && mirror_drifted` resolved to source-wins (see `conflict_source_won` below). |
 | `target_edited`            | `propagate` or `revert`     | `mirror_drifted=true && source_changed=false`, or `source_changed && mirror_drifted` resolved to mirror-wins. `propagate` if `pdir.source_writable`, else `revert`. |
 | `stale_bookkeeping`        | `patch`                     | `source_changed=false && mirror_drifted=false && fields_disagree=true` - stored bookkeeping reports both signals clean but the source's current managed fields differ from the mirror's. Repairs the divergence by rewriting the mirror from source. No conflict label; the daemon doesn't have evidence of a user-edit conflict, just bookkeeping divergence (see §"`fields_disagree`: stale-bookkeeping fallback"). |
@@ -1308,23 +1308,25 @@ If the source parent is now ineligible (status=cancelled, transparency=transpare
 
 #### Step 2: locate the mirror instance
 
-Compute the `originalStart` query value from the source exception:
-- If `E.originalStartTime.dateTime` is set, use that (a timezone-aware RFC 3339 string).
-- Else `E.originalStartTime.date` is set (an all-day exception, `YYYY-MM-DD`).
+Locate the mirror instance by its deterministic instance ID, not by an `originalStart` filter. Google instance IDs are `<parent.id>_<occurrenceKey>` where the occurrence key is the original start in compact UTC (`20260610T183000Z`, timed) or `YYYYMMDD` (all-day). The source exception ID `E.id` already carries this key as the substring after its last underscore (the last-underscore rule also handles anchored `_R...` parents). Because the mirror parent copies the source parent's DTSTART grid verbatim (`mirror.BuildPayload` copies start/timezone; all-day overrides only TimeZone, not Date), the mirror instance shares the same occurrence-key suffix.
 
-Call `events.instances?calendarId=<T>&eventId=<mirror_parent.id>&originalStart=<value>&maxResults=1&showDeleted=true`. (showDeleted=true is needed so a previously-cancelled instance still resolves; we may need to "uncancel" it.)
+Construct `<mirror_parent.id>_<key>` and fetch it: `events.get?calendarId=<T>&eventId=<mirror_parent.id>_<key>`. `events.get` returns cancelled instances natively (so a previously-cancelled mirror still resolves and can be "uncancelled" - no `showDeleted` flag needed), and returns 404 for an occurrence the recurrence doesn't generate.
 
-##### Zero-result instance lookup
+> Why not `events.instances?originalStart=<value>`: Google's `originalStart` filter does **not** return an instance once it has been moved off its native recurrence slot (`start != originalStartTime`). A mirror instance becomes a moved exception precisely because a prior sync moved it, so the filter made every previously-moved instance permanently unsyncable (`skip(instance_unmaterializable)` forever, even though the instance plainly exists). `events.get` by constructed ID resolves moved exceptions correctly.
 
-If the response is empty, the mirror parent's recurrence rule doesn't generate an instance at `originalStart`. This is rare but real - it can happen when the mirror parent's `recurrence` is stale relative to the source parent's, or when an exception's `originalStartTime` doesn't match the new RRULE after a series-rule change.
+##### 404 instance lookup
+
+A 404 means the constructed instance ID doesn't resolve against the current mirror parent - the parent's `recurrence` may be stale relative to the source parent's (e.g. an exception whose `originalStartTime` no longer falls on the mirror's RRULE after a series-rule change).
 
 Repair path:
 1. Fetch the source parent via `events.get?calendarId=<S>&eventId=<E.recurringEventId>`.
 2. Force-patch the mirror parent with the source parent's current state (full mirror payload, `reason=source_updated`), refreshing its `recurrence`.
-3. Retry the `events.instances` lookup.
-4. If still empty, the exception falls outside the mirror's recurrence even after refresh. `skip(reason=instance_unmaterializable)` and log at level `warn` with both the source parent's and mirror parent's recurrence arrays. The next full sync (within `full_sync_interval`) re-checks the parent and usually self-heals.
+3. Rebuild the instance ID against the repaired parent and retry the `events.get`.
+4. If it still 404s, the exception falls outside the mirror's recurrence even after refresh. `skip(reason=instance_unmaterializable)` and log at level `warn` with both the source parent's and mirror parent's recurrence arrays. The next full sync (within `full_sync_interval`) re-checks the parent and usually self-heals.
 
-If step 2 succeeds but step 3 returns an error (the retry `events.instances` fails for any reason - transient 5xx, gws subprocess timeout, etc.), the recurring handler must still surface the post-rewrite mirror parent through its return Result so the sync layer's inventory reflects the completed force-rewrite. Without that propagation, the next tick's classify loop sees a stale inventory entry and re-fires the force-rewrite - bounded only by the next full sync's inventory rebuild. The sync layer applies the post-write inventory updates from the Result (keying the mirror parent by the source PARENT's tuple `(canonical_source_calendar_id, E.recurringEventId)`) before returning the underlying error so the per-event error tolerance (transient skip vs fatal) decision in `runClassifyLoop` operates on a consistent inventory view.
+After a successful `events.get`, sanity-check the returned instance (its `recurringEventId` should be the mirror parent and its `originalStartTime` should match `E`'s); a mismatch logs `warn` but does not abort - the resource fetched by the constructed ID is authoritative.
+
+If step 2 succeeds but step 3 returns a non-404 error (the retry `events.get` fails for any reason - transient 5xx, gws subprocess timeout, etc.), the recurring handler must still surface the post-rewrite mirror parent through its return Result so the sync layer's inventory reflects the completed force-rewrite. Without that propagation, the next tick's classify loop sees a stale inventory entry and re-fires the force-rewrite - bounded only by the next full sync's inventory rebuild. The sync layer applies the post-write inventory updates from the Result (keying the mirror parent by the source PARENT's tuple `(canonical_source_calendar_id, E.recurringEventId)`) before returning the underlying error so the per-event error tolerance (transient skip vs fatal) decision in `runClassifyLoop` operates on a consistent inventory view.
 
 #### Step 3: decide insert/patch/delete/propagate/revert
 

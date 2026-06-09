@@ -292,9 +292,9 @@ func TestTargetDeltaPhase_ManagedInstanceEdit(t *testing.T) {
 	parentTuple := mirror.SourceTuple{CalendarID: "src-A", EventID: "src-parent"}
 	inv.Set(parentTuple, mirrorParent)
 
-	// events.instances on mirror parent (locate the mirror instance via
-	// originalStart) -> returns m.
-	api.queueInstances([]gws.Event{*m})
+	// Locate the mirror instance by its constructed ID (mirror parent +
+	// occurrence key) -> returns m.
+	api.queueGet("tgt-A", instanceID, m)
 	// Drift matrix path: recurring handler runs the propagate shape.
 	patchedSrc := *srcInstance
 	patchedSrc.Summary = "Lunch-edited"
@@ -778,9 +778,9 @@ func TestTargetDeltaPhase_InheritedAutoMaterializedNoUserEdit(t *testing.T) {
 	}
 	inv.Set(mirror.SourceTuple{CalendarID: "src-A", EventID: "src-parent"}, mirrorParent)
 
-	// Recurring handler step 2: events.instances locates the mirror
-	// instance.
-	api.queueInstances([]gws.Event{*clean})
+	// Recurring handler step 2: the constructed-ID locate get returns the
+	// mirror instance.
+	api.queueGet("tgt-A", instanceID, clean)
 	// Inherited-upgrade rewrite + checksum follow-up.
 	post := *clean
 	api.queuePatch(&post)
@@ -817,20 +817,24 @@ func TestTargetDeltaPhase_InheritedAutoMaterializedNoUserEdit(t *testing.T) {
 		}
 	}
 
-	// events.instances must be queried against the MIRROR PARENT's id, not
+	// The locate get must be addressed to the mirror instance ID constructed
+	// from the MIRROR PARENT's id (mirror-parent + occurrence key), not from
 	// the child instance's id. If the inv.Set shadow ever returns, the
 	// recurring handler's resolveMirrorParent step would pick up the child
-	// (cached at the parent's tuple) and locate-instance would query the
-	// child's id - which would 404 / return zero results from Calendar API
-	// in production but happens to pass the stub here.
-	instanceCalls := api.callsByOp("EventsInstances")
-	if len(instanceCalls) == 0 {
-		t.Fatal("expected at least one events.instances call")
-	}
-	for _, c := range instanceCalls {
-		if c.EventID != "mirror-parent" {
-			t.Errorf("events.instances must query the mirror parent id; got %q", c.EventID)
+	// (cached at the parent's tuple) and locate-instance would construct a
+	// double-suffixed id that 404s in production.
+	var locateGet *recordedCall
+	for i := range api.callsByOp("EventsGet") {
+		c := api.callsByOp("EventsGet")[i]
+		if c.CalendarID == "tgt-A" {
+			locateGet = &c
 		}
+	}
+	if locateGet == nil {
+		t.Fatal("expected a locate events.get against the target calendar")
+	}
+	if locateGet.EventID != instanceID {
+		t.Errorf("locate get must address the mirror instance id %q; got %q", instanceID, locateGet.EventID)
 	}
 
 	// The parent inventory entry must still point at the parent (not the
@@ -923,7 +927,6 @@ func TestTargetDeltaPhase_InheritedInstance_DoesNotShadowParentInInventory(t *te
 		HTMLLink:          "https://www.google.com/calendar/event?eid=ABC",
 	}
 	api.queueGet("src-A", "src-parent_20260520T160000Z", srcInstance)
-	api.queueInstances([]gws.Event{*clean})
 	post := *clean
 	api.queuePatch(&post)
 	api.queuePatch(&post)
@@ -947,15 +950,6 @@ func TestTargetDeltaPhase_InheritedInstance_DoesNotShadowParentInInventory(t *te
 	}
 	if got.RecurringEventID != "" {
 		t.Errorf("parent inventory shadowed by recurring instance; got RecurringEventID=%q", got.RecurringEventID)
-	}
-
-	// Also: the recurring handler's events.instances must query the parent's
-	// id. If the shadow happens, mirrorParent.ID becomes the child's id and
-	// events.instances goes there.
-	for _, c := range api.callsByOp("EventsInstances") {
-		if c.EventID != "mirror-parent" {
-			t.Errorf("events.instances queried the wrong event id (parent shadowed?); got %q", c.EventID)
-		}
 	}
 }
 

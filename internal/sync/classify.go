@@ -205,7 +205,7 @@ func (c *Classifier) classifyRecurringInstance(ctx context.Context, source *gws.
 	// Apply inventory updates from any post-writes BEFORE returning on
 	// error (B19). The recurring handler may have completed a partial
 	// write before erroring - typically forceRewriteMirrorParent
-	// succeeded but the followup events.instances flaked. Dropping the
+	// succeeded but the followup locate events.get flaked. Dropping the
 	// post-write resource here would leave the inventory stale and
 	// trigger spurious force-rewrites on subsequent ticks until the
 	// next FullSync rebuilds inventory from scratch.

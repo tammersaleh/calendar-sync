@@ -917,9 +917,10 @@ func TestFullSync_RecurringDelegation_RoutesToHandler(t *testing.T) {
 	pd := makeTestPDir("p1", "src-A", "tgt-A", true)
 	canonical := makeCanonical(pd)
 
-	// Source: a recurring-instance exception.
+	// Source: a recurring-instance exception. Its ID carries the occurrence
+	// key the handler uses to construct the mirror instance ID.
 	source := &gws.Event{
-		ID:                "src-evt",
+		ID:                "src-parent_20260501T120000Z",
 		Status:            gws.EventStatusConfirmed,
 		Summary:           "Updated",
 		Updated:           "2026-04-30T10:00:00Z",
@@ -953,13 +954,13 @@ func TestFullSync_RecurringDelegation_RoutesToHandler(t *testing.T) {
 	api.queueListInventory("tgt-A", "2", nil)
 	api.queueListInventory("tgt-A", "1", nil)
 
-	// Step 2: events.instances on the mirror parent returns the mirror
-	// instance.
+	// Step 2: the handler locates the mirror instance by its constructed ID
+	// (mirror parent + occurrence key).
 	mirrorInst := makeCleanCurrentMirror("mi-1", "src-A:src-evt",
 		"2026-04-29T20:00:00Z", "2026-04-30T08:00:00Z",
 		"Standup", source.Start, source.End,
 	)
-	api.queueInstances([]gws.Event{*mirrorInst})
+	api.queueGet("tgt-A", "mp-1_20260501T120000Z", mirrorInst)
 
 	// Step 3 drift: source.Updated > stored source_updated, mirror clean -
 	// patch + checksum followup.

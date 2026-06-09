@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/tammersaleh/calendar-sync/internal/gws"
@@ -11,17 +12,16 @@ import (
 )
 
 // recordedCall captures one method invocation on the stub. Fields are unioned
-// across all three operations so a single []recordedCall preserves call order
+// across the operations so a single []recordedCall preserves call order
 // across method boundaries; tests assert on (Op, ...) tuples per call.
 //
 // PatchBody is *gws.PatchEvent so tests can inspect pointer-field
 // clear-intent (a non-nil pointer to "" is meaningfully different from nil).
 type recordedCall struct {
-	Op            string // "EventsGet", "EventsInstances", "EventsPatch"
-	CalendarID    string
-	EventID       string
-	OriginalStart string
-	PatchBody     *gws.PatchEvent
+	Op         string // "EventsGet", "EventsPatch"
+	CalendarID string
+	EventID    string
+	PatchBody  *gws.PatchEvent
 }
 
 // stubAPI is a hand-rolled in-process API stub. CLAUDE.md "Testing" prefers
@@ -33,13 +33,11 @@ type recordedCall struct {
 // (and the "force-patch then re-lookup" repair path) needs queues to model
 // the multi-call flow.
 type stubAPI struct {
-	getResponses       map[[2]string][]*gws.Event
-	getErrors          map[[2]string][]error
-	instancesResponses [][]gws.Event
-	instancesErrors    []error
-	patchResponses     []*gws.Event
-	patchErrors        []error
-	calls              []recordedCall
+	getResponses   map[[2]string][]*gws.Event
+	getErrors      map[[2]string][]error
+	patchResponses []*gws.Event
+	patchErrors    []error
+	calls          []recordedCall
 }
 
 func newStubAPI() *stubAPI {
@@ -65,28 +63,6 @@ func (s *stubAPI) EventsGet(_ context.Context, calendarID, eventID string) (*gws
 	}
 	head := resps[0]
 	s.getResponses[key] = resps[1:]
-	return head, nil
-}
-
-func (s *stubAPI) EventsInstances(_ context.Context, params gws.EventsInstancesParams) ([]gws.Event, error) {
-	s.calls = append(s.calls, recordedCall{
-		Op:            "EventsInstances",
-		CalendarID:    params.CalendarID,
-		EventID:       params.EventID,
-		OriginalStart: params.OriginalStart,
-	})
-	if len(s.instancesErrors) > 0 {
-		head := s.instancesErrors[0]
-		s.instancesErrors = s.instancesErrors[1:]
-		if head != nil {
-			return nil, head
-		}
-	}
-	if len(s.instancesResponses) == 0 {
-		return nil, errors.New("stubAPI: no EventsInstances response queued")
-	}
-	head := s.instancesResponses[0]
-	s.instancesResponses = s.instancesResponses[1:]
 	return head, nil
 }
 
@@ -118,9 +94,14 @@ func (s *stubAPI) queueGet(calendarID, eventID string, resp *gws.Event) {
 	s.getResponses[key] = append(s.getResponses[key], resp)
 }
 
-// queueInstances enqueues a list response for the next EventsInstances call.
-func (s *stubAPI) queueInstances(events []gws.Event) {
-	s.instancesResponses = append(s.instancesResponses, events)
+// queueGetError enqueues an error for the next EventsGet on (calendarID,
+// eventID). EventsGet drains the error queue for a key before the response
+// queue, so queueing a 404 then a success on the same key models the
+// "first get 404 -> repair -> retry get hit" repair flow (the repaired parent
+// keeps the same id, so both gets address the same key).
+func (s *stubAPI) queueGetError(calendarID, eventID string, err error) {
+	key := [2]string{calendarID, eventID}
+	s.getErrors[key] = append(s.getErrors[key], err)
 }
 
 // queuePatch enqueues a response for the next EventsPatch call.
@@ -247,10 +228,13 @@ type managedFieldHints struct {
 	end         *gws.EventDateTime
 }
 
-// makeSourceException constructs a typical recurring source exception.
+// makeSourceException constructs a typical recurring source exception. The
+// ID carries a realistic "src-parent_<occurrenceKey>" suffix derived from
+// originalStart so locateMirrorInstance can build the mirror instance ID from
+// it (the occurrence key is shared between the source and mirror series).
 func makeSourceException(updated, originalStart string, summary string) *gws.Event {
 	return &gws.Event{
-		ID:                "src-evt",
+		ID:                "src-parent_" + compactOccurrenceKey(originalStart),
 		Status:            gws.EventStatusConfirmed,
 		Summary:           summary,
 		Start:             &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z", TimeZone: "UTC"},
@@ -260,6 +244,33 @@ func makeSourceException(updated, originalStart string, summary string) *gws.Eve
 		RecurringEventID:  "src-parent",
 		OriginalStartTime: &gws.EventDateTime{DateTime: originalStart, TimeZone: "UTC"},
 	}
+}
+
+// compactOccurrenceKey turns an RFC-3339 original start into the compact UTC
+// occurrence key Google uses as an instance-ID suffix: strip "-" and ":" and
+// any fractional seconds, keeping the trailing "Z". E.g.
+// "2026-05-01T12:00:00Z" -> "20260501T120000Z". A bare date
+// ("2026-05-01") becomes "20260501".
+func compactOccurrenceKey(originalStart string) string {
+	s := originalStart
+	if i := strings.IndexByte(s, '.'); i >= 0 {
+		// Drop fractional seconds, preserve a trailing "Z" if present.
+		rest := s[i:]
+		s = s[:i]
+		if strings.HasSuffix(rest, "Z") {
+			s += "Z"
+		}
+	}
+	s = strings.ReplaceAll(s, "-", "")
+	s = strings.ReplaceAll(s, ":", "")
+	return s
+}
+
+// expectedMirrorInstanceID is the deterministic mirror-instance ID the handler
+// constructs: the mirror parent ID plus the source instance's occurrence key.
+func expectedMirrorInstanceID(mirrorParentID string, source *gws.Event) string {
+	key, _ := occurrenceKey(source.ID)
+	return mirrorParentID + "_" + key
 }
 
 // makeMirrorParent is a thin convenience for the inventory parent.
@@ -286,7 +297,7 @@ func TestHandle_Step1_MirrorParentInInventory(t *testing.T) {
 		start:       source.Start,
 		end:         source.End,
 	})
-	api.queueInstances([]gws.Event{*mirrorInst})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mirrorInst)
 
 	reconcileCalled := 0
 	h := &Handler{
@@ -310,8 +321,15 @@ func TestHandle_Step1_MirrorParentInInventory(t *testing.T) {
 	if reconcileCalled != 0 {
 		t.Errorf("ReconcileParent should not be called when inventory has the parent; was called %d time(s)", reconcileCalled)
 	}
-	if len(api.callsByOp("EventsGet")) != 0 {
-		t.Errorf("EventsGet should not be called when inventory has the parent; got %d", len(api.callsByOp("EventsGet")))
+	// The only EventsGet should be the mirror-instance locate on the target
+	// calendar - no source-side parent fetch (that's the repair path).
+	for _, c := range api.callsByOp("EventsGet") {
+		if c.CalendarID == "src-cal" {
+			t.Errorf("no source-side EventsGet expected when inventory has the parent; got %+v", c)
+		}
+	}
+	if n := len(api.callsByOp("EventsGet")); n != 1 {
+		t.Errorf("expected exactly 1 EventsGet (mirror-instance locate); got %d", n)
 	}
 	if got.Action != mirror.ActionSkip || got.Reason != mirror.ReasonUnchanged {
 		t.Errorf("expected skip(unchanged); got %+v", got)
@@ -343,7 +361,7 @@ func TestHandle_Step1_RepairsMirrorParentViaReconciler(t *testing.T) {
 		start:       source.Start,
 		end:         source.End,
 	})
-	api.queueInstances([]gws.Event{*mirrorInst})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mirrorInst)
 
 	reconcileCalls := 0
 	h := &Handler{
@@ -404,9 +422,13 @@ func TestHandle_Step1_ParentNotEligible(t *testing.T) {
 	if got.Action != mirror.ActionSkip || got.Reason != ReasonParentNotEligible {
 		t.Errorf("expected skip(parent_not_eligible); got %+v", got)
 	}
-	// No instance lookup or patch should have happened.
-	if n := len(api.callsByOp("EventsInstances")); n != 0 {
-		t.Errorf("EventsInstances should not be called; got %d", n)
+	// No mirror-instance locate (target-side EventsGet) or patch should have
+	// happened: the only get is the source-parent fetch on src-cal that
+	// feeds ReconcileParent.
+	for _, c := range api.callsByOp("EventsGet") {
+		if c.CalendarID == "tgt-cal" {
+			t.Errorf("no target-side EventsGet (instance locate) expected; got %+v", c)
+		}
 	}
 	if n := len(api.callsByOp("EventsPatch")); n != 0 {
 		t.Errorf("EventsPatch should not be called; got %d", n)
@@ -440,8 +462,8 @@ func TestHandle_Step1_ReconcileParentError(t *testing.T) {
 // ---------- Step 2: instance lookup ----------
 
 func TestHandle_Step2_InstanceFoundOnFirstLookup(t *testing.T) {
-	// Smoke-test verified by the step-1-inventory case above; here we add
-	// a small assertion that the originalStart param was forwarded.
+	// Smoke-test verified by the step-1-inventory case above; here we assert
+	// the handler fetched the mirror instance by its constructed ID.
 	api := newStubAPI()
 	mirrorParent := makeMirrorParent("mp-1")
 	source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
@@ -451,7 +473,7 @@ func TestHandle_Step2_InstanceFoundOnFirstLookup(t *testing.T) {
 		start:       source.Start,
 		end:         source.End,
 	})
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	h := &Handler{
 		API:              api,
@@ -465,15 +487,16 @@ func TestHandle_Step2_InstanceFoundOnFirstLookup(t *testing.T) {
 	if _, err := h.Handle(context.Background(), source); err != nil {
 		t.Fatal(err)
 	}
-	calls := api.callsByOp("EventsInstances")
+	calls := api.callsByOp("EventsGet")
 	if len(calls) != 1 {
-		t.Fatalf("expected 1 EventsInstances call; got %d", len(calls))
+		t.Fatalf("expected 1 EventsGet call (locate by constructed instance ID); got %d", len(calls))
 	}
-	if calls[0].OriginalStart != "2026-05-01T12:00:00Z" {
-		t.Errorf("originalStart = %q, want %q", calls[0].OriginalStart, "2026-05-01T12:00:00Z")
+	wantID := "mp-1_20260501T120000Z"
+	if calls[0].EventID != wantID {
+		t.Errorf("EventsGet EventID = %q, want %q (mirror parent + occurrence key)", calls[0].EventID, wantID)
 	}
-	if calls[0].EventID != "mp-1" {
-		t.Errorf("EventID = %q, want mp-1", calls[0].EventID)
+	if calls[0].CalendarID != "tgt-cal" {
+		t.Errorf("EventsGet CalendarID = %q, want tgt-cal", calls[0].CalendarID)
 	}
 }
 
@@ -481,7 +504,7 @@ func TestHandle_Step2_AllDayOriginalStart(t *testing.T) {
 	api := newStubAPI()
 	mirrorParent := makeMirrorParent("mp-1")
 	source := &gws.Event{
-		ID:                "src-evt",
+		ID:                "src-parent_20260501", // date-form occurrence key
 		Status:            gws.EventStatusConfirmed,
 		Summary:           "All-day exception",
 		Start:             &gws.EventDateTime{Date: "2026-05-01"},
@@ -497,7 +520,7 @@ func TestHandle_Step2_AllDayOriginalStart(t *testing.T) {
 		start:       source.Start,
 		end:         source.End,
 	})
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	h := &Handler{
 		API:              api,
@@ -510,14 +533,13 @@ func TestHandle_Step2_AllDayOriginalStart(t *testing.T) {
 	if _, err := h.Handle(context.Background(), source); err != nil {
 		t.Fatal(err)
 	}
-	calls := api.callsByOp("EventsInstances")
-	if len(calls) != 1 || calls[0].OriginalStart != "2026-05-01" {
-		t.Errorf("originalStart for all-day = %q (calls=%d), want 2026-05-01", func() string {
-			if len(calls) > 0 {
-				return calls[0].OriginalStart
-			}
-			return "<none>"
-		}(), len(calls))
+	calls := api.callsByOp("EventsGet")
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 EventsGet call; got %d", len(calls))
+	}
+	wantID := "mp-1_20260501" // date-form occurrence key
+	if calls[0].EventID != wantID {
+		t.Errorf("all-day mirror instance ID = %q, want %q", calls[0].EventID, wantID)
 	}
 }
 
@@ -525,9 +547,12 @@ func TestHandle_Step2_RepairAfterZeroResults(t *testing.T) {
 	api := newStubAPI()
 	mirrorParent := makeMirrorParent("mp-1")
 	source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
+	instanceID := expectedMirrorInstanceID("mp-1", source)
 
-	// First instances lookup: empty (need repair).
-	api.queueInstances(nil)
+	// First locate get: 404 (need repair). The repaired parent keeps the same
+	// id, so the retry get addresses the same key; the stub drains the error
+	// queue for a key before the response queue, so the 404 fires first.
+	api.queueGetError("tgt-cal", instanceID, gws.ErrAPINotFound)
 
 	// Repair path fetches source parent.
 	sourceParent := &gws.Event{
@@ -552,14 +577,14 @@ func TestHandle_Step2_RepairAfterZeroResults(t *testing.T) {
 	postChecksumParent.ExtendedProperties = &gws.ExtendedProperties{Private: map[string]string{}}
 	api.queuePatch(&postChecksumParent)
 
-	// Retry instances: returns the now-materialized instance.
+	// Retry get: returns the now-materialized instance.
 	mi := makeCleanCurrentMirror("mi-1", source.Updated, source.Updated, managedFieldHints{
 		summary:     source.Summary,
 		description: source.Description + "\n\n---\nSource: " + source.HTMLLink,
 		start:       source.Start,
 		end:         source.End,
 	})
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", instanceID, mi)
 
 	h := &Handler{
 		API:              api,
@@ -576,8 +601,16 @@ func TestHandle_Step2_RepairAfterZeroResults(t *testing.T) {
 	if got.PostWriteMirrorParent == nil {
 		t.Errorf("PostWriteMirrorParent should be set after repair")
 	}
-	if n := len(api.callsByOp("EventsInstances")); n != 2 {
-		t.Errorf("expected 2 EventsInstances calls (original + retry); got %d", n)
+	// Two locate gets to the mirror instance (404 + retry) plus one source-
+	// parent get during repair = 3 EventsGet calls total.
+	instanceGets := 0
+	for _, c := range api.callsByOp("EventsGet") {
+		if c.CalendarID == "tgt-cal" && c.EventID == instanceID {
+			instanceGets++
+		}
+	}
+	if instanceGets != 2 {
+		t.Errorf("expected 2 EventsGet calls on the mirror instance (404 + retry); got %d", instanceGets)
 	}
 	patches := api.callsByOp("EventsPatch")
 	if len(patches) != 2 {
@@ -597,14 +630,15 @@ func TestHandle_Step2_RepairAfterZeroResults(t *testing.T) {
 }
 
 // TestHandle_Step2_RepairSucceedsThenRetryFails_ReturnsParentAfterRepair
-// pins B19. The repair path may fire 3 API calls in sequence:
+// pins B19. The repair path may fire 4 API calls in sequence:
 //
-//  1. events.get on the source parent
-//  2. forceRewriteMirrorParent (events.patch x2: main + checksum follow-up)
-//  3. events.instances retry on the rewritten mirror parent
+//  1. events.get on the mirror instance (404 -> triggers repair)
+//  2. events.get on the source parent
+//  3. forceRewriteMirrorParent (events.patch x2: main + checksum follow-up)
+//  4. events.get retry on the rewritten mirror parent's instance ID
 //
-// If step 3 returns a transient error (HTTP 5xx, gws subprocess timeout,
-// etc.) AFTER step 2 has already written the rewritten parent to Google,
+// If step 4 returns a transient error (HTTP 5xx, gws subprocess timeout,
+// etc.) AFTER step 3 has already written the rewritten parent to Google,
 // the handler must surface the post-rewrite resource via Result.
 // PostWriteMirrorParent so the sync layer can update its inventory. Without
 // this propagation Handle would return Result{}, err and the inventory
@@ -616,12 +650,17 @@ func TestHandle_Step2_RepairSucceedsThenRetryFails_ReturnsParentAfterRepair(t *t
 	api := newStubAPI()
 	mirrorParent := makeMirrorParent("mp-1")
 	source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
+	instanceID := expectedMirrorInstanceID("mp-1", source)
 
-	// First instances lookup: empty (triggers repair). The stub's EventsInstances
-	// dequeues from instancesErrors before instancesResponses, so a leading
-	// nil error sentinel keeps the first call on the success path.
-	api.instancesErrors = append(api.instancesErrors, nil)
-	api.queueInstances(nil)
+	// Both locate gets hit the same key (the repaired parent keeps id mp-1).
+	// The stub drains the error queue for a key in order: first 404 (triggers
+	// repair), then a transient 5xx on the retry.
+	api.queueGetError("tgt-cal", instanceID, gws.ErrAPINotFound)
+	api.queueGetError("tgt-cal", instanceID, &gws.Error{
+		Code:     gws.CodeBackendError,
+		ExitCode: 1,
+		Op:       "events.get",
+	})
 
 	// Repair fetches source parent.
 	sourceParent := &gws.Event{
@@ -646,13 +685,6 @@ func TestHandle_Step2_RepairSucceedsThenRetryFails_ReturnsParentAfterRepair(t *t
 	postChecksumParent.ExtendedProperties = &gws.ExtendedProperties{Private: map[string]string{}}
 	api.queuePatch(&postChecksumParent)
 
-	// Second instances lookup (the retry): transient 5xx.
-	api.instancesErrors = append(api.instancesErrors, &gws.Error{
-		Code:     gws.CodeBackendError,
-		ExitCode: 1,
-		Op:       "events.instances",
-	})
-
 	h := &Handler{
 		API:              api,
 		SourceCalendarID: "src-cal",
@@ -663,7 +695,7 @@ func TestHandle_Step2_RepairSucceedsThenRetryFails_ReturnsParentAfterRepair(t *t
 	}
 	got, err := h.Handle(context.Background(), source)
 	if err == nil {
-		t.Fatal("Handle should return the transient error from the retry events.instances")
+		t.Fatal("Handle should return the transient error from the retry events.get")
 	}
 	if got.PostWriteMirrorParent == nil {
 		t.Fatalf("PostWriteMirrorParent must be set even on retry-error path so the sync layer can update its inventory; got Result.Action=%q", got.Action)
@@ -691,8 +723,12 @@ func TestHandle_Step2_InstanceUnmaterializable(t *testing.T) {
 	mirrorParent := makeMirrorParent("mp-1")
 	mirrorParent.Recurrence = []string{"RRULE:FREQ=WEEKLY"}
 	source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
+	instanceID := expectedMirrorInstanceID("mp-1", source)
 
-	api.queueInstances(nil) // first lookup empty
+	// First locate get: 404 (need repair). Retry get (same key): 404 again ->
+	// genuinely unmaterializable.
+	api.queueGetError("tgt-cal", instanceID, gws.ErrAPINotFound)
+	api.queueGetError("tgt-cal", instanceID, gws.ErrAPINotFound)
 
 	sourceParent := &gws.Event{
 		ID:         "src-parent",
@@ -708,9 +744,6 @@ func TestHandle_Step2_InstanceUnmaterializable(t *testing.T) {
 	postPatchParent.Recurrence = []string{"RRULE:FREQ=MONTHLY"}
 	api.queuePatch(&postPatchParent)
 	api.queuePatch(&postPatchParent)
-
-	// Retry still empty.
-	api.queueInstances(nil)
 
 	h := &Handler{
 		API:              api,
@@ -736,14 +769,88 @@ func TestHandle_Step2_InstanceUnmaterializable(t *testing.T) {
 	}
 }
 
-func TestHandle_Step2_NoOriginalStartReturnsError(t *testing.T) {
+// TestHandle_Step2_MovedExceptionRelocatedViaGet models the production bug:
+// a recurring mirror instance that a prior sync already MOVED (its live start
+// differs from originalStartTime). Google's old events.instances?originalStart
+// filter does not return such an instance, so locate returned zero, the repair
+// retried the same filter (still zero), and the handler emitted
+// skip(instance_unmaterializable) forever. The fix locates by the constructed
+// instance ID via events.get, which returns moved exceptions natively.
+//
+// Here the source override was edited more recently than the mirror's stored
+// source_updated, so the drift signal yields source_changed and the handler
+// must patch (source_updated), NOT skip(instance_unmaterializable).
+func TestHandle_Step2_MovedExceptionRelocatedViaGet(t *testing.T) {
 	api := newStubAPI()
 	mirrorParent := makeMirrorParent("mp-1")
-	// Programmer-error case: no OriginalStartTime at all.
+	// originalStartTime 11:30 (its native slot); source edited 2026-06-09.
+	source := makeSourceException("2026-06-09T14:19:00Z", "2026-06-10T18:30:00Z", "Lunch & Reading")
+	source.ID = "src-parent_20260610T183000Z"
+	instanceID := expectedMirrorInstanceID("mp-1", source)
+	if instanceID != "mp-1_20260610T183000Z" {
+		t.Fatalf("constructed instance ID = %q, want mp-1_20260610T183000Z", instanceID)
+	}
+
+	// The located mirror instance is a MOVED exception: its live start (12:00)
+	// differs from originalStartTime (11:30). Its stored source_updated
+	// (2026-06-08) is OLDER than source.Updated -> source_changed.
+	mi := makeCleanCurrentMirror("mi-1", "2026-06-08T19:31:00Z", "2026-06-08T19:31:00Z", managedFieldHints{
+		summary:     source.Summary,
+		description: source.Description + "\n\n---\nSource: " + source.HTMLLink,
+		start:       &gws.EventDateTime{DateTime: "2026-06-10T19:00:00Z", TimeZone: "UTC"}, // moved
+		end:         &gws.EventDateTime{DateTime: "2026-06-10T20:00:00Z", TimeZone: "UTC"},
+	})
+	mi.RecurringEventID = "mp-1"
+	mi.OriginalStartTime = &gws.EventDateTime{DateTime: "2026-06-10T18:30:00Z", TimeZone: "UTC"}
+	api.queueGet("tgt-cal", instanceID, mi)
+
+	// Patch + checksum follow-up for the source_changed outcome.
+	postMain := *mi
+	postMain.Updated = "2026-06-09T14:19:01Z"
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+
+	h := &Handler{
+		API:              api,
+		SourceCalendarID: "src-cal",
+		TargetCalendarID: "tgt-cal",
+		SourceWritable:   true,
+		LookupMirrorParent: func(_ mirror.SourceTuple) (*gws.Event, bool) {
+			return mirrorParent, true
+		},
+	}
+	got, err := h.Handle(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if got.Action == mirror.ActionSkip && got.Reason == ReasonInstanceUnmaterializable {
+		t.Fatalf("moved exception must NOT be skip(instance_unmaterializable); the old originalStart filter caused this")
+	}
+	if got.Action != mirror.ActionPatch || got.Reason != mirror.ReasonSourceUpdated {
+		t.Errorf("expected patch(source_updated); got %s/%s", got.Action, got.Reason)
+	}
+	gets := api.callsByOp("EventsGet")
+	if len(gets) != 1 {
+		t.Fatalf("expected exactly 1 EventsGet (no repair needed - get hit); got %d", len(gets))
+	}
+	if gets[0].CalendarID != "tgt-cal" || gets[0].EventID != instanceID {
+		t.Errorf("EventsGet = %s/%s, want tgt-cal/%s", gets[0].CalendarID, gets[0].EventID, instanceID)
+	}
+}
+
+func TestHandle_Step2_NoOccurrenceKeyReturnsError(t *testing.T) {
+	api := newStubAPI()
+	mirrorParent := makeMirrorParent("mp-1")
+	// Programmer-error case: the source ID has no "_<occurrenceKey>" suffix,
+	// so locateMirrorInstance can't construct the mirror instance ID. This
+	// handler is only ever called for recurring instances, whose IDs always
+	// carry a suffix; a suffix-less ID means the classification logic routed
+	// a non-instance event here.
 	source := &gws.Event{
-		ID:               "src-evt",
-		RecurringEventID: "src-parent",
-		Updated:          "2026-04-29T20:00:00Z",
+		ID:                "src-evt", // no underscore -> no occurrence key
+		RecurringEventID:  "src-parent",
+		Updated:           "2026-04-29T20:00:00Z",
+		OriginalStartTime: &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"},
 	}
 	h := &Handler{
 		API:              api,
@@ -755,7 +862,45 @@ func TestHandle_Step2_NoOriginalStartReturnsError(t *testing.T) {
 	}
 	_, err := h.Handle(context.Background(), source)
 	if err == nil {
-		t.Fatal("expected an error for missing OriginalStartTime")
+		t.Fatal("expected an error for a source ID with no occurrence-key suffix")
+	}
+}
+
+func TestHandle_Step2_ConstructedIDCollisionAborts(t *testing.T) {
+	// Safety boundary: if the constructed mirror instance ID resolves to an
+	// event whose RecurringEventID names a DIFFERENT parent, we located the
+	// wrong resource (only reachable via an external ID collision). The
+	// handler must abort with an error rather than patch/cancel an unrelated
+	// event. No EventsPatch should fire.
+	api := newStubAPI()
+	mirrorParent := makeMirrorParent("mp-1")
+	source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
+	instanceID := expectedMirrorInstanceID("mp-1", source)
+
+	collider := makeCleanCurrentMirror("mi-1", source.Updated, source.Updated, managedFieldHints{
+		summary: source.Summary,
+		start:   source.Start,
+		end:     source.End,
+	})
+	collider.RecurringEventID = "some-other-parent" // NOT mp-1
+	collider.OriginalStartTime = source.OriginalStartTime
+	api.queueGet("tgt-cal", instanceID, collider)
+
+	h := &Handler{
+		API:              api,
+		SourceCalendarID: "src-cal",
+		TargetCalendarID: "tgt-cal",
+		SourceWritable:   true,
+		LookupMirrorParent: func(_ mirror.SourceTuple) (*gws.Event, bool) {
+			return mirrorParent, true
+		},
+	}
+	_, err := h.Handle(context.Background(), source)
+	if err == nil {
+		t.Fatal("expected an error when the located instance's RecurringEventID names a different parent")
+	}
+	if n := len(api.callsByOp("EventsPatch")); n != 0 {
+		t.Errorf("no EventsPatch should fire on a collision abort; got %d", n)
 	}
 }
 
@@ -851,7 +996,7 @@ func TestHandle_Step3_CancellationFamily(t *testing.T) {
 			if c.mirrorState == "cancelled" {
 				mi.Status = gws.EventStatusCancelled
 			}
-			api.queueInstances([]gws.Event{*mi})
+			api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 			if c.wantAction == mirror.ActionDelete {
 				postCancel := *mi
@@ -928,7 +1073,7 @@ func TestHandle_Step3_StaleBookkeeping_PatchesFromSource(t *testing.T) {
 		start:       driftedStart, // diverges from source.Start
 		end:         source.End,
 	})
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	// Two EventsPatch calls (main + checksum).
 	postMain := *mi
@@ -998,7 +1143,7 @@ func TestHandle_Step3_ConfirmedSourceCancelledMirror_Revives(t *testing.T) {
 		end:         source.End,
 	})
 	mi.Status = gws.EventStatusCancelled
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	// Two EventsPatch calls: main (full payload + status=confirmed) + checksum follow-up.
 	postMain := *mi
@@ -1056,7 +1201,7 @@ func TestHandle_Step3_DriftNoChange(t *testing.T) {
 		start:       source.Start,
 		end:         source.End,
 	})
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	h := &Handler{
 		API:              api,
@@ -1091,7 +1236,7 @@ func TestHandle_Step3_SourceChangedOnly_PatchesMirror(t *testing.T) {
 		start:       source.Start,
 		end:         source.End,
 	})
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	// Two EventsPatch calls: main + checksum.
 	postMain := *mi
@@ -1160,7 +1305,7 @@ func TestHandle_Step3_MirrorDriftedOnly_Propagate(t *testing.T) {
 		e.Summary = "User edit"
 		e.Description = "User edit\n\n---\nSource: " + source.HTMLLink
 	})
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	// First patch is on the SOURCE calendar with drifted fields.
 	postSrcPatch := *source
@@ -1197,8 +1342,8 @@ func TestHandle_Step3_MirrorDriftedOnly_Propagate(t *testing.T) {
 	if len(patches) != 3 {
 		t.Fatalf("expected 3 EventsPatch (source + mirror main + mirror checksum); got %d", len(patches))
 	}
-	if patches[0].CalendarID != "src-cal" || patches[0].EventID != "src-evt" {
-		t.Errorf("first patch should be on the source; got %s/%s", patches[0].CalendarID, patches[0].EventID)
+	if patches[0].CalendarID != "src-cal" || patches[0].EventID != source.ID {
+		t.Errorf("first patch should be on the source instance %q; got %s/%s", source.ID, patches[0].CalendarID, patches[0].EventID)
 	}
 	for i := 1; i < 3; i++ {
 		if patches[i].CalendarID != "tgt-cal" || patches[i].EventID != "mi-1" {
@@ -1242,7 +1387,7 @@ func TestHandle_Step3_MirrorDriftedOnly_Revert(t *testing.T) {
 		e.Summary = "User edit"
 		e.Description = "User edit\n\n---\nSource: " + source.HTMLLink
 	})
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	// Read-only source: only mirror gets touched (main + checksum).
 	postMirror := *mi
@@ -1298,7 +1443,7 @@ func TestHandle_Step3_BothChanged_SourceNewer_Patch(t *testing.T) {
 		e.Summary = "User edit"
 		e.Description = "User edit\n\n---\nSource: " + source.HTMLLink
 	})
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	postMain := *mi
 	postMain.Summary = source.Summary
@@ -1342,7 +1487,7 @@ func TestHandle_Step3_BothChanged_MirrorNewer_Propagate(t *testing.T) {
 		e.Summary = "User edit"
 		e.Description = "User edit\n\n---\nSource: " + source.HTMLLink
 	})
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	postSrc := *source
 	postSrc.Summary = "User edit"
@@ -1388,7 +1533,7 @@ func TestHandle_Step3_BothChanged_MirrorNewer_Revert(t *testing.T) {
 		e.Summary = "User edit"
 		e.Description = "User edit\n\n---\nSource: " + source.HTMLLink
 	})
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	api.queuePatch(mi)
 	api.queuePatch(mi)
@@ -1433,7 +1578,7 @@ func TestHandle_V1Mirror_NoActualDrift_PatchesAsMigrationUpgrade(t *testing.T) {
 		start:       source.Start,
 		end:         source.End,
 	})
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	// The migration upgrade is a normal patch+checksum-followup pair.
 	postMain := *mi
@@ -1520,7 +1665,7 @@ func TestHandle_V1Mirror_ActualDrift_MigrationSourceWon(t *testing.T) {
 		start:       source.Start,
 		end:         source.End,
 	})
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	postMain := *mi
 	postMain.Summary = source.Summary
@@ -1579,7 +1724,7 @@ func TestHandle_V1Mirror_BothChanged_MigrationSourceWon(t *testing.T) {
 			end:         source.End,
 		},
 	)
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	// Migration_source_won is a single patch+checksum on the mirror; the
 	// source is NOT touched (no propagate followup).
@@ -1659,7 +1804,7 @@ func TestHandle_V2Mirror_NeedsMigration_PatchesAsMigrationUpgrade(t *testing.T) 
 			},
 		},
 	}
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	postMain := *mi
 	api.queuePatch(&postMain)
@@ -1742,7 +1887,7 @@ func TestHandle_V2MirrorInstanceEmptyTransparencyDoesNotPropagate(t *testing.T) 
 			},
 		},
 	}
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	// Queue three patch responses so the buggy propagate path
 	// (EventsPatch source + EventsPatch mirror + checksum follow-up) and
@@ -1832,7 +1977,7 @@ func TestHandle_V2MirrorInstanceLocationDriftRoutesToMigrationSourceWon(t *testi
 			},
 		},
 	}
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	// Queue three patch responses so the buggy propagate path
 	// (EventsPatch source + EventsPatch mirror + checksum follow-up) and
@@ -1924,7 +2069,7 @@ func TestHandle_InheritedInstance_NoActualDrift_PatchesAsInheritedUpgrade(t *tes
 			end:         desired.End,
 		},
 	)
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	postMain := *mi
 	api.queuePatch(&postMain)
@@ -2014,7 +2159,7 @@ func TestHandle_InheritedInstance_DriftOnly_InheritedSourceWon(t *testing.T) {
 			end:         &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z", TimeZone: "UTC"},
 		},
 	)
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	postMain := *mi
 	api.queuePatch(&postMain)
@@ -2090,7 +2235,7 @@ func TestHandle_InheritedInstance_BothChanged_InheritedSourceWon(t *testing.T) {
 			end:         &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z", TimeZone: "UTC"},
 		},
 	)
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	postMain := *mi
 	api.queuePatch(&postMain)
@@ -2153,7 +2298,7 @@ func TestHandle_InheritedInstance_SourceOnly_FallsThroughToPatch(t *testing.T) {
 			end:         desired.End,
 		},
 	)
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	postMain := *mi
 	api.queuePatch(&postMain)
@@ -2213,7 +2358,7 @@ func TestHandle_ManagedInstance_PreservesPropagateBehavior(t *testing.T) {
 	driftMirror(mi, func(e *gws.Event) {
 		e.Summary = "User edit"
 	})
-	api.queueInstances([]gws.Event{*mi})
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
 
 	// Propagate path: events.patch source, then events.patch mirror twice
 	// (main + checksum followup).
@@ -2247,30 +2392,24 @@ func TestHandle_ManagedInstance_PreservesPropagateBehavior(t *testing.T) {
 
 // ---------- helper-level tests ----------
 
-func TestComputeOriginalStart(t *testing.T) {
+func TestOccurrenceKey(t *testing.T) {
 	tests := []struct {
-		name    string
-		in      *gws.EventDateTime
-		want    string
-		wantErr bool
+		name   string
+		in     string
+		want   string
+		wantOK bool
 	}{
-		{"datetime", &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z"}, "2026-05-01T12:00:00Z", false},
-		{"all-day", &gws.EventDateTime{Date: "2026-05-01"}, "2026-05-01", false},
-		{"datetime preferred over date", &gws.EventDateTime{Date: "2026-05-01", DateTime: "2026-05-01T12:00:00Z"}, "2026-05-01T12:00:00Z", false},
-		{"nil pointer", nil, "", true},
-		{"both empty", &gws.EventDateTime{}, "", true},
+		{"timed", "parent_20260610T183000Z", "20260610T183000Z", true},
+		{"all-day", "parent_20260610", "20260610", true},
+		{"anchored parent", "parent_R20260323T163000_20260504T163000Z", "20260504T163000Z", true},
+		{"no underscore", "src-evt", "", false},
+		{"trailing underscore", "parent_", "", true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := computeOriginalStart(tc.in)
-			if tc.wantErr {
-				if err == nil {
-					t.Errorf("expected error; got %q", got)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
+			got, ok := occurrenceKey(tc.in)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
 			}
 			if got != tc.want {
 				t.Errorf("got %q, want %q", got, tc.want)

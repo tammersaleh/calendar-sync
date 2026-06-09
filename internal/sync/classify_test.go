@@ -207,7 +207,7 @@ func TestClassify_Step2_RecurringDelegation_UpdatesInventory(t *testing.T) {
 	sink, captured := captureOutputs()
 
 	source := &gws.Event{
-		ID:                "src-evt",
+		ID:                "src-parent_20260501T120000Z",
 		Status:            gws.EventStatusConfirmed,
 		Summary:           "Updated",
 		Updated:           "2026-04-30T10:00:00Z",
@@ -228,7 +228,9 @@ func TestClassify_Step2_RecurringDelegation_UpdatesInventory(t *testing.T) {
 		"2026-04-29T20:00:00Z", "2026-04-30T08:00:00Z",
 		"Standup", source.Start, source.End,
 	)
-	api.queueInstances([]gws.Event{*mirrorInst})
+	// The recurring handler locates the mirror instance by its constructed ID
+	// (mirror parent + occurrence key from source.ID).
+	api.queueGet("tgt-cal", "mp-1_20260501T120000Z", mirrorInst)
 
 	// The recurring handler will compute drift, see the mirror needs the
 	// source-changed patch, and fire a main+checksum patch pair on the
@@ -286,7 +288,7 @@ func TestClassify_Step2_RecurringDelegation_PartialRepairOnError_UpdatesInventor
 	sink, _ := captureOutputs()
 
 	source := &gws.Event{
-		ID:                "src-evt",
+		ID:                "src-parent_20260501T120000Z",
 		Status:            gws.EventStatusConfirmed,
 		Summary:           "Standup",
 		Description:       "Standup",
@@ -308,11 +310,16 @@ func TestClassify_Step2_RecurringDelegation_PartialRepairOnError_UpdatesInventor
 	}
 	inv.Set(parentTuple, staleParent)
 
-	// First instances lookup: empty (triggers repair). The sync stub's
-	// EventsInstances dequeues from instancesErrors before instancesResp, so
-	// a leading nil error sentinel keeps the first call on the success path.
-	api.instancesErrors = append(api.instancesErrors, nil)
-	api.queueInstances(nil)
+	// First locate get: 404 (triggers repair). The repaired parent keeps id
+	// mp-1, so the retry get hits the same key; queue the transient 5xx after
+	// the 404 (the stub drains a key's error queue in order).
+	const instanceID = "mp-1_20260501T120000Z"
+	api.queueGetErr("tgt-cal", instanceID, gws.ErrAPINotFound)
+	api.queueGetErr("tgt-cal", instanceID, &gws.Error{
+		Code:     gws.CodeBackendError,
+		ExitCode: 1,
+		Op:       "events.get",
+	})
 
 	// Repair fetches the source parent.
 	sourceParent := &gws.Event{
@@ -331,13 +338,6 @@ func TestClassify_Step2_RecurringDelegation_PartialRepairOnError_UpdatesInventor
 	api.queuePatch(&postPatchParent)
 	postChecksumParent := postPatchParent
 	api.queuePatch(&postChecksumParent)
-
-	// Second instances lookup (the retry): transient 5xx.
-	api.instancesErrors = append(api.instancesErrors, &gws.Error{
-		Code:     gws.CodeBackendError,
-		ExitCode: 1,
-		Op:       "events.instances",
-	})
 
 	rec := &recurring.Handler{
 		API:              api,
@@ -380,7 +380,7 @@ func TestClassify_Step2_RecurringDelegation_BothPostWritesUpdated(t *testing.T) 
 	sink, captured := captureOutputs()
 
 	source := &gws.Event{
-		ID:                "src-evt",
+		ID:                "src-parent_20260501T120000Z",
 		Status:            gws.EventStatusConfirmed,
 		Summary:           "Standup",
 		Updated:           "2026-04-30T10:00:00Z",
@@ -399,9 +399,11 @@ func TestClassify_Step2_RecurringDelegation_BothPostWritesUpdated(t *testing.T) 
 		Recurrence: []string{"RRULE:FREQ=WEEKLY"},
 	}
 
-	// Step 2 force-rewrite path: first events.instances call returns empty,
-	// triggering the repair flow.
-	api.queueInstances(nil)
+	// Step 2 force-rewrite path: first locate get 404s, triggering the repair
+	// flow. The repaired parent keeps id mp-1 so the retry get hits the same
+	// key; the success response below is dequeued after the 404.
+	const instanceID = "mp-1_20260501T120000Z"
+	api.queueGetErr("tgt-cal", instanceID, gws.ErrAPINotFound)
 
 	// Step 2 then re-fetches the source parent for forceRewriteMirrorParent.
 	sourceParent := &gws.Event{
@@ -426,12 +428,12 @@ func TestClassify_Step2_RecurringDelegation_BothPostWritesUpdated(t *testing.T) 
 	api.queuePatch(repairedParent) // main rewrite
 	api.queuePatch(repairedParent) // checksum followup
 
-	// Step 2 retries events.instances; now it returns one instance.
+	// Step 2 retries the locate get; now it returns the instance.
 	mirrorInst := makeCleanCurrentMirror("mi-1", "src-cal:src-evt",
 		"2026-04-29T20:00:00Z", "2026-04-30T08:00:00Z",
 		"Standup", source.Start, source.End,
 	)
-	api.queueInstances([]gws.Event{*mirrorInst})
+	api.queueGet("tgt-cal", instanceID, mirrorInst)
 
 	// Step 3 drift matrix: source.Updated (2026-04-30T10:00:00Z) is newer than
 	// stored source_updated on mirrorInst (2026-04-29T20:00:00Z), so source-
@@ -499,7 +501,7 @@ func TestClassify_Step2_RecurringDelegation_CancellationKeepsInventoryEntry(t *t
 	sink, captured := captureOutputs()
 
 	source := &gws.Event{
-		ID:                "src-evt",
+		ID:                "src-parent_20260501T120000Z",
 		Status:            gws.EventStatusCancelled,
 		Updated:           "2026-04-30T10:00:00Z",
 		HTMLLink:          "https://www.google.com/calendar/event?eid=ABC",
@@ -513,14 +515,15 @@ func TestClassify_Step2_RecurringDelegation_CancellationKeepsInventoryEntry(t *t
 		Recurrence: []string{"RRULE:FREQ=WEEKLY"},
 	}
 
-	// Step 2 finds the live (not-yet-cancelled) mirror instance.
+	// Step 2 finds the live (not-yet-cancelled) mirror instance via the
+	// constructed-ID locate get.
 	mirrorInst := makeCleanCurrentMirror("mi-1", "src-cal:src-evt",
 		"2026-04-29T20:00:00Z", "2026-04-30T08:00:00Z",
 		"Standup",
 		&gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z"},
 		&gws.EventDateTime{DateTime: "2026-05-01T14:00:00Z"},
 	)
-	api.queueInstances([]gws.Event{*mirrorInst})
+	api.queueGet("tgt-cal", "mp-1_20260501T120000Z", mirrorInst)
 
 	// Pre-populate inventory with the live instance entry. After Classify,
 	// it should still be present (with the post-cancel resource).

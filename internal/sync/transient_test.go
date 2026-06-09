@@ -300,10 +300,9 @@ func TestTick_EventsInstancesInvalidRequest_AdvancesToken(t *testing.T) {
 // TestTick_RecurringHandlerLocateInstancesError_AdvancesToken pins the
 // recurring handler's locateMirrorInstance path: the mirror parent is in
 // inventory (so resolveMirrorParent succeeds via LookupMirrorParent), and
-// the first events.instances call (the locate-the-mirror-instance lookup
-// against the TARGET calendar) returns 5xx. The horizon-check
-// events.instances tested above lives in classify.go's isInHorizon; this
-// is a different code path with the same op-shape, and the transient
+// the locate-the-mirror-instance events.get against the TARGET calendar
+// returns 5xx. The horizon-check events.instances tested above lives in
+// classify.go's isInHorizon; this is a different code path and the transient
 // classifier must work for both.
 func TestTick_RecurringHandlerLocateInstancesError_AdvancesToken(t *testing.T) {
 	api := newStubAPI()
@@ -311,8 +310,9 @@ func TestTick_RecurringHandlerLocateInstancesError_AdvancesToken(t *testing.T) {
 	canonical := makeCanonical(pd)
 
 	// Recurring INSTANCE source (RecurringEventID set). Routes through
-	// step 2 to recurring.Handler.Handle.
-	src := makeRecurringInstanceSource("inst-1", "src-parent", "2026-04-29T20:00:00Z")
+	// step 2 to recurring.Handler.Handle. The ID carries the occurrence key
+	// the handler uses to construct the mirror instance ID.
+	src := makeRecurringInstanceSource("src-parent_20260501T120000Z", "src-parent", "2026-04-29T20:00:00Z")
 	api.queueListIncr("src-A", []gws.Event{*src}, "tok-new")
 
 	// Mirror parent is in inventory keyed by (src-A, src-parent). The
@@ -334,12 +334,13 @@ func TestTick_RecurringHandlerLocateInstancesError_AdvancesToken(t *testing.T) {
 		},
 	})
 
-	// First (and only) EventsInstances call is the locate-the-instance
-	// lookup against the TARGET calendar. Flake it.
-	queueInstancesErr(api, &gws.Error{
+	// The locate-the-instance events.get against the TARGET calendar flakes
+	// with a 5xx (a non-404 read failure surfaces as-is; the transient
+	// classifier maps backend_error to a skip-and-advance).
+	api.queueGetErr("tgt-A", "mp-1_20260501T120000Z", &gws.Error{
 		Code:     gws.CodeBackendError,
 		ExitCode: 1,
-		Op:       "events.instances",
+		Op:       "events.get",
 	})
 
 	r := newTestReconciler(api, canonical)

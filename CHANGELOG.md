@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.5.2](https://github.com/tammersaleh/calendar-sync/compare/v2.5.1...v2.5.2) (2026-06-15)
+
+
+### Bug Fixes
+
+* run gws in a writable scratch dir so daemon deletes don't fail ([ad15273](https://github.com/tammersaleh/calendar-sync/commit/ad15273d14eab04b120ac9c629798b3eb80a3fe0))
+
 ## [2.5.1](https://github.com/tammersaleh/calendar-sync/compare/v2.5.0...v2.5.1) (2026-06-09)
 
 

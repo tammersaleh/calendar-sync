@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 
 	"github.com/tammersaleh/calendar-sync/internal/config"
 	"github.com/tammersaleh/calendar-sync/internal/gws"
@@ -31,10 +33,59 @@ func (rt *Runtime) gwsClient() GwsClient {
 	if rt.Gws != nil {
 		return rt.Gws
 	}
-	if rt.Logger != nil {
-		return gws.New(gws.WithLogger(rt.Logger))
+	// One options slice, one constructor call. The old logger/no-logger
+	// branch split is the shape that let B25 slip through: when each option
+	// lives in its own return path it's easy to add a new one (WithWorkDir)
+	// to none of them. A single accumulated slice can't drift that way.
+	var opts []gws.Option
+	if dir := gwsScratchDir(); dir != "" {
+		opts = append(opts, gws.WithWorkDir(dir))
 	}
-	return gws.New()
+	if rt.Logger != nil {
+		opts = append(opts, gws.WithLogger(rt.Logger))
+	}
+	return gws.New(opts...)
+}
+
+// gwsScratchDir returns a best-effort app-specific directory for gws's
+// disposable stray output, or "" when no candidate can be created.
+//
+// gws renders a 204 No Content (what events.delete / calendars.delete get on
+// success) as an empty "downloaded file" and writes it as download.html in
+// the subprocess cwd. The launchd daemon runs with no WorkingDirectory, so
+// its cwd is "/" - read-only on modern macOS - and every delete then fails
+// with HTTP 500 ("Read-only file system"), succeeds server-side anyway, and
+// burns the full retry budget being logged as a failure (B25). Pointing the
+// gws subprocess at an app-specific scratch dir absorbs the stray harmlessly.
+//
+// Preference order: the user cache dir (~/Library/Caches on macOS,
+// $XDG_CACHE_HOME or ~/.cache on Linux) is the semantic home for disposable
+// junk; a fixed app subdir under the system temp dir is the fallback when the
+// cache dir can't be resolved or created (e.g. HOME unset). Returning "" -
+// which leaves the subprocess inheriting the parent cwd, and which gws.New
+// treats as "unset" - is the last resort when neither can be created.
+//
+// "Created" here means MkdirAll succeeded, not that a write is guaranteed to
+// land: a pre-existing dir with hostile permissions would still be returned.
+// That edge is not worth a per-construction write probe - the daemon's cache
+// dir is created 0700 and owned by the user running it.
+func gwsScratchDir() string {
+	var bases []string
+	if cache, err := os.UserCacheDir(); err == nil {
+		bases = append(bases, cache)
+	}
+	bases = append(bases, os.TempDir())
+
+	for _, base := range bases {
+		if base == "" {
+			continue
+		}
+		dir := filepath.Join(base, "calendar-sync")
+		if err := os.MkdirAll(dir, 0o700); err == nil {
+			return dir
+		}
+	}
+	return ""
 }
 
 // Compile-time assertion that *gws.Client satisfies GwsClient. Catches

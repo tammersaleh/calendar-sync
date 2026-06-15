@@ -40,6 +40,20 @@ Fix sketch: switch to `html/template` (handles XML-class escaping for content), 
 
 ## Fixed
 
+### B25 - daemon `events.delete` always failed HTTP 500 on read-only cwd
+
+Surfaced live while cleaning up ~660 stale Reclaim leftover events on the source calendar: the daemon dutifully pruned the corresponding mirrors, but every prune logged `backend_error during events.delete (HTTP 500): Failed to create output file: Read-only file system (os error 30)` and retried it the full 5 attempts. 148 such 500s in one prune pass.
+
+Root cause: gws renders a 204 No Content (what `events.delete` / `calendars.delete` get on success) as an empty "downloaded file" and writes `download.html` into the subprocess cwd. The launchd plist sets no `WorkingDirectory`, so the daemon's cwd defaults to `/`, which is read-only on modern macOS - the file write fails and gws exits non-zero. The Calendar API delete itself lands first (server-side), so the prune actually completed; the error was cosmetic-but-noisy and made every cancellation/orphan delete look like a failure.
+
+The gws client already had `WithWorkDir` built and tested (`internal/gws/client_test.go:TestWithWorkDir_HonoredByExecute`) for exactly this stray-file problem, and the e2e harness passed it - but the production constructor `cmd/gws.go:gwsClient()` never did. The bug was a missing option, not missing capability.
+
+Fix: `gwsClient()` now builds one options slice and passes `WithWorkDir(gwsScratchDir())`. `gwsScratchDir` prefers the user cache dir (`~/Library/Caches/calendar-sync`), falls back to a fixed subdir under the system temp dir, and returns "" (inherit-cwd) only if neither is creatable. Collapsing the old logger/no-logger return-branch split into a single accumulated slice removes the shape that let the option go missing. Covers every gws subprocess (daemon + any CLI invocation run from a read-only cwd), so no plist change was needed.
+
+Verified by `cmd/gws_test.go`: `TestGwsClient_WiresScratchWorkDir` (fake gws on PATH reports its cwd; asserts production `gwsClient()` runs it in the cache scratch dir - the cross-layer wiring guard), `TestGwsScratchDir_PrefersCacheDir`, and `TestGwsScratchDir_FallsBackToTempWhenCacheUnusable` (deterministic: plants a file at the preferred path so MkdirAll fails and the temp fallback fires; uid-independent).
+
+Operational note for bulk gws work: running `gws` writes (delete/insert/patch) from a **backgrounded/detached** shell hangs indefinitely - the keyring is unreachable without the foreground session, so the first call blocks with no gws process and no error. Run gws mutations in the foreground (small batches if needed to stay under the harness's auto-background threshold).
+
 ### B24 - moved recurring instances became permanently unsyncable (CRITICAL)
 
 Surfaced live: user rescheduled the `Lunch & Reading` 6/10 instance on personal (source) back to 11:30; the cw mirror stayed at 12:00. The daemon was healthy and ticking, the source change WAS delivered in the incremental delta, but every tick logged `skip(instance_unmaterializable)` for that instance.

@@ -281,6 +281,12 @@ Do NOT go back to `events.instances?originalStart=...`: Google's `originalStart`
 
 Known pre-existing gap (`doc/bugs.md` B24 follow-up): `patchMirrorWithChecksum` drops the post-main resource if the checksum follow-up patch fails, so the force-rewrite repair path can still lose the B19 inventory propagation on that one sub-path.
 
+### Production gws.Client must run in a writable scratch dir (B25)
+
+`cmd/gws.go:gwsClient()` passes `gws.WithWorkDir(gwsScratchDir())`. This is load-bearing, not hygiene: gws writes a stray `download.html` into its cwd on any 204 response (`events.delete` / `calendars.delete`), and the launchd daemon's cwd is `/` (read-only on macOS), so without it every delete fails HTTP 500 and burns the full retry budget (the API delete still lands, so it's noisy-but-not-broken). `gwsScratchDir` is cache-dir → temp-dir → "" (inherit). Build the client with a single accumulated options slice; do NOT reintroduce per-option return branches (that split is how the option went missing originally). The e2e harness sets `WithWorkDir` too - production and e2e must not diverge here.
+
+When doing bulk gws mutations by hand (not through the daemon), run them in the **foreground**: gws writes from a backgrounded/detached shell hang forever on keyring access with no process and no error.
+
 ## Sandbox
 
 `mise run` commands work fine in sandboxed processes. Network access required during `go mod tidy` (first run) and during `go test` for any test that pulls a module.

@@ -38,6 +38,18 @@ Fix sketch: `filepath.Abs` the result of `config.FindPath` (or just inside the l
 
 Fix sketch: switch to `html/template` (handles XML-class escaping for content), or wrap the path in `xml.EscapeText` before stamping. Test should generate a plist with `&`, `<`, `>` in the config path and verify the output parses as valid XML.
 
+### B26 - a FullSync that races a fresh feed import strands the imported events
+
+Surfaced live during the v2.6.0 install: the tripit feed imported the rebooked Jul-13 flights onto Personal, but they did not mirror to CoreWeave for ~24h-worth of ticks. Cause is the interaction between the feed importer and FullSync's syncToken reset.
+
+The daemon runs the feed importer before `Reconciler.FullSync`/`Tick` (correct for the common case). But FullSync does a FULL `events.list` of each source and resets that source's in-memory syncToken to the list's `nextSyncToken`. Google's `events.list` is not strictly read-your-writes: an event inserted seconds earlier (by the feed importer, into a calendar that is also a pdir source - here Personal) can be absent from the full list yet still behind the returned `nextSyncToken`. The token advances past it, so it never appears in a subsequent incremental delta (deltas only move forward from the token). The event is stranded until the next FullSync (`full_sync_interval`, default 24h) or a daemon restart.
+
+Incremental ticks do NOT have this problem: a tick's source-delta lists "everything since the last token" and advances the token to the new value, so a briefly-lagged event simply reappears in the next delta. The stranding is specific to FullSync's token RESET colliding with a fresh feed insert - which is most likely at startup (startup always FullSyncs, and startup is also when the importer is most likely to insert new events). The install session made it worse by restarting the daemon several times (cask relink, config WatchPaths, manual kickstart), so a doomed instance inserted the flights while a different instance's FullSync raced the list.
+
+Workaround used: restart the daemon once the feed events had settled on the source calendar (seconds-old writes -> minutes-old), so the next FullSync's full list reliably returned them and mirrored them onward. Confirmed: after the restart the Jul-13 flights mirrored to CoreWeave with `calendar-sync:source = me@tammersaleh.com:csf...`.
+
+Fix sketch (follow-up, not yet implemented): after a `Changed` feed import to calendar `C`, do not let that tick's/FullSync's token reset for source `C` swallow the just-written events. Options: (a) skip advancing `C`'s syncToken on the same pass that imported into `C`, forcing the next tick to re-list via delta from the prior token; (b) after a feed import, force an incremental (delta, not full) source pass for `C` before resetting its token; (c) have the importer return the set of written event IDs and have the reconciler verify they're present in the source list before advancing the token. Option (a) is the smallest. Needs a test that drives feed-insert-then-FullSync with a stubbed source list that omits the just-written event and asserts the token does not strand it.
+
 ## Fixed
 
 ### B25 - daemon `events.delete` always failed HTTP 500 on read-only cwd

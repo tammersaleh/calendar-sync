@@ -6,16 +6,15 @@ pass. `mise run check` green. Commits: `912f780` (plan) → `5667f51` ical →
 `0354c6d` feed → `7819adf` feedimport → `a8f9309` config → `6407228` feat (the
 user-facing wiring) → docs (this pass).
 
-Remaining before it does anything (all await user go-ahead - outward-facing /
-secret-writing, so NOT done autonomously):
-1. Final full-diff `feature-dev:code-reviewer` pass, then merge `feat/ical-importer`
-   to main + push. The `feat:` commit auto-cuts a Homebrew release.
-2. Install the release + restart the daemon (per CLAUDE.md "Installing a release").
-3. User adds a `[[feeds]]` entry to config.toml (recommend `url_env = "TRIPIT_ICAL_URL"`
-   with the TripIt feed URL in the env) targeting `me@tammersaleh.com`; the existing
-   `personal-to-work` pair mirrors onward to CoreWeave.
-4. Verify the July-13 trip imports with the rebooked flights, then do the DEFERRED
-   one-time cleanup of the 16 stale `navan*` events on CoreWeave.
+SHIPPED as v2.6.0: merged to main, released, installed, daemon running it. A
+`[[feeds]]` entry (name `tripit`, inline `url`, target `me@tammersaleh.com`) is
+live in config.toml; the rebooked Jul-13 flights imported to Personal and
+mirrored to CoreWeave. Verified stable (no churn).
+
+Still to do: (1) the deferred cleanup of the 16 stale `navan*` events on
+CoreWeave (duplicate window until then); (2) the B26 follow-up in doc/bugs.md
+(FullSync-races-feed-import can strand imported events until restart/next
+FullSync; steady-state ticks are fine).
 
 ## Resolved decisions (user, this session)
 

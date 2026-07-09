@@ -16,9 +16,10 @@ import (
 	syncpkg "github.com/tammersaleh/calendar-sync/internal/sync"
 )
 
-// feedRunner is the feed-import phase the daemon runs before every mirror
-// reconcile. *feedimport.Runner satisfies it. A nil Feeds field means no feeds
-// are configured and the phase is skipped entirely.
+// feedRunner is the feed-import phase the daemon runs before each Tick's mirror
+// reconcile (NOT before FullSync - see runFeeds and B26). *feedimport.Runner
+// satisfies it. A nil Feeds field means no feeds are configured and the phase
+// is skipped entirely.
 type feedRunner interface {
 	RunOnce(ctx context.Context) []feedimport.FeedResult
 }
@@ -53,9 +54,9 @@ type Daemon struct {
 	Stdout      io.Writer
 
 	// Feeds is the optional feed-import phase. When non-nil it runs BEFORE
-	// each Reconciler pass so a feed change reaches its target calendar and
-	// then propagates through the mirror mesh within the same pass. nil skips
-	// the phase.
+	// each Tick's mirror reconcile (not FullSync - see runFeeds/B26) so a feed
+	// change reaches its target calendar and then propagates through the mirror
+	// mesh within the same tick. nil skips the phase.
 	Feeds feedRunner
 }
 
@@ -199,7 +200,9 @@ func (d *Daemon) runFullSync(
 	store *stateStore,
 	printer *outcomePrinter,
 ) error {
-	d.runFeeds(ctx)
+	// NB: feeds are deliberately NOT imported on the FullSync pass - see runTick
+	// and runFeeds. FullSync resets each source's syncToken from a full list,
+	// and that reset can leap past a feed event written moments earlier (B26).
 	res, err := d.Reconciler.FullSync(ctx)
 	if err != nil {
 		return fmt.Errorf("daemon: FullSync: %w", err)
@@ -239,12 +242,20 @@ func (d *Daemon) runTick(
 	return nil
 }
 
-// runFeeds runs the feed-import phase when configured. It runs BEFORE the
-// mirror reconcile in the same pass (both runFullSync and runTick call it
-// first) so a feed change reaches its target calendar and then propagates
-// through the existing mirror mesh within the same pass. The Runner isolates
-// per-feed failures internally and logs each one, so a feed error can never
-// abort the mirror sync; the daemon deliberately ignores the returned results.
+// runFeeds runs the feed-import phase when configured. Only runTick calls it,
+// and it runs BEFORE the tick's mirror reconcile: a feed change reaches its
+// target calendar and then propagates through the mirror mesh within the same
+// tick. It is intentionally NOT called from runFullSync. FullSync resets each
+// source's syncToken from a full events.list, and that list can omit an event
+// the importer wrote seconds earlier while the returned token already sits past
+// it, stranding the event until the next FullSync/restart (B26). Tick uses an
+// incremental delta whose token is consistent with its own results, so a
+// briefly-lagged feed write is simply caught by the next delta - never
+// stranded. Feeds still poll every tick (subject to the fetcher's cache gate);
+// at startup the import lands on the first tick rather than the startup
+// FullSync (~one poll_interval later, race-free). The Runner isolates per-feed
+// failures internally and logs each one, so a feed error can never abort the
+// mirror sync; the daemon deliberately ignores the returned results.
 func (d *Daemon) runFeeds(ctx context.Context) {
 	if d.Feeds == nil {
 		return

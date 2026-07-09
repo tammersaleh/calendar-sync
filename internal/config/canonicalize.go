@@ -2,7 +2,10 @@ package config
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -68,6 +71,49 @@ type Canonical struct {
 	Settings  Settings
 	Calendars map[string]Calendar // keyed by canonical ID
 	PDirs     []PDir
+	Feeds     []CanonicalFeed
+}
+
+// CanonicalFeed is the post-resolution view of one enabled [[feeds]] entry:
+// the target ref resolved to a canonical (writable) calendar ID and the URL
+// secret resolved from either the inline url or the named env var.
+//
+// URL is a bearer secret; never log it directly. RedactedURL is the only
+// form safe for logs and `config show`.
+type CanonicalFeed struct {
+	Name           string
+	URL            string // resolved secret (from Feed.URL or os.Getenv(Feed.URLEnv)); MarshalJSON redacts it - see below
+	TargetCalendar string // canonical ID
+}
+
+// RedactedURL returns a log-safe rendering of the feed URL: "scheme://host/
+// <redacted>" with the path, query, and fragment (which carry the secret
+// token) dropped entirely. If the URL fails to parse or has no host, it
+// returns "<redacted>" so a malformed secret can't leak through the error
+// path either.
+func (f CanonicalFeed) RedactedURL() string {
+	u, err := url.Parse(f.URL)
+	if err != nil || u.Host == "" {
+		return "<redacted>"
+	}
+	return u.Scheme + "://" + u.Host + "/<redacted>"
+}
+
+// MarshalJSON makes CanonicalFeed fail-safe to serialize: it emits the
+// REDACTED url, never the raw secret. Without this, a future `config show`
+// wiring or a stray %+v/json.Marshal of a CanonicalFeed would leak the bearer
+// token in Field.URL. Callers that need the live URL read the field directly
+// (in memory); anything that serializes gets the redacted form.
+func (f CanonicalFeed) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Name           string `json:"name"`
+		URL            string `json:"url"`
+		TargetCalendar string `json:"target_calendar"`
+	}{
+		Name:           f.Name,
+		URL:            f.RedactedURL(),
+		TargetCalendar: f.TargetCalendar,
+	})
 }
 
 // CalendarLister is the gws-subprocess capability Canonicalize needs.
@@ -120,10 +166,16 @@ func (c Config) Canonicalize(ctx context.Context, lister CalendarLister) (*Canon
 		return nil, err
 	}
 
+	feeds, err := expandFeeds(c, calendars, refToCanonical)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Canonical{
 		Settings:  c.Settings,
 		Calendars: calendars,
 		PDirs:     pdirs,
+		Feeds:     feeds,
 	}, nil
 }
 
@@ -207,6 +259,18 @@ func resolveCalendars(ctx context.Context, c Config, lister CalendarLister) (
 			return nil, nil, err
 		}
 	}
+
+	// Enabled feed targets resolve in the SAME pass as pair refs so a single
+	// CalendarListList still covers every summary lookup. Disabled feeds are
+	// skipped entirely, like disabled pairs.
+	for _, f := range c.Feeds {
+		if !f.IsEnabled() {
+			continue
+		}
+		if err := resolve(f.Target); err != nil {
+			return nil, nil, err
+		}
+	}
 	return resolved, refToCanonical, nil
 }
 
@@ -219,6 +283,14 @@ func anyEnabledSummaryRef(c Config) bool {
 			continue
 		}
 		if p.Source.IsSummaryRef() || p.Target.IsSummaryRef() {
+			return true
+		}
+	}
+	for _, f := range c.Feeds {
+		if !f.IsEnabled() {
+			continue
+		}
+		if f.Target.IsSummaryRef() {
 			return true
 		}
 	}
@@ -469,6 +541,69 @@ func requireTarget(cal Calendar, pairName string) error {
 			ErrInvalid, pairName, cal.OriginalRef, cal.AccessRole)
 	}
 	return nil
+}
+
+// expandFeeds resolves each enabled [[feeds]] entry into a CanonicalFeed: the
+// target ref resolved to a canonical (writable) calendar and the URL secret
+// resolved from url or url_env. Disabled feeds produce nothing, mirroring
+// disabled pairs. Refs were already resolved by resolveCalendars in the same
+// pass as pair refs, so this step only looks them up and applies the
+// writable-target rule (the importer writes to the target).
+func expandFeeds(c Config, calendars map[string]Calendar, refToCanonical map[string]string) ([]CanonicalFeed, error) {
+	var out []CanonicalFeed
+	for _, f := range c.Feeds {
+		if !f.IsEnabled() {
+			continue
+		}
+
+		targetCal, ok := calendars[refToCanonical[refKey(f.Target)]]
+		if !ok {
+			return nil, fmt.Errorf("%w: feed %q target %s not resolved",
+				ErrInvalid, f.Name, refDescription(f.Target))
+		}
+		if err := requireFeedTarget(targetCal, f.Name); err != nil {
+			return nil, err
+		}
+
+		feedURL, err := resolveFeedURL(f)
+		if err != nil {
+			return nil, err
+		}
+
+		out = append(out, CanonicalFeed{
+			Name:           f.Name,
+			URL:            feedURL,
+			TargetCalendar: targetCal.CanonicalID,
+		})
+	}
+	return out, nil
+}
+
+// requireFeedTarget enforces that a feed's target calendar is writable; the
+// importer inserts, patches, and deletes events on it.
+func requireFeedTarget(cal Calendar, feedName string) error {
+	if !AccessRoleAtLeast(cal.AccessRole, AccessRoleWriter) {
+		return fmt.Errorf("%w: feed %q target %q has accessRole %q; need at least writer",
+			ErrInvalid, feedName, cal.OriginalRef, cal.AccessRole)
+	}
+	return nil
+}
+
+// resolveFeedURL returns the feed's URL secret from the inline url or, when
+// url_env is set, from that env var. Validate has already enforced the
+// exactly-one rule and that the env var is set/non-empty, but re-check here
+// so canonicalization never emits a CanonicalFeed with an empty URL if it's
+// ever called without a prior Validate. The error names only the env var,
+// never its value.
+func resolveFeedURL(f Feed) (string, error) {
+	if f.URL != "" {
+		return f.URL, nil
+	}
+	if v, ok := os.LookupEnv(f.URLEnv); ok && v != "" {
+		return v, nil
+	}
+	return "", fmt.Errorf("%w: feed %q url_env names environment variable %q which is unset or empty",
+		ErrInvalid, f.Name, f.URLEnv)
 }
 
 func makePDir(p Pair, source, target Calendar, horizon time.Duration, propagate bool) PDir {

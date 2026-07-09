@@ -18,6 +18,39 @@ import (
 type Config struct {
 	Settings Settings `toml:"settings"`
 	Pairs    []Pair   `toml:"pairs"`
+	Feeds    []Feed   `toml:"feeds"`
+}
+
+// Feed is one [[feeds]] entry: an iCal feed imported into a Google calendar
+// by the feed importer. It's independent of [[pairs]] - the importer runs as
+// its own daemon phase, writing only events it owns (namespaced by Name).
+//
+// Name is the feed's stable identity. It becomes the importer's FeedID, which
+// namespaces every imported event's deterministic ID and scopes the
+// "absent from feed => delete" cleanup. Renaming a feed therefore ORPHANS its
+// previously-imported events: they carry the old feed_id, so the renamed feed
+// won't match or prune them. Renames need manual cleanup of the old events.
+//
+// URL and URLEnv are mutually exclusive: set exactly one. Both hold a bearer
+// secret (the feed token lives in the URL path), so URLEnv lets the secret
+// stay out of the config file. The resolved URL is never logged in full;
+// see CanonicalFeed.RedactedURL.
+//
+// Enabled is a *bool so an unset value defaults to true; only an explicit
+// `enabled = false` disables the feed, skipping it entirely (no resolution,
+// no validation), mirroring disabled pairs.
+type Feed struct {
+	Name    string      `toml:"name"`
+	URL     string      `toml:"url"`
+	URLEnv  string      `toml:"url_env"`
+	Target  CalendarRef `toml:"target"`
+	Enabled *bool       `toml:"enabled"`
+}
+
+// IsEnabled returns whether the feed should be imported. Enabled defaults to
+// true when not set in TOML.
+func (f Feed) IsEnabled() bool {
+	return f.Enabled == nil || *f.Enabled
 }
 
 // Settings is the [settings] block. Every field has a default applied

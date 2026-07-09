@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"time"
 )
@@ -47,6 +48,22 @@ func (c Config) Validate() error {
 			return fmt.Errorf("%w: duplicate pair name %q", ErrInvalid, p.Name)
 		}
 		seenNames[p.Name] = struct{}{}
+	}
+
+	// Disabled feeds are skipped entirely (mirrors disabled pairs): no
+	// validation, and they don't participate in the name-uniqueness check.
+	seenFeeds := make(map[string]struct{}, len(c.Feeds))
+	for i, f := range c.Feeds {
+		if !f.IsEnabled() {
+			continue
+		}
+		if err := validateFeed(i, f); err != nil {
+			return err
+		}
+		if _, dup := seenFeeds[f.Name]; dup {
+			return fmt.Errorf("%w: duplicate feed name %q", ErrInvalid, f.Name)
+		}
+		seenFeeds[f.Name] = struct{}{}
 	}
 	return nil
 }
@@ -101,10 +118,10 @@ func validatePair(idx int, p Pair) error {
 			ErrInvalid, p.Name, p.Direction)
 	}
 
-	if err := validateCalendarRef(p.Name, "source", p.Source); err != nil {
+	if err := validateCalendarRef(fmt.Sprintf("pairs[%q].source", p.Name), p.Source); err != nil {
 		return err
 	}
-	if err := validateCalendarRef(p.Name, "target", p.Target); err != nil {
+	if err := validateCalendarRef(fmt.Sprintf("pairs[%q].target", p.Name), p.Target); err != nil {
 		return err
 	}
 	// Pre-canonicalization source==target catches the typo case early
@@ -130,22 +147,57 @@ func validatePair(idx int, p Pair) error {
 	return nil
 }
 
+// validateFeed enforces the SPEC "[[feeds]]" rules that don't need Calendar
+// API access. loc is the caller-visible "feeds[N]" index used only when the
+// name is missing (so there's no name to reference). Only ENABLED feeds reach
+// this function; disabled feeds are skipped entirely by Validate, mirroring
+// disabled pairs.
+//
+// The feed URL is a bearer secret: no error message here echoes the URL or
+// the value of the env var, only the env-var NAME.
+func validateFeed(idx int, f Feed) error {
+	if f.Name == "" {
+		return fmt.Errorf("%w: feeds[%d].name is required", ErrInvalid, idx)
+	}
+
+	hasURL := f.URL != ""
+	hasEnv := f.URLEnv != ""
+	switch {
+	case hasURL && hasEnv:
+		return fmt.Errorf("%w: feed %q sets both url and url_env; set exactly one",
+			ErrInvalid, f.Name)
+	case !hasURL && !hasEnv:
+		return fmt.Errorf("%w: feed %q sets neither url nor url_env; set exactly one",
+			ErrInvalid, f.Name)
+	}
+
+	if hasEnv {
+		if v, ok := os.LookupEnv(f.URLEnv); !ok || v == "" {
+			return fmt.Errorf("%w: feed %q url_env names environment variable %q which is unset or empty",
+				ErrInvalid, f.Name, f.URLEnv)
+		}
+	}
+
+	return validateCalendarRef(fmt.Sprintf("feeds[%q].target", f.Name), f.Target)
+}
+
 // validateCalendarRef enforces the string-or-table union shape that
 // CalendarRef.UnmarshalTOML is permissive about. The unmarshal path
 // accepts {} and {account = "..."} (no summary) and surfaces the
-// required-field error here so config_invalid output stays uniform.
+// required-field error here so config_invalid output stays uniform. loc is
+// the fully-qualified field location (e.g. `pairs["p"].source`,
+// `feeds["tripit"].target`) so pairs and feeds share one implementation.
 //
 // Account-without-summary is checked before the required-field check so a
 // user who wrote `target = {account = "alice"}` gets a hint that account
 // requires summary, rather than the more generic "target is required".
-func validateCalendarRef(pairName, field string, r CalendarRef) error {
+func validateCalendarRef(loc string, r CalendarRef) error {
 	if r.Account != "" && r.Summary == "" {
-		return fmt.Errorf("%w: pairs[%q].%s sets account=%q but no summary; account is only valid with a summary lookup",
-			ErrInvalid, pairName, field, r.Account)
+		return fmt.Errorf("%w: %s sets account=%q but no summary; account is only valid with a summary lookup",
+			ErrInvalid, loc, r.Account)
 	}
 	if r.ID == "" && r.Summary == "" {
-		return fmt.Errorf("%w: pairs[%q].%s is required",
-			ErrInvalid, pairName, field)
+		return fmt.Errorf("%w: %s is required", ErrInvalid, loc)
 	}
 	return nil
 }

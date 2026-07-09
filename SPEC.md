@@ -328,6 +328,22 @@ The inline-table form makes one `gws calendar calendarList list` call at canonic
 
 Limitation: when `dataOwner` is empty, `account` falls back to ID-substring matching, which breaks for import/subscription calendars whose IDs look like `<random>@import.calendar.google.com` - the random hash carries no account information. If two such calendars share a display name and neither can be disambiguated by `dataOwner` or ID substring, fall back to the bare ID-form ref. New calendars added in Google Calendar's UI after the daemon starts aren't visible until config reload (same behavior as the pre-F1 ID-form path).
 
+#### `[[feeds]]`
+
+A feed imports an external iCalendar (`.ics`) URL into a Google calendar. Unlike a pair (which mirrors between two Google calendars), a feed's source is an HTTP-fetched read-only `.ics` document. The importer polls the URL, parses its `VEVENT`s, and reconciles them into the target calendar via a full-snapshot diff (insert new, patch changed, delete vanished). From there the normal pair mesh propagates the imported events onward like any other event on that calendar.
+
+Typical use: replace Google's slow "subscribe by URL" refresh (hours to a day) with calendar-sync's own polling. A travel feed (TripIt, Navan) that regenerates every 15 min shows up on your calendar within a tick instead of whenever Google next re-polls.
+
+| Field     | Type                   | Required   | Description                                                                                                                                     |
+|-----------|------------------------|------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
+| `name`    | string                 | yes        | Unique across all feeds. Becomes the importer's stable identity: it namespaces the imported events' deterministic IDs and scopes which events the feed may delete. Renaming a feed orphans its previously-imported events (they carry the old name and won't be matched or pruned) - clean them up by hand. |
+| `url`     | string                 | one of     | The iCal feed URL. A **bearer secret** (anyone with it can read the calendar). Never logged, never in an error, redacted in `config show`.       |
+| `url_env` | string                 | one of     | Name of an environment variable holding the URL instead of `url`. Exactly one of `url` / `url_env` must be set. Prefer `url_env` to keep the secret out of the config file. |
+| `target`  | string or inline table | yes        | Calendar to import into. Same reference forms as a pair's `target` (see "Calendar references"). Must be writable (`accessRole >= writer`).       |
+| `enabled` | bool                   | no (true)  | If false, the feed is skipped entirely - no URL resolution, no validation, no import.                                                           |
+
+Fetch cadence is governed by the feed's own HTTP caching, not a config knob: the importer honors `Cache-Control: max-age` (falling back to the feed's `X-PUBLISHED-TTL`, then a 15-min default), clamped to `[60s, 24h]`. The daemon calls the importer every tick, but the in-memory cache gate skips the actual HTTP request until the TTL elapses. Deletion is scoped to the feed's own events and only ever happens after a successful fetch + full parse - a fetch failure, a `304 Not Modified`, or a parse error never prunes anything.
+
 #### Validation rules
 
 Run on every command that touches config. Failures exit with code 1 and a JSON error to stderr (see Output).
@@ -348,6 +364,10 @@ Run on every command that touches config. Failures exit with code 1 and a JSON e
   - The source calendar's `accessRole` is `>= reader` (i.e. `reader`, `writer`, or `owner`). `freeBusyReader` is rejected because we cannot read event details.
   - The target calendar's `accessRole` is `>= writer` (`writer` or `owner`). A read-only target means we can never write mirrors there.
   - The pdir's `source_writable` flag (used by drift handling) is `true` iff the source's `accessRole` is `>= writer`. A `source_writable=false` pdir can still mirror events from source to target; it just `revert`s any mirror drift instead of `propagate`ing.
+- **Feeds** (only enabled feeds are validated; a disabled feed is skipped entirely, like a disabled pair):
+  - `name` is non-empty and unique across all feeds.
+  - Exactly one of `url` / `url_env` is set. If `url_env`, the named environment variable must be set and non-empty. Error messages never include the URL or the env value - only the field or variable name.
+  - `target` is a valid calendar reference and, after canonicalization, resolves to a calendar with `accessRole >= writer` (the importer writes to it).
 
 ### Examples
 
@@ -414,6 +434,19 @@ name = "coreweave-to-personal"
 source = {summary = "CoreWeave", account = "alice@example.com"}
 target = "primary"
 ```
+
+#### Import a TripIt feed directly (faster than a Google subscription)
+
+Rather than subscribing Google Calendar to the TripIt `.ics` (which Google re-polls only every several hours), import it with a `[[feeds]]`. calendar-sync polls the feed on its own TTL (~15 min for TripIt) and writes the events into the target calendar; the pair mesh then mirrors them onward. Keep the secret URL in an env var:
+
+```toml
+[[feeds]]
+name = "tripit"
+url_env = "TRIPIT_ICAL_URL"
+target = "primary"
+```
+
+The events land on `primary` as ordinary events, so any `[[pairs]]` with `source = "primary"` mirrors them to the other calendar within the same tick. Nothing else references the feed; `name` just has to stay stable (renaming orphans the previously-imported events).
 
 ## Authentication
 
@@ -679,9 +712,11 @@ Stdout:
 
 ```
 $ calendar-sync config show
-{"settings":{"poll_interval":"60s","horizon":"365d","full_sync_interval":"24h","log_level":"info","log_format":"json","dry_run":false,"propagate_target_edits":true},"pairs":[{"name":"work-to-personal","source":"alice@example.com","target":"primary","enabled":true}]}
+{"settings":{"poll_interval":"60s","horizon":"365d","full_sync_interval":"24h","log_level":"info","log_format":"json","dry_run":false,"propagate_target_edits":true},"pairs":[{"name":"work-to-personal","source":"alice@example.com","target":"primary","enabled":true}],"feeds":[{"name":"tripit","url":"https://www.tripit.com/<redacted>","target_calendar":"primary"}]}
 {"_meta":{"count":1}}
 ```
+
+Feed URLs are always shown redacted (`scheme://host/<redacted>`) - the path/token is a bearer secret and never appears in output. `feeds` is omitted entirely when no feeds are configured.
 
 #### Errors
 
@@ -1026,6 +1061,8 @@ Startup wall-clock cost on real-world calendars (1-year horizon, ~1000 events pe
 ### Daemon lifecycle: per-tick reconciliation
 
 Every `poll_interval`, the internal scheduler fires the per-tick path.
+
+**Feed-import phase (feeds only).** Before the reconciliation phases below, the daemon runs the feed importer once for every enabled `[[feeds]]` entry: fetch (subject to the per-feed cache gate), parse, and reconcile into the target calendar. This runs FIRST so that a feed change lands on its target calendar before the source-delta phase lists that calendar - a feed event imported to calendar `T` is then picked up and mirrored onward by any pair whose source is `T` within the same tick, rather than waiting for the next one. A feed failure is isolated per feed and never aborts the reconciliation phases. The same ordering applies at startup and full re-sync (feeds import before `FullSync`).
 
 **Phase ordering.** The target-delta phase (step 0 below) MUST run before the source-delta phase (steps 1-4). If reversed, source-driven mirror rewrites in the source-delta phase can clobber target-side edits before the target-delta phase has a chance to detect and propagate them. The two phases are sequential, not interleaved, within a single tick.
 
@@ -1557,11 +1594,15 @@ The following are intentionally not part of this version. None require structura
 - **Parallel pdir execution.** Each tick processes pdirs sequentially. Wall-clock cost is dominated by Google API latency, not local CPU; parallelism would reduce latency at the cost of complexity.
 - **Multi-machine sync coordination.** A single user running `watch` on multiple machines simultaneously would have both machines making redundant API calls. Don't do this; pick one host. There's no state arbitration to make multi-host correct.
 - **Linux/Windows.** `install`/`uninstall` write a launchd plist; running on non-Darwin platforms exits with `not_macos`. The sync engine itself is portable Go and could be built on Linux for ad-hoc `run` invocations, but no service-installation story is provided for non-macOS hosts.
+- **Recurring events in feeds.** The feed importer projects concrete `VEVENT`s only. It parses `RRULE`/`RDATE`/`EXDATE` but does not expand them into occurrences, so a feed shipping a recurring *master* (rather than pre-expanded instances) imports only the master. This fits the target feeds (TripIt, Navan, and most travel/booking exports ship concrete instances). Expansion would require pairing in an RRULE library.
+- **Two-way sync to feeds.** Feeds are one-way (read-only source). Edits to imported events aren't propagated back to the feed provider (there's no write API), and the next poll re-projects the feed's state. Imported events live on a normal Google calendar, so the pair mesh can still mirror them onward two-way between *Google* calendars.
+- **Per-feed status in the IPC snapshot.** `calendar-sync status` does not yet report per-feed last-fetch / last-success / staleness. Feed health is surfaced via the daemon logs (per-feed import result lines). A structured IPC surface is a later addition.
 
 ## Dependencies
 
 - **CLI framework**: [kong](https://github.com/alecthomas/kong).
 - **Config**: [BurntSushi/toml](https://github.com/BurntSushi/toml).
+- **iCalendar parsing**: [arran4/golang-ical](https://github.com/arran4/golang-ical) - parses `[[feeds]]` `.ics` documents. The only third-party runtime dependency beyond kong/toml; the HTTP fetch uses stdlib `net/http`.
 - **Subprocess**: stdlib `os/exec`. `gws` is invoked with `--format json` and parsed.
 - **Locking**: stdlib `golang.org/x/sys/unix` for `flock`.
 - **Logging**: stdlib `log/slog` with custom JSON and text handlers.

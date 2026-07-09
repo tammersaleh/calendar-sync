@@ -99,6 +99,9 @@ internal/
   sync/            # core algorithm: list, classify, reconcile, prune
   mirror/          # mirror payload construction, extended-property layout, drift handling
   recurring/       # recurring-instance handler, occurrence-key / instance-id helpers
+  ical/            # iCalendar (.ics) parser: bytes -> normalized []ical.Item (wraps golang-ical)
+  feed/            # HTTP conditional-GET fetcher for feed URLs (ETag/cache-gate, secret-safe)
+  feedimport/      # one-way [[feeds]] importer: fetch+parse+reconcile into a target calendar (Runner)
   daemon/          # lifecycle, scheduler, IPC socket
   output/          # JSONL printer, _meta trailer, error stderr writer
   launchd/         # plist generation, launchctl wrappers
@@ -286,6 +289,26 @@ Known pre-existing gap (`doc/bugs.md` B24 follow-up): `patchMirrorWithChecksum` 
 `cmd/gws.go:gwsClient()` passes `gws.WithWorkDir(gwsScratchDir())`. This is load-bearing, not hygiene: gws writes a stray `download.html` into its cwd on any 204 response (`events.delete` / `calendars.delete`), and the launchd daemon's cwd is `/` (read-only on macOS), so without it every delete fails HTTP 500 and burns the full retry budget (the API delete still lands, so it's noisy-but-not-broken). `gwsScratchDir` is cache-dir → temp-dir → "" (inherit). Build the client with a single accumulated options slice; do NOT reintroduce per-option return branches (that split is how the option went missing originally). The e2e harness sets `WithWorkDir` too - production and e2e must not diverge here.
 
 When doing bulk gws mutations by hand (not through the daemon), run them in the **foreground**: gws writes from a backgrounded/detached shell hang forever on keyring access with no process and no error.
+
+### iCal feed importer (`[[feeds]]`) is a separate one-way path, not a source "kind"
+
+The feed importer (`internal/ical` parse → `internal/feed` fetch → `internal/feedimport` reconcile, orchestrated by `feedimport.Runner`) deliberately does NOT reuse the `sync.Reconciler`. That reconciler is Google-shaped top to bottom (per-source syncTokens, an orphan walk that re-`events.get`s each source, `config.CalendarRef`/accessRole resolution). A feed has none of that, so it gets its own full-snapshot-diff reconcile loop. The seam between them is the ordinary Google calendar the importer writes to: imported events are just events, so the pair mesh mirrors them onward with zero feed-specific code.
+
+Load-bearing invariants (each has a test that fails if broken):
+
+- **Feed events use the `calendar-sync-feed:*` namespace, never `calendar-sync:*`.** If they carried the mirror namespace, loop-prevention would skip them when the target calendar is scanned as a pair source, and `BuildInventory` would misclassify them as mirrors. The distinct namespace (`:uid`, `:feed_id`, `:checksum`, `:version`) is what lets them mirror onward normally. Deterministic IDs use the `csf` prefix (vs mirror's `cs2`).
+- **Delete scope is filtered by BOTH `version` AND `feed_id`.** `feedimport.listExisting` passes both as `privateExtendedProperty` filters. Without the `feed_id` scope, two feeds sharing a target calendar would each list the other's events, find them absent from its own snapshot, and delete them. `Feed.Name` is the `feed_id` and is the stable identity — renaming a feed orphans its prior events (old `feed_id`, never matched, never pruned).
+- **Delete only after a successful 200 + full parse.** A cache-skip, `304`, fetch error, or parse error must never prune. The Runner short-circuits before reconcile on skip/unchanged; deletion is "feed-owned event whose UID is absent from a *complete* snapshot."
+- **Change detection is feed-vs-feed**, not against Google's post-write resource. `feedimport` reuses `mirror.Checksum` over the desired managed fields and stores it in `calendar-sync-feed:checksum`; the next poll compares new-desired vs stored. This diverges from the mirror layer's post-write-resource contract on purpose (a one-way projector never reads the event back to detect drift) and is what avoids churning the mirror mesh every tick.
+- **The importer runs BEFORE `Reconciler.FullSync`/`Tick`** in `daemon.runFullSync`/`runTick`, so a feed change reaches its target and mirrors onward in the same tick. `run` refreshes feeds only on an UNSCOPED run — a `--pair`-filtered run (including `pair test`, which delegates to `RunCmd.run` with a pair filter) skips the feed phase so it can't make live HTTP calls to feed providers as a side effect.
+
+### The feed URL is a bearer secret — never let it surface
+
+Anyone with the `[[feeds]]` URL can read the calendar. It's accepted via `url` or `url_env` (prefer `url_env`), and it must never reach a log line, an error, stdout (`config show`), or the IPC snapshot. Enforced structurally: `internal/feed` sanitizes it out of every error (`*url.Error` unwrap + host-only messages), the `Importer` has no URL field, and `config.CanonicalFeed.MarshalJSON` emits only `RedactedURL()` so a stray serialization fails safe. When adding any code that touches a feed, grep your diff for the URL before committing.
+
+### golang-ical parses but does not expand recurrence; property lookup is case-sensitive
+
+`internal/ical` wraps `github.com/arran4/golang-ical` (the only runtime dep beyond kong/toml). Two gotchas baked into the wrapper: (1) the library parses `RRULE`/`RDATE`/`EXDATE` but does NOT expand them into occurrences — fine because target feeds (TripIt, Navan) ship pre-expanded concrete `VEVENT`s; a feed with a recurring master would import only the master. (2) the library's `GetProperty` matches `IANAToken` case-*sensitively*, but RFC 5545 §3.1 makes names case-insensitive, so `internal/ical.getProp` does the lookup with `EqualFold` — a lowercase `dtstart:` would otherwise silently import a zero date. Route all property reads through `getProp`, never the library's `GetProperty`.
 
 ## Sandbox
 

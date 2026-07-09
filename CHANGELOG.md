@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.6.1](https://github.com/tammersaleh/calendar-sync/compare/v2.6.0...v2.6.1) (2026-07-09)
+
+
+### Bug Fixes
+
+* import feeds on the tick path only, not FullSync (B26) ([4bac82e](https://github.com/tammersaleh/calendar-sync/commit/4bac82e63d380712b5984825f5ce9ce860e2580a))
+
 ## [2.6.0](https://github.com/tammersaleh/calendar-sync/compare/v2.5.2...v2.6.0) (2026-07-09)
 
 

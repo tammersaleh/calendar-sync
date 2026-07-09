@@ -338,6 +338,80 @@ func TestConfigShowCmd_CanonicalizeResolvesSource(t *testing.T) {
 	}
 }
 
+// feedConfigTOML declares one feed whose URL carries a bearer-secret token.
+// The secret substring must never appear in `config show` output.
+const feedConfigTOML = `
+[settings]
+poll_interval      = "60s"
+horizon            = "365d"
+full_sync_interval = "24h"
+log_level          = "info"
+log_format         = "json"
+
+[[pairs]]
+name   = "work-personal"
+source = "work@example.com"
+target = "personal@example.com"
+
+[[feeds]]
+name   = "trip"
+url    = "https://feeds.example.com/private/SUPER-SECRET-TOKEN/cal.ics"
+target = "travel@example.com"
+`
+
+// TestConfigShowCmd_EmitsFeedsRedacted pins that `config show` surfaces each
+// feed with a REDACTED url (never the raw bearer secret), in both the raw and
+// the --canonicalize paths.
+func TestConfigShowCmd_EmitsFeedsRedacted(t *testing.T) {
+	const secretToken = "SUPER-SECRET-TOKEN"
+	const wantURL = "https://feeds.example.com/<redacted>"
+
+	for _, canon := range []bool{false, true} {
+		name := "raw"
+		if canon {
+			name = "canonicalize"
+		}
+		t.Run(name, func(t *testing.T) {
+			path := writeConfigFixture(t, feedConfigTOML)
+			stdout := &bytes.Buffer{}
+			rt := &Runtime{
+				Stdout:  stdout,
+				Stderr:  &bytes.Buffer{},
+				Globals: Globals{Config: path},
+				Ctx:     context.Background(),
+				Gws:     &stubGws{},
+			}
+			if err := (&ConfigShowCmd{Canonicalize: canon}).Run(rt); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+
+			// The raw secret must be absent from the ENTIRE output.
+			if strings.Contains(stdout.String(), secretToken) {
+				t.Fatalf("secret token leaked into config show output:\n%s", stdout.String())
+			}
+
+			var payload configShowPayload
+			first := strings.SplitN(stdout.String(), "\n", 2)[0]
+			if err := json.Unmarshal([]byte(first), &payload); err != nil {
+				t.Fatalf("unmarshal: %v\nstdout=%s", err, stdout.String())
+			}
+			if len(payload.Feeds) != 1 {
+				t.Fatalf("feeds = %+v, want exactly one feed", payload.Feeds)
+			}
+			f := payload.Feeds[0]
+			if f.Name != "trip" {
+				t.Errorf("feed name = %q, want trip", f.Name)
+			}
+			if f.URL != wantURL {
+				t.Errorf("feed url = %q, want %q (redacted)", f.URL, wantURL)
+			}
+			if f.Target != "travel@example.com" {
+				t.Errorf("feed target = %q, want travel@example.com", f.Target)
+			}
+		})
+	}
+}
+
 func TestConfigShowCmd_MissingFileMapsToConfigNotFound(t *testing.T) {
 	stdout := &bytes.Buffer{}
 	rt := &Runtime{

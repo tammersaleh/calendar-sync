@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/tammersaleh/calendar-sync/internal/config"
+	"github.com/tammersaleh/calendar-sync/internal/feedimport"
 	"github.com/tammersaleh/calendar-sync/internal/gws"
 	"github.com/tammersaleh/calendar-sync/internal/output"
 	syncpkg "github.com/tammersaleh/calendar-sync/internal/sync"
@@ -86,8 +87,21 @@ func (c *RunCmd) run(ctx context.Context, rt *Runtime, canonical *config.Canonic
 	// SPEC line 253: `[settings].dry_run = true` must suppress writes the
 	// same way `--dry-run` does. Either source of truth flips the wrapper.
 	api := rt.gwsClient()
-	if c.DryRun || canonical.Settings.DryRun {
+	dryRun := c.DryRun || canonical.Settings.DryRun
+	if dryRun {
 		api = newDryRunAPI(api)
+	}
+
+	// Feed-import phase runs ONCE before the pdir reconcile so a manual full
+	// `run` refreshes feeds and then mirrors within the same command. Feeds are
+	// global (not part of any pair), so they run ONLY on an unscoped run: a
+	// `--pair`-filtered run (including `pair test`, which delegates here with a
+	// pair filter) is asking about one specific pair and must not make live HTTP
+	// calls to unrelated third-party feed providers as a side effect.
+	if len(c.Pair) == 0 {
+		if feeds := feedConfigs(canonical.Feeds); len(feeds) > 0 {
+			feedimport.NewRunner(api, feeds, dryRun, time.Now, rt.Logger).RunOnce(ctx)
+		}
 	}
 
 	// Build a per-command Reconciler scoped to the filtered pdir list. We

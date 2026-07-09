@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"os"
+
 	"github.com/tammersaleh/calendar-sync/internal/config"
 )
 
@@ -45,6 +47,9 @@ func (c *ConfigShowCmd) Run(rt *Runtime) error {
 		for _, p := range cfg.Pairs {
 			body.Pairs = append(body.Pairs, pairPayloadFromCanonical(p, canonical))
 		}
+		// Canonical feeds already dropped disabled entries and resolved the
+		// target ref to its canonical ID; RedactedURL keeps the secret out.
+		body.Feeds = feedPayloadsFromCanonical(canonical.Feeds)
 	} else {
 		for _, p := range cfg.Pairs {
 			row := pairPayload{
@@ -59,6 +64,7 @@ func (c *ConfigShowCmd) Run(rt *Runtime) error {
 			}
 			body.Pairs = append(body.Pairs, row)
 		}
+		body.Feeds = feedPayloadsFromConfig(cfg.Feeds)
 	}
 
 	p := rt.printer()
@@ -140,6 +146,68 @@ func (c *ConfigValidateCmd) Run(rt *Runtime) error {
 type configShowPayload struct {
 	Settings settingsPayload `json:"settings"`
 	Pairs    []pairPayload   `json:"pairs"`
+	Feeds    []feedPayload   `json:"feeds,omitempty"`
+}
+
+// feedPayload is the wire shape for one [[feeds]] entry in `config show`.
+// URL is ALWAYS the redacted rendering (scheme://host/<redacted>): the feed
+// URL is a bearer secret and the raw value must never reach stdout. Target is
+// the raw ref (non-canonicalize) or the canonical calendar ID (canonicalize).
+type feedPayload struct {
+	Name   string `json:"name"`
+	URL    string `json:"url"`
+	Target string `json:"target"`
+}
+
+// feedPayloadsFromCanonical renders resolved canonical feeds (already
+// enabled-filtered, target resolved to a canonical ID). RedactedURL is the
+// only URL form that leaves the process.
+func feedPayloadsFromCanonical(feeds []config.CanonicalFeed) []feedPayload {
+	if len(feeds) == 0 {
+		return nil
+	}
+	out := make([]feedPayload, 0, len(feeds))
+	for _, f := range feeds {
+		out = append(out, feedPayload{
+			Name:   f.Name,
+			URL:    f.RedactedURL(),
+			Target: f.TargetCalendar,
+		})
+	}
+	return out
+}
+
+// feedPayloadsFromConfig renders raw config feeds for the non-canonicalize
+// path (no gws call). Disabled feeds are dropped to match the canonical
+// output. The URL secret - inline or resolved from url_env - is redacted via
+// CanonicalFeed.RedactedURL before it can reach stdout.
+func feedPayloadsFromConfig(feeds []config.Feed) []feedPayload {
+	var out []feedPayload
+	for _, f := range feeds {
+		if !f.IsEnabled() {
+			continue
+		}
+		raw := f.URL
+		if raw == "" && f.URLEnv != "" {
+			raw = os.Getenv(f.URLEnv)
+		}
+		out = append(out, feedPayload{
+			Name:   f.Name,
+			URL:    config.CanonicalFeed{URL: raw}.RedactedURL(),
+			Target: feedTargetString(f.Target),
+		})
+	}
+	return out
+}
+
+// feedTargetString renders a raw target ref as a string for feedPayload.Target
+// (which is a plain string, not a CalendarRef). Summary-form refs render as
+// their summary; ID-form refs as their ID.
+func feedTargetString(r config.CalendarRef) string {
+	if r.IsSummaryRef() {
+		return r.Summary
+	}
+	return r.ID
 }
 
 // settingsPayload mirrors SPEC line 588's settings sub-object. Durations

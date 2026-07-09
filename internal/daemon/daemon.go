@@ -12,8 +12,16 @@ import (
 	"time"
 
 	"github.com/tammersaleh/calendar-sync/internal/config"
+	"github.com/tammersaleh/calendar-sync/internal/feedimport"
 	syncpkg "github.com/tammersaleh/calendar-sync/internal/sync"
 )
+
+// feedRunner is the feed-import phase the daemon runs before every mirror
+// reconcile. *feedimport.Runner satisfies it. A nil Feeds field means no feeds
+// are configured and the phase is skipped entirely.
+type feedRunner interface {
+	RunOnce(ctx context.Context) []feedimport.FeedResult
+}
 
 // Daemon is the long-running process that drives sync.Reconciler. Construct
 // one per process; call Run to start the main loop.
@@ -43,6 +51,12 @@ type Daemon struct {
 	AuthChecker AuthChecker
 	Clock       Clock
 	Stdout      io.Writer
+
+	// Feeds is the optional feed-import phase. When non-nil it runs BEFORE
+	// each Reconciler pass so a feed change reaches its target calendar and
+	// then propagates through the mirror mesh within the same pass. nil skips
+	// the phase.
+	Feeds feedRunner
 }
 
 // Run executes SPEC §"Daemon lifecycle: startup" (lines 887-913) plus the
@@ -185,6 +199,7 @@ func (d *Daemon) runFullSync(
 	store *stateStore,
 	printer *outcomePrinter,
 ) error {
+	d.runFeeds(ctx)
 	res, err := d.Reconciler.FullSync(ctx)
 	if err != nil {
 		return fmt.Errorf("daemon: FullSync: %w", err)
@@ -209,6 +224,7 @@ func (d *Daemon) runTick(
 	store *stateStore,
 	printer *outcomePrinter,
 ) error {
+	d.runFeeds(ctx)
 	res, err := d.Reconciler.Tick(ctx)
 	if err != nil {
 		return fmt.Errorf("daemon: Tick: %w", err)
@@ -221,6 +237,19 @@ func (d *Daemon) runTick(
 		sch.requestFastTrackFullSync()
 	}
 	return nil
+}
+
+// runFeeds runs the feed-import phase when configured. It runs BEFORE the
+// mirror reconcile in the same pass (both runFullSync and runTick call it
+// first) so a feed change reaches its target calendar and then propagates
+// through the existing mirror mesh within the same pass. The Runner isolates
+// per-feed failures internally and logs each one, so a feed error can never
+// abort the mirror sync; the daemon deliberately ignores the returned results.
+func (d *Daemon) runFeeds(ctx context.Context) {
+	if d.Feeds == nil {
+		return
+	}
+	d.Feeds.RunOnce(ctx)
 }
 
 // inventorySizes returns a map[targetCalendarID]int with the current

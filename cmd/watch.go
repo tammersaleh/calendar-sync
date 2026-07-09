@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/tammersaleh/calendar-sync/internal/daemon"
+	"github.com/tammersaleh/calendar-sync/internal/feedimport"
 	syncpkg "github.com/tammersaleh/calendar-sync/internal/sync"
 )
 
@@ -57,5 +58,15 @@ func (c *WatchCmd) Run(rt *Runtime) error {
 		AuthChecker: AuthChecker,
 		Stdout:      rt.Stdout,
 	}
+
+	// Feed-import phase. One long-lived Runner over the same timeout-wrapped
+	// api (dry-run-wrapped above when settings.dry_run is set); each Fetcher
+	// keeps its ETag/cache gate across ticks. No feeds => leave d.Feeds nil so
+	// the daemon skips the phase. The Importer.DryRun flag mirrors the
+	// effective settings dry-run (watch has no --dry-run flag).
+	if feeds := feedConfigs(canonical.Feeds); len(feeds) > 0 {
+		d.Feeds = feedimport.NewRunner(api, feeds, canonical.Settings.DryRun, time.Now, rt.Logger)
+	}
+
 	return d.Run(rt.Ctx)
 }

@@ -17,15 +17,16 @@ import (
 
 // Item is one normalized VEVENT.
 type Item struct {
-	UID         string    // ComponentPropertyUniqueId; REQUIRED, error if missing/empty
-	Summary     string    // SUMMARY; "" if absent
-	Description string    // DESCRIPTION, unfolded and unescaped; "" if absent
-	Location    string    // LOCATION; "" if absent
-	Start       DateTime  // DTSTART
-	End         DateTime  // DTEND; zero DateTime if absent
-	Status      string    // upper-cased VEVENT STATUS; "" if absent
-	Sequence    int       // SEQUENCE; 0 if absent or unparseable
-	Stamp       time.Time // DTSTAMP as UTC; zero time.Time if absent
+	UID          string    // ComponentPropertyUniqueId; REQUIRED, error if missing/empty
+	Summary      string    // SUMMARY; "" if absent
+	Description  string    // DESCRIPTION, unfolded and unescaped; "" if absent
+	Location     string    // LOCATION; "" if absent
+	Start        DateTime  // DTSTART
+	End          DateTime  // DTEND; zero DateTime if absent
+	Status       string    // upper-cased VEVENT STATUS; "" if absent
+	Transparency string    // upper-cased VEVENT TRANSP ("TRANSPARENT"/"OPAQUE"); "" if absent
+	Sequence     int       // SEQUENCE; 0 if absent or unparseable
+	Stamp        time.Time // DTSTAMP as UTC; zero time.Time if absent
 }
 
 // DateTime is a normalized DTSTART/DTEND.
@@ -37,7 +38,7 @@ type DateTime struct {
 
 // layouts for the raw RFC 5545 value forms this package handles.
 const (
-	layoutDate     = "20060102"       // VALUE=DATE
+	layoutDate     = "20060102"        // VALUE=DATE
 	layoutDateTime = "20060102T150405" // floating / TZID-qualified
 	layoutUTC      = "20060102T150405Z"
 )
@@ -79,11 +80,12 @@ func normalizeEvent(ev *ics.VEvent) (Item, error) {
 	}
 
 	item := Item{
-		UID:         uid,
-		Summary:     propValue(ev, ics.ComponentPropertySummary),
-		Description: propValue(ev, ics.ComponentPropertyDescription),
-		Location:    propValue(ev, ics.ComponentPropertyLocation),
-		Status:      strings.ToUpper(propValue(ev, ics.ComponentPropertyStatus)),
+		UID:          uid,
+		Summary:      propValue(ev, ics.ComponentPropertySummary),
+		Description:  propValue(ev, ics.ComponentPropertyDescription),
+		Location:     propValue(ev, ics.ComponentPropertyLocation),
+		Status:       strings.ToUpper(propValue(ev, ics.ComponentPropertyStatus)),
+		Transparency: strings.ToUpper(propValue(ev, ics.ComponentPropertyTransp)),
 	}
 
 	if seq := propValue(ev, ics.ComponentPropertySequence); seq != "" {

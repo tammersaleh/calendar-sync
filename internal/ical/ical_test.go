@@ -68,6 +68,10 @@ func TestParse_TripItFeed(t *testing.T) {
 			if span.Status != "CONFIRMED" {
 				t.Errorf("span status = %q, want CONFIRMED", span.Status)
 			}
+			// TRANSP:TRANSPARENT captured, upper-cased.
+			if span.Transparency != "TRANSPARENT" {
+				t.Errorf("span transparency = %q, want TRANSPARENT", span.Transparency)
+			}
 			if span.Sequence != 0 {
 				t.Errorf("span sequence = %d, want 0", span.Sequence)
 			}
@@ -101,6 +105,10 @@ func TestParse_TripItFeed(t *testing.T) {
 			// STATUS lower-cased in the feed must be upper-cased.
 			if flight.Status != "CONFIRMED" {
 				t.Errorf("flight status = %q, want CONFIRMED (upper-cased)", flight.Status)
+			}
+			// TRANSP absent -> "".
+			if flight.Transparency != "" {
+				t.Errorf("flight transparency = %q, want \"\" (TRANSP absent)", flight.Transparency)
 			}
 			// Folding unwrapped (leading space of continuation removed) and
 			// TEXT escapes decoded to real runes.

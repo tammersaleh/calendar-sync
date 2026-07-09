@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.6.0](https://github.com/tammersaleh/calendar-sync/compare/v2.5.2...v2.6.0) (2026-07-09)
+
+
+### Features
+
+* import iCal feeds into a calendar via [[feeds]] ([6407228](https://github.com/tammersaleh/calendar-sync/commit/64072281d18104503353a59f2226b0341a0e4d59))
+
 ## [2.5.2](https://github.com/tammersaleh/calendar-sync/compare/v2.5.1...v2.5.2) (2026-06-15)
 
 

@@ -55,10 +55,11 @@ func (im *Importer) buildEvent(it ical.Item) *gws.Event {
 // is part of the checksum) plus the feed extended properties; recurrence,
 // visibility, and reminders are intentionally left untouched (they belong to
 // the user/calendar default). Status is not set here - the revive path sets it
-// explicitly. Transparency is written unconditionally (via PatchStr, clearing
-// to "" when the feed drops TRANSP): guarding on non-empty would let a checksum
-// that includes Transparency diverge from the event Google actually stores,
-// stranding the field permanently as "Unchanged".
+// explicitly. Transparency is written unconditionally (via PatchStr): it's part
+// of the checksum, so guarding on non-empty would let a Transparency change go
+// unwritten while the checksum advanced, stranding the field permanently as
+// "Unchanged". transparency() always yields a valid enum (never ""), so the
+// unconditional PatchStr can't emit an invalid "transparency":"".
 func (im *Importer) buildPatch(want *gws.Event) *gws.PatchEvent {
 	return &gws.PatchEvent{
 		Summary:            gws.PatchStr(want.Summary),
@@ -90,15 +91,19 @@ func toEventDateTime(dt ical.DateTime) *gws.EventDateTime {
 }
 
 // transparency maps the ical (upper-cased) TRANSP value to the Calendar-API
-// lower-case form, leaving it unset ("") when the feed didn't specify it.
+// lower-case enum. An absent/unknown TRANSP defaults to opaque (busy) - the
+// same convention as mirror.normalizeTransparency. It must NEVER return "":
+// buildPatch sends transparency unconditionally via PatchStr, and PatchStr("")
+// serializes an explicit "transparency":"" (omitempty only drops a nil
+// pointer), which is not a valid Calendar API enum value and is rejected on the
+// live API. Defaulting to opaque keeps every emitted value valid while leaving
+// TRANSP:TRANSPARENT feed events (trip spans) correctly free.
 func transparency(t string) string {
 	switch t {
 	case "TRANSPARENT":
 		return gws.TransparencyTransparent
-	case "OPAQUE":
-		return gws.TransparencyOpaque
 	default:
-		return ""
+		return gws.TransparencyOpaque
 	}
 }
 

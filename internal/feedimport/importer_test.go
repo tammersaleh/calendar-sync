@@ -316,6 +316,49 @@ func TestReconcile_PatchChanged(t *testing.T) {
 	}
 }
 
+// TestReconcile_AbsentTransparencyDefaultsOpaque pins that a feed item without
+// a TRANSP property (the common case - TripIt flights have none) maps to a
+// VALID transparency enum on both insert and patch, never an empty string. An
+// explicit "transparency":"" is rejected by the live Calendar API; PatchStr("")
+// would serialize exactly that, so transparency() must default to opaque.
+func TestReconcile_AbsentTransparencyDefaultsOpaque(t *testing.T) {
+	flight := timedItem("flight-1", "Flight AB 100", // timedItem sets no Transparency
+		time.Date(2026, 7, 13, 13, 0, 0, 0, time.UTC),
+		time.Date(2026, 7, 13, 14, 0, 0, 0, time.UTC))
+
+	// Insert path.
+	s := newStub()
+	im := newImporter(s)
+	if _, err := im.Reconcile(context.Background(), []ical.Item{flight}); err != nil {
+		t.Fatalf("Reconcile (insert): %v", err)
+	}
+	if len(s.inserts) != 1 {
+		t.Fatalf("got %d inserts, want 1", len(s.inserts))
+	}
+	if got := s.inserts[0].body.Transparency; got != gws.TransparencyOpaque {
+		t.Errorf("inserted transparency = %q, want %q (absent TRANSP -> opaque)", got, gws.TransparencyOpaque)
+	}
+
+	// Patch path: seed a stale event so the same item forces a patch, and assert
+	// the patch body carries a valid, non-empty transparency.
+	s2 := newStub()
+	im2 := newImporter(s2)
+	seedExisting(im2, s2, flight, "sha256:stale")
+	if _, err := im2.Reconcile(context.Background(), []ical.Item{flight}); err != nil {
+		t.Fatalf("Reconcile (patch): %v", err)
+	}
+	if len(s2.patches) != 1 {
+		t.Fatalf("got %d patches, want 1", len(s2.patches))
+	}
+	tp := s2.patches[0].body.Transparency
+	if tp == nil {
+		t.Fatal("patch transparency is nil, want a valid enum")
+	}
+	if *tp != gws.TransparencyOpaque {
+		t.Errorf("patch transparency = %q, want %q (never empty)", *tp, gws.TransparencyOpaque)
+	}
+}
+
 func TestReconcile_DeleteVanished(t *testing.T) {
 	s := newStub()
 	im := newImporter(s)

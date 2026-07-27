@@ -75,7 +75,17 @@ type Reconciler struct {
 	// can't propagate target edits never list. Seeded by FullSync BEFORE
 	// rebuildInventories runs so an edit landing in the gap between seed
 	// and inventory snapshot is visible to the next tick's target-delta.
+	//
+	// Map invariant: an entry exists only when it holds a USABLE token.
+	// There is no "present but empty" state - that state is what left the
+	// whole phase silently dead in production for months (B28).
 	targetSyncTokens map[string]string // canonical target -> latest token
+
+	// targetDeltaDisabledWarned tracks which targets have already logged
+	// the "no token, target-delta is off" warning, so the transition warns
+	// once instead of every 60 seconds forever. Cleared when the target
+	// gets a usable token again.
+	targetDeltaDisabledWarned map[string]bool
 }
 
 // debug is a nil-safe wrapper around r.Log.Debug. Centralizing the nil
@@ -135,7 +145,8 @@ func New(api API, canonical *config.Canonical, opts ...Option) *Reconciler {
 		syncTokens:       map[string]string{},
 		inventories:      map[string]*Inventory{},
 		lastFullSync:     map[string]time.Time{},
-		targetSyncTokens: map[string]string{},
+		targetSyncTokens:          map[string]string{},
+		targetDeltaDisabledWarned: map[string]bool{},
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -550,6 +561,25 @@ func (r *Reconciler) fullListSources(ctx context.Context) (
 func (r *Reconciler) seedTargetSyncTokens(ctx context.Context) map[string]error {
 	errs := map[string]error{}
 	for _, target := range r.uniqueWritableTargets() {
+		// Seed ONLY when the target has no usable cursor. FullSync refreshes
+		// source state and inventories; it must never move a valid target
+		// cursor forward.
+		//
+		// Reseeding unconditionally loses target edits on a schedule: a
+		// periodic FullSync landing between a user's mirror-side edit and
+		// the next tick would seed past the edit, and the tick would then
+		// start from the newer cursor and never see it. The source side
+		// can't recover it either - a recurring occurrence with no
+		// materialized source exception never appears in the source list.
+		// Skipping also avoids re-listing the whole calendar (41 pages in
+		// production) once per FullSync for no gain.
+		if existing := r.targetSyncTokens[target]; existing != "" {
+			r.debug("sync.seedTargetSyncTokens: token present; not reseeding",
+				"target", target,
+			)
+			continue
+		}
+
 		// SPEC's source-list shape is reused for the seed: ShowDeleted=true
 		// + EventTypes filter. SingleEvents stays false so recurring parents
 		// come back as parents (the target-delta dispatcher distinguishes
@@ -570,11 +600,19 @@ func (r *Reconciler) seedTargetSyncTokens(ctx context.Context) map[string]error 
 			)
 			continue
 		}
+		// EventsList now guarantees a complete collection, so a missing
+		// token is a protocol violation rather than "the calendar is
+		// large". Storing it would put the map in the one state
+		// runTargetDeltaPhase treats as "skip forever" (B28).
+		if token == "" {
+			errs[target] = fmt.Errorf("target seed for %s returned no syncToken", target)
+			r.warn("sync.seedTargetSyncTokens: no syncToken returned; target-delta disabled for this target",
+				"target", target,
+			)
+			continue
+		}
 		r.targetSyncTokens[target] = token
-		r.debug("sync.seedTargetSyncTokens: seeded",
-			"target", target,
-			"token_present", token != "",
-		)
+		r.debug("sync.seedTargetSyncTokens: seeded", "target", target)
 	}
 	return errs
 }

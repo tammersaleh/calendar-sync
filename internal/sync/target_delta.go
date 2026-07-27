@@ -54,10 +54,24 @@ func (r *Reconciler) runTargetDeltaPhase(ctx context.Context, res *TickResult) {
 	for _, target := range r.uniqueWritableTargets() {
 		token, ok := r.targetSyncTokens[target]
 		if !ok || token == "" {
-			// No seed yet (cold start, or the previous seed/410 cleared
-			// it). Skip silently; the next FullSync re-seeds.
+			// No usable cursor: cold start before the first FullSync, a
+			// failed seed, a 410, or a delta that came back without a next
+			// token. The next FullSync re-seeds (it only seeds targets that
+			// are missing one).
+			//
+			// Warn on the transition, not every tick. B28 sat here silently
+			// for months because this branch logged nothing above DEBUG
+			// while two-way sync was completely off; a per-tick warning
+			// would just be noise that gets filtered out again.
+			if !r.targetDeltaDisabledWarned[target] {
+				r.targetDeltaDisabledWarned[target] = true
+				r.warn("sync.targetDelta: no target syncToken; two-way sync is OFF for this target",
+					"target", target,
+				)
+			}
 			continue
 		}
+		delete(r.targetDeltaDisabledWarned, target)
 
 		// B17 missing-inventory guard: FullSync seeds tokens BEFORE
 		// rebuilding inventories (so an edit landing in the seed-to-

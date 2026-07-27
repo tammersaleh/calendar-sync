@@ -198,7 +198,7 @@ Each error code (`gws.CodeAPIConflict` etc.) has a paired sentinel value (`gws.E
 
 ### Sync token advancement is conditional
 
-The wrapper exposes `nextSyncToken` from the LAST NDJSON page (or empty string if Google omitted it). Per SPEC, the in-memory syncToken must advance only when every dependent pdir successfully processed every event in the delta - that conditional-advancement invariant is the sync layer's responsibility, not the wrapper's.
+The wrapper exposes `nextSyncToken` from the LAST NDJSON page. An empty token there is NOT a normal large-calendar outcome - see the pagination gotcha below. Per SPEC, the in-memory syncToken must advance only when every dependent pdir successfully processed every event in the delta - that conditional-advancement invariant is the sync layer's responsibility, not the wrapper's.
 
 ### v1 migration cells live in callers, not in `mirror.Classify`
 
@@ -305,6 +305,42 @@ Load-bearing invariants (each has a test that fails if broken):
 ### The feed URL is a bearer secret — never let it surface
 
 Anyone with the `[[feeds]]` URL can read the calendar. It's accepted via `url` or `url_env` (prefer `url_env`), and it must never reach a log line, an error, stdout (`config show`), or the IPC snapshot. Enforced structurally: `internal/feed` sanitizes it out of every error (`*url.Error` unwrap + host-only messages), the `Importer` has no URL field, and `config.CanonicalFeed.MarshalJSON` emits only `RedactedURL()` so a stray serialization fails safe. When adding any code that touches a feed, grep your diff for the URL before committing.
+
+### `gws --page-all` truncates at `--page-limit` (default 10); `EventsList` fails closed (B28)
+
+gws stops paginating at `--page-limit`, whose default is **10**. At `maxResults=250` that caps a list at 2500 events and returns the prefix with no error and no `nextSyncToken`. This killed B17's target-delta phase for months: the target seed lists the whole calendar unbounded (sync tokens forbid `timeMin`/`timeMax`), production targets need 14 and 41 pages, so both stored an empty token and two-way sync was silently off.
+
+`EventsList` and `CalendarListList` now pass `gws.MaxPagesPerList` and run `assertPaginationComplete`. A terminal page still carrying `nextPageToken` means truncation, not a large calendar: they return `ErrIncompletePagination` and **no data**. A successful return means the collection is COMPLETE - inventory rebuilds, orphan classification, and delta processing all depend on that.
+
+The check tests pagination completeness only, never sync-token presence: whether Google issues a token depends on the query, and `EventsInstances` has none at all.
+
+**Do NOT give `EventsInstances` the same treatment.** Both its callers are `MaxResults=1` existence probes (`classify.go` horizon eligibility, `orphan.go`) that only test `len(result) > 0`. With one item per page, an explicit high page limit would turn a yes/no question into up to 1000 round-trips, and truncation is the expected outcome there rather than a fault. See B33.
+
+### Target syncTokens: seed only when missing, never store an empty one (B28)
+
+`targetSyncTokens` map invariant: **an entry exists only when it holds a usable token.** There is no "present but empty" state - that state is exactly what `runTargetDeltaPhase`'s guard turns into a permanently dead phase.
+
+`seedTargetSyncTokens` seeds only targets that lack a token. FullSync must never move a valid target cursor forward: a periodic FullSync landing between a mirror-side edit and the next tick would seed past the edit, and the source side cannot recover it (a recurring occurrence with no materialized source exception never appears in a `singleEvents=false` source list). This is also what makes B31's missing recovery scan merely a gap rather than a scheduled data-loss bug.
+
+A tokenless target warns once on the transition, with the latch cleared on recovery. Not per-tick - a warning that fires every 60 seconds gets filtered out and hides the next outage just as effectively as silence did.
+
+### Recurring instances: use collection membership, not `events.get` status, to detect a real source exception (B29)
+
+Google returns **HTTP 200 with a synthesized virtual occurrence** for a recurring instance ID whose series has no exception at that slot. So a 404 is NOT the signal for "no source override" - that assumption made the daemon revert genuine mirror-side edits instead of propagating them.
+
+The only sound signal is membership in a complete unexpanded `events.list(singleEvents=false)`, which contains real exceptions and never manufactures virtual ones. The source-exception catalog on `Reconciler` maintains that per source calendar with `Ready`/`Unknown` readiness, and lookups return `Present | Absent | Unknown | OutOfScope`.
+
+Empirically rejected discriminators - do not reach for these again:
+
+- `etag`: a real override and its parent share the SAME etag.
+- `sequence`: a virtual instance can report a HIGHER sequence than its parent.
+- `start != originalStartTime`: catches only moved exceptions.
+- `signal.SourceChanged`: an existing test pins a genuine source exception with it false.
+- comparing the source instance's managed fields to the parent's projection: a **cancelled** exception can have `start == originalStartTime`, and `status` is deliberately not a managed field, so this resurrects deliberately-cancelled occurrences.
+
+Cancelled source exceptions count as `Present` - cancellation is real source intent.
+
+Readiness is per source CALENDAR, not per occurrence: a failed or truncated source list means any exception anywhere in it might be unknown, so you cannot claim a specific ID is `Absent`.
 
 ### golang-ical parses but does not expand recurrence; property lookup is case-sensitive
 

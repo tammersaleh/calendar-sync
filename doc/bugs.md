@@ -4,6 +4,44 @@ Running list of bugs surfaced during the v1.0.0 install + test session. Add a ne
 
 ## Open
 
+### B31 - no FullSync recovery for inherited target exceptions
+
+`BuildInventory` drops recurring mirror instances whose `calendar-sync:source` is the inherited (parent) form, so a target-side override that the target-delta stream never delivered has no second chance. There is no automatic repair for: edits made while the daemon was stopped, edits predating process startup, anything queued when a target token 410s, occurrences quarantined by B32, or occurrences that only enter the horizon later.
+
+Safe to defer only because B28's fix stopped FullSync from reseeding valid target tokens - without that, every periodic FullSync would open a fresh loss window and this would be mandatory rather than a recovery gap.
+
+The fix is to keep inherited target exceptions in a separate inventory collection instead of discarding them, and run them through the same B29 membership decision during FullSync. Because the target inventory is unexpanded, those candidates are real target exceptions, not every virtual occurrence.
+
+The one known instance of this damage (the Jul 28 exercise event) was repaired by hand: the source override was materialized directly at 09:00.
+
+### B32 - reverse target cancellation is quarantined, not implemented
+
+Deleting one occurrence of a recurring event on the MIRROR side does not propagate to the source. Target deltas carry `ShowDeleted: true`, and the revive cells in `internal/recurring/handler.go` (B20) and `internal/sync/reconcile.go` would resurrect a cancelled mirror whose source is still live. The reverse patch body omits `status`, so routing cancellations through materialization would not delete anything either.
+
+Until this ships, every target-delta event with `status == cancelled` is quarantined: not classified, not materialized, not revived, no source write, structured warning, and consumed for token purposes. Consumed rather than pinned, so the first deletion does not head-of-line block every later target delta.
+
+Consequences while deferred: the cancellation does not propagate; it will not retry automatically once this ships (B31 would be the recovery path); and a later source-driven FullSync may still revive it, since `BuildInventory` drops cancelled resources.
+
+The fix is to cancel or delete the constructed source occurrence - which materializes a cancelled source exception - rather than sending an ordinary field patch, and to reconstruct the source parent mapping via the target's recurring parent plus `OriginalStartTime` for tombstones that arrive without inherited private properties.
+
+### B33 - `EventsInstances` conflates existence probes with exhaustive listing
+
+Both callers (`classify.go` horizon eligibility, `orphan.go`) pass `MaxResults=1` and only test `len(result) > 0`, but the method still passes `--page-all`. With `maxResults=1` that is one item per page. It is harmless today because gws's default 10-page cap bounds it, which is precisely why B28's explicit `--page-limit` was NOT applied here - doing so would turn a yes/no question into up to 1000 round-trips.
+
+The clean shape is two methods: a bounded first-page existence probe with no `--page-all`, and a separately named exhaustive one if a caller ever needs the full instance set. Do not "fix the inconsistency" by giving this method the same treatment as `EventsList`.
+
+### B34 - FullSync can race a concurrent target edit
+
+Pre-existing and not observed in the wild. FullSync snapshots the source, snapshots the target inventory, then issues source-driven writes. A target edit landing between the inventory snapshot and the write can be overwritten, and whether the following target delta observes it depends on timing. B29's staged reads narrow the equivalent race on the tick path but do not address FullSync.
+
+Closing it would need target deltas staged before FullSync writes, or conditional writes with version preconditions.
+
+### B35 - a prolonged source-catalog outage pins the target cursor
+
+By design, B29 refuses to make inherited-instance decisions while a source calendar's exception catalog is `Unknown`, and leaves the target token unadvanced so the edit is redelivered. Correct for a transient failure, but a sustained source-list outage means the target batch grows, one source calendar head-of-line blocks a whole target, and Google may eventually expire the pinned target token with a 410. At that point the queued edits have no recovery path until B31 exists.
+
+Not a hot loop - preflight guarantees zero writes while blocked, and retries follow the normal tick cadence. Blocked duration should be made observable.
+
 ### B3 - gws subprocess timeouts cascade to `partial_failure`
 
 A 365-day-horizon dry-run produced ~200 `gws subprocess: context deadline exceeded` errors. The outer `--timeout` default is 5m; per-event `events.instances` lookups serialize and queue past it.
@@ -47,6 +85,72 @@ Rare: needs a `Changed` feed import AND a 410 in the same tick, plus Google's fu
 Fix options: (a) if `runFeeds` reported a `Changed` import this tick, defer any fast-track FullSync by one `poll_interval` so the write settles before the full list (needs `runFeeds` to report changed, and `runTick` to tell the scheduler); (b) hold/skip the syncToken reset in FullSync for any source written to within the last few seconds (touches the token-advancement path). (a) is smaller and localizes the change to the daemon. Needs a test driving feed-changed-tick + NeedsFullResync and asserting the fast-track doesn't strand the event.
 
 ## Fixed
+
+### B28 - gws truncated every long list at 10 pages; two-way sync was dead in production (CRITICAL)
+
+Surfaced from a user report: "why isn't the exercise event on my personal calendar updated after I updated the coreweave version?" The 🧘/🏃 series lives on Personal (weekly TU 08:45-09:30); the user dragged the Jul 28 occurrence on the CoreWeave MIRROR to 09:00. With `propagate_target_edits = true` and a writable source, B17's target-delta phase should have pushed that back. Nothing happened, across hours of ticks.
+
+Root cause: `gws --page-all` stops at `--page-limit`, which **defaults to 10**. `internal/gws/events.go:EventsList` never passed the flag. At `maxResults=250` that silently capped any list at 2500 events, and the wrapper returned the partial prefix as SUCCESS - `nextSyncToken` empty, no error.
+
+`seedTargetSyncTokens` lists the entire target calendar with no time bounds (sync tokens are incompatible with `timeMin`/`timeMax`). Production sizes: `tsaleh@coreweave.com` 3470 events / 14 pages, `me@tammersaleh.com` 10244 events / 41 pages. Both blew past 10. gws stopped at page 10; that page carried `nextPageToken` and no `nextSyncToken`. The seed stored `""`, and `runTargetDeltaPhase`'s `if !ok || token == ""` skipped the target on every tick.
+
+**B17's entire target-delta phase had been dead since v2.4.0 shipped**, for both targets, silently. Evidence: daemon debug log showing `sync.seedTargetSyncTokens: seeded ... token_present:false` for both targets, and tick traces making exactly two `gws.EventsList` calls (the two source deltas) and zero target lists. Confirmed independently by capturing a sync token by hand with the daemon's exact parameters, editing the mirror, and watching Google return the edit in the delta - the API was fine, the wrapper was not.
+
+Why it wasn't obvious sooner: the source-side classify path ALSO detects mirror drift and propagates, which covers any target edit whose source event appears in the source list. It does not cover a recurring occurrence with no materialized source exception - that never appears in a `singleEvents=false` source list, at any FullSync, ever. So most target edits still worked, eventually.
+
+Fix, in three parts:
+
+1. `EventsList` and `CalendarListList` pass an explicit `--page-limit` (`gws.MaxPagesPerList`, 1000 = 250k events) and run `assertPaginationComplete`: if the terminal page still advertises `nextPageToken`, return `ErrIncompletePagination` **with no data**. A successful return now means the collection is complete. The check is deliberately about pagination completeness only, not sync-token presence - whether Google issues a token depends on the query. `EventsInstances` is excluded on purpose: both callers are `MaxResults=1` existence probes where truncation is the expected outcome and an exhaustive walk would cost one round-trip per instance.
+
+2. `seedTargetSyncTokens` seeds **only when a target has no usable token**. It previously reseeded unconditionally, so a periodic FullSync landing between a mirror-side edit and the next tick seeded past the edit and lost it - on every FullSync, not just once. Skipping also drops a full unbounded re-list of every target calendar per FullSync.
+
+3. An empty token from a successful seed is now a seed error, never stored. Map invariant: an entry in `targetSyncTokens` exists only when it holds a usable token; there is no "present but empty" state. A tokenless target warns once on the transition (latch reset on recovery) instead of staying silent - silence is what let this hide for months.
+
+Note the old SPEC/CLAUDE.md claim that Google "omitted nextSyncToken on a long delta" was wrong. A terminal page without a sync token means truncation, not a large calendar.
+
+### B29 - inherited recurring mirror instances clobbered genuine target edits (CRITICAL)
+
+Found while fixing B28, and the reason B28's fix could not ship alone. Even with the target token working, the exercise event above would have been REVERTED rather than propagated.
+
+`processTargetDeltaEvent` took the B17 Phase 2 `materializeSourceOverride` path only on a **404** from `events.get` on the constructed source-instance ID. But Google returns **200 with a synthesized virtual occurrence** when the series has no exception at that slot. So control fell through to `Classify` -> `recurring.applyDriftMatrix`, where `IsInheritedRecurringInstance` is true (Google copies the parent's extendedProperties onto a user-created override, so `calendar-sync:source` carries the source PARENT id), the recomputed `MirrorDrifted` is true, and the `case signal.MirrorDrifted:` cell source-wins. Reproduced in a test before fixing: `action=patch reason=source_updated conflict=inherited_source_won`, zero writes to the source.
+
+The `isInherited` guard itself is correct and stays - it exists for B15, where a freshly auto-materialized mirror instance's bootstrap fields must not be propagated over a pre-existing source override. The defect is that `isInherited` alone cannot separate bootstrap junk from user intent.
+
+Discriminators evaluated and rejected, all against live data:
+
+- `events.get` 200 vs 404 - Google returns 200 for virtual occurrences. This is the bug itself.
+- `etag` - a real override and its parent share the SAME etag.
+- `sequence` - a virtual instance reported `sequence` 2 while its parent reported 1.
+- `start != originalStartTime` - catches only moved exceptions; misses title/end/status changes.
+- `signal.SourceChanged` - an existing test deliberately pins a genuine source exception with `SourceChanged == false`.
+- Comparing the source instance's managed fields to the parent's projection for that occurrence. This was the near-miss: it fixes the "only detects moves" objection. Killed by real data on this very series - the Jul 14 exception is **cancelled** with `start == originalStartTime`, and `status` is deliberately not a managed field (adding it would force a checksum migration across every v3 mirror). The comparison reports "no source intent" and would reverse-propagate onto a deliberately-cancelled occurrence, resurrecting it.
+
+The sound signal is **membership in a complete unexpanded `events.list(singleEvents=false)`**: it contains real exceptions and never manufactures virtual ones. Live proof on the exercise series - exceptions exist for Jun 16, Jun 23, Jun 30, Jul 7, Jul 14, Jul 21, Aug 4 and Aug 11, and Jul 28 is absent.
+
+Fix: a per-source-calendar exception catalog (`readiness: Ready|Unknown`, proven coverage window, `byID`, `byParent`) built from the complete source list at FullSync and maintained by a staged overlay from each successful source delta. Cancelled exceptions count as Present. Lookup returns `Present | Absent | Unknown | OutOfScope`; readiness is per-calendar because a failed or truncated source list means any exception anywhere in it might be unknown. The inherited branch then decides:
+
+```
+Present                            -> inherited source-wins bootstrap (unchanged, B15 preserved)
+Absent + GET 200 virtual + drift   -> materialize the source override (target wins)
+Absent + GET 200 + no drift        -> metadata bootstrap only, no source write
+Absent + GET 404                   -> terminal skip, no source write
+Unknown                            -> zero writes for the batch, target token pinned
+OutOfScope                         -> no source write, horizon policy
+```
+
+Tick was restaged to target-delta READS -> source-delta reads + catalog overlay -> whole-batch preflight -> target writes -> source writes -> token commit. Target-read before source-read is load-bearing: it puts the source view as close as possible to the reverse write, so any source override that existed at target-read time is guaranteed to be in the catalog. Batch preflight means one `Unknown` blocks the whole target with zero writes rather than rewriting the safe prefix every 60 seconds while the token stays pinned.
+
+Design reviewed with Codex, which rejected a first, smaller version of the fix and supplied the seed-preservation and cancellation-quarantine guards.
+
+### B30 - `[settings].log_level` and `log_format` never reached the logger
+
+`cmd/cli.go` built the logger from CLI globals only, before config was loaded. Both settings were parsed, defaulted and validated, then ignored. launchd passes no log flags, so the production daemon always ran at the built-in default no matter what config.toml said. The `--log-level` help text already claimed "Overrides settings.log_level", so config-as-fallback was the documented intent all along.
+
+This is why B28 stayed invisible: the one state that disabled two-way sync logged at DEBUG, and DEBUG was unreachable in production.
+
+Secondary defect in the same code: invalid values (`--log-level=trace`, `--log-format=yaml`) parsed fine and silently fell back inside `output.NewLogger` instead of failing as usage errors.
+
+Fix: `Globals.LogLevel` / `LogFormat` become `*string` with kong `enum` and no `default:` - nil means "the invocation said nothing", so absent is distinguishable from empty and a bad value is a usage error. Level and format resolve independently (`--log-level=warn` still honors `settings.log_format`). A bootstrap logger still exists for configless commands and config-load failures; `loadConfig` replaces `rt.Logger` after a successful load, before any gws client, reconciler or feed runner captures it. `cfg.Settings` is not mutated with CLI values - the config represents the file, the logger represents the invocation.
 
 ### B26 - a FullSync that races a fresh feed import stranded the imported events
 

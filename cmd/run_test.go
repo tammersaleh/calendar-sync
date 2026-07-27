@@ -204,7 +204,11 @@ func TestRunCmd_PartialFailureSurfacesUnderlyingErrorViaHandleErr(t *testing.T) 
 		Detail string `json:"detail"`
 		Cause  string `json:"cause"`
 	}
-	last := strings.TrimSpace(stderr.String())
+	// stderr carries the run's structured log lines ahead of the envelope
+	// (settings.log_level now reaches the logger, so the per-pdir failure
+	// warning lands here too). The envelope is always the final line.
+	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+	last := lines[len(lines)-1]
 	if err := json.Unmarshal([]byte(last), &envelope); err != nil {
 		t.Fatalf("unmarshal stderr %q: %v", last, err)
 	}

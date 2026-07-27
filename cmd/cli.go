@@ -17,18 +17,50 @@ import (
 
 	"github.com/alecthomas/kong"
 
+	"github.com/tammersaleh/calendar-sync/internal/config"
 	"github.com/tammersaleh/calendar-sync/internal/output"
 )
 
 // Globals carries the SPEC §"Global Flags" values to every subcommand. kong
 // embeds this into CLI; the per-subcommand Run method reads the values via
 // the *runtime injected ctx.
+//
+// LogLevel and LogFormat are *string, not string, because absent must be
+// distinguishable from empty: a nil pointer means the invocation said nothing
+// about logging and settings.log_* wins, while a non-nil pointer is an
+// explicit override. Giving either field a kong `default:` would make every
+// invocation look explicit and shadow the config again, which is exactly the
+// B30 defect. `enum` turns a bad value into a usage error instead of the
+// silent fallback NewLogger would otherwise apply; kong skips the enum check
+// on a nil pointer, so the tag and the absent case coexist.
 type Globals struct {
-	Config    string `name:"config" placeholder:"<path>" help:"Path to config.toml. Overrides $CALENDAR_SYNC_CONFIG and the default location." env:"CALENDAR_SYNC_CONFIG"`
-	LogLevel  string `name:"log-level" placeholder:"<level>" help:"One of debug, info, warn, error. Overrides settings.log_level." env:"CALENDAR_SYNC_LOG_LEVEL"`
-	LogFormat string `name:"log-format" placeholder:"<fmt>" help:"One of json, text. Overrides settings.log_format." env:"CALENDAR_SYNC_LOG_FORMAT"`
-	Quiet     bool   `short:"q" name:"quiet" help:"Suppress stdout (logs still go to stderr)."`
-	NoColor   bool   `name:"no-color" help:"Disable ANSI colors in text-format logs."`
+	Config    string  `name:"config" placeholder:"<path>" help:"Path to config.toml. Overrides $CALENDAR_SYNC_CONFIG and the default location." env:"CALENDAR_SYNC_CONFIG"`
+	LogLevel  *string `name:"log-level" placeholder:"<level>" enum:"debug,info,warn,error" help:"One of debug, info, warn, error. Overrides settings.log_level." env:"CALENDAR_SYNC_LOG_LEVEL"`
+	LogFormat *string `name:"log-format" placeholder:"<fmt>" enum:"json,text" help:"One of json, text. Overrides settings.log_format." env:"CALENDAR_SYNC_LOG_FORMAT"`
+	Quiet     bool    `short:"q" name:"quiet" help:"Suppress stdout (logs still go to stderr)."`
+	NoColor   bool    `name:"no-color" help:"Disable ANSI colors in text-format logs."`
+}
+
+// newLogger builds the logger for this invocation. Level and format resolve
+// independently against s, so `--log-level=warn` still honors
+// settings.log_format and `--log-format=text` still honors
+// settings.log_level. Per field the order is: explicit flag (kong folds
+// $CALENDAR_SYNC_LOG_* into the same field, with the flag winning), then the
+// config setting, then NewLogger's built-in default.
+//
+// Pass a zero config.Settings to get the bootstrap logger: the one in effect
+// before config is readable, so configless commands and config-load failures
+// still have somewhere to log.
+func (g Globals) newLogger(w io.Writer, s config.Settings) *output.Logger {
+	return output.NewLogger(w, strOr(g.LogFormat, s.LogFormat), strOr(g.LogLevel, s.LogLevel))
+}
+
+// strOr dereferences p, or returns fallback when the flag was not supplied.
+func strOr(p *string, fallback string) string {
+	if p == nil {
+		return fallback
+	}
+	return *p
 }
 
 // CLI is the kong root struct. Each cmd:"" field is one subcommand; the
@@ -98,13 +130,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	// (--help → 0). We honor it by returning before subcommand dispatch.
 	kongExitCode := -1
 
-	parser, err := kong.New(cli,
-		kong.Name("calendar-sync"),
-		kong.Description("Google Calendar event mirroring tool."),
-		kong.Writers(stdout, stderr),
-		kong.UsageOnError(),
-		kong.Exit(func(code int) { kongExitCode = code }),
-	)
+	parser, err := newParser(cli, stdout, stderr, func(code int) { kongExitCode = code })
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 64
@@ -130,7 +156,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		Stderr:  stderr,
 		Globals: cli.Globals,
 		Ctx:     signalContext(),
-		Logger:  output.NewLogger(stderr, cli.Globals.LogFormat, cli.Globals.LogLevel),
+		Logger:  cli.Globals.newLogger(stderr, config.Settings{}),
 	}
 	if cli.Globals.Quiet {
 		rt.Stdout = nil
@@ -143,6 +169,19 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return handleErr(stderr, err)
 	}
 	return 0
+}
+
+// newParser builds the kong parser Run uses. It is a separate function so
+// tests can drive the real flag definitions - enum validation, env binding,
+// the optional pointer globals - without dispatching a subcommand.
+func newParser(cli *CLI, stdout, stderr io.Writer, exit func(int)) (*kong.Kong, error) {
+	return kong.New(cli,
+		kong.Name("calendar-sync"),
+		kong.Description("Google Calendar event mirroring tool."),
+		kong.Writers(stdout, stderr),
+		kong.UsageOnError(),
+		kong.Exit(exit),
+	)
 }
 
 // signalContext returns a context that is canceled on SIGINT / SIGTERM.

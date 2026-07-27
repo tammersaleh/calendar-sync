@@ -264,11 +264,19 @@ type configValidatePayload struct {
 // loadConfig is the shared "find + load + return" path used by every
 // subcommand that needs config. Errors map to config_not_found /
 // config_invalid via MapError on the way out.
+//
+// A successful load replaces rt.Logger with one that honors
+// settings.log_level / settings.log_format (B30). Every subcommand builds its
+// gws client, reconciler, and feed runner after calling loadConfig, so the
+// rebuilt logger is the one those objects capture. The config object itself
+// is left alone: it represents the file, while the logger represents the
+// invocation.
 func loadConfig(rt *Runtime) (*config.Config, error) {
 	path := config.FindPath(rt.Globals.Config)
 	cfg, err := config.Load(path)
 	if err != nil {
 		return nil, err
 	}
+	rt.Logger = rt.Globals.newLogger(rt.Stderr, cfg.Settings)
 	return cfg, nil
 }

@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.6.3](https://github.com/tammersaleh/calendar-sync/compare/v2.6.2...v2.6.3) (2026-07-27)
+
+
+### Bug Fixes
+
+* send normalized enums in reverse patches, not raw (B37) ([0fa25c2](https://github.com/tammersaleh/calendar-sync/commit/0fa25c2904faf218acf67538f6c57dd8befaa2ad))
+
 ## [2.6.2](https://github.com/tammersaleh/calendar-sync/compare/v2.6.1...v2.6.2) (2026-07-27)
 
 

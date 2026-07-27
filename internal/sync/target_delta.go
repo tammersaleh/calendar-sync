@@ -21,14 +21,6 @@ import (
 // prefix.
 var instanceSuffixRE = regexp.MustCompile(`_\d{8}T\d{6}Z$`)
 
-// reasonMirrorOnlyOverride is the propagate reason emitted when a target-
-// delta event references a recurring instance the source has no override
-// for. B17 Phase 2 (live as of v2.5.0) materializes the user's edit by
-// patching the constructed source-instance ID, creating the source override.
-// The reason name is preserved for stream continuity with the v2.4.0 Phase 1
-// shape (`skip(mirror_only_override)`); only the action changed.
-const reasonMirrorOnlyOverride mirror.Reason = "mirror_only_override"
-
 // reasonSourceOrphan is the skip reason emitted when a target-delta event
 // references a non-recurring source that no longer exists (events.get
 // returned 404). The orphan walk's existing prune pass cleans the mirror;
@@ -36,21 +28,44 @@ const reasonMirrorOnlyOverride mirror.Reason = "mirror_only_override"
 // stream so the action log isn't silently incomplete.
 const reasonSourceOrphan mirror.Reason = "source_orphan"
 
-// runTargetDeltaPhase runs B17's per-target delta reconciliation. For each
-// writable-source target, list the events.list delta against the seeded
-// targetSyncToken; for each delta event that is a calendar-sync mirror,
-// look up the owning pdir and dispatch the corresponding source event
-// through the standard Classifier. The classifier's drift-detection then
-// produces the propagate write back to source.
+// reasonInstanceNotInSeries is the skip reason for a recurring-instance
+// mirror whose constructed source-instance ID 404s. Google answers 200 with
+// a virtual occurrence for every slot the parent's RRULE does produce, so a
+// 404 means the slot is not part of the series at all. Materializing an
+// override for a non-occurrence would create an exception with nothing
+// behind it, so this outcome is terminal and the event is consumed.
+const reasonInstanceNotInSeries mirror.Reason = "instance_not_in_series"
+
+// reasonTargetCancelled is the skip reason for a target-side deletion.
+// Reverse cancellation is not implemented, so these are quarantined rather
+// than classified - see processTargetDeltaEvent for why classifying them
+// would resurrect the event the user just deleted.
+const reasonTargetCancelled mirror.Reason = "target_cancelled"
+
+// targetDeltaBatch is one target's staged delta read: the events the list
+// returned plus the cursor to commit once every one of them is processed.
 //
-// This phase MUST run before the source-delta classify (per the design
-// "Phase ordering" must-fix). If reversed, source-driven mirror rewrites
-// can clobber target edits before target-delta lists them.
+// Reads are staged separately from writes so the source-delta phase can
+// refresh the source-exception catalog in between. The reverse-materialize
+// decision depends on that catalog (B29), and the batch preflight needs the
+// whole batch in hand before any of it is written.
+type targetDeltaBatch struct {
+	target    string
+	events    []gws.Event
+	nextToken string
+}
+
+// stageTargetDeltas runs the READ half of B17's per-target delta phase. For
+// each writable-source target it lists the delta against the seeded
+// targetSyncToken and returns the staged result. No writes happen here, and
+// no token moves.
 //
-// Token advancement is conditional: the seeded targetSyncToken advances
-// only if processing every event in the delta succeeds. Errors leave the
-// token unchanged so the next tick re-delivers.
-func (r *Reconciler) runTargetDeltaPhase(ctx context.Context, res *TickResult) {
+// A target that cannot be read at all (no cursor, no inventory, list error)
+// is simply absent from the returned slice, which leaves its token where it
+// was. A 410 is handled inline: the cursor is invalid, so it is cleared and
+// NeedsFullResync is surfaced.
+func (r *Reconciler) stageTargetDeltas(ctx context.Context, res *TickResult) []targetDeltaBatch {
+	var batches []targetDeltaBatch
 	for _, target := range r.uniqueWritableTargets() {
 		token, ok := r.targetSyncTokens[target]
 		if !ok || token == "" {
@@ -119,10 +134,45 @@ func (r *Reconciler) runTargetDeltaPhase(ctx context.Context, res *TickResult) {
 			continue
 		}
 
+		batches = append(batches, targetDeltaBatch{
+			target:    target,
+			events:    events,
+			nextToken: nextToken,
+		})
+	}
+	return batches
+}
+
+// applyTargetDeltas runs the WRITE half of the target-delta phase over the
+// batches stageTargetDeltas produced, after the source-delta phase has
+// refreshed the exception catalog.
+//
+// Token advancement is conditional: the seeded targetSyncToken advances only
+// if every event in the batch is processed without a pinning error. Errors
+// leave the token unchanged so the next tick re-delivers.
+func (r *Reconciler) applyTargetDeltas(ctx context.Context, res *TickResult, batches []targetDeltaBatch) {
+	for _, b := range batches {
+		if source, blocked := r.blockingUnreadySource(b); blocked {
+			// Batch preflight. Deliberate head-of-line blocking: writing the
+			// safe prefix and pinning the token on a later event would
+			// rewrite that prefix every 60 seconds for as long as the source
+			// read stays broken.
+			//
+			// The target token is still valid, so NeedsFullResync stays
+			// unset - reseeding would seed past the unconsumed edit and lose
+			// it for good.
+			r.warn("sync.targetDelta: source-exception catalog not ready; batch deferred",
+				"target", b.target,
+				"source", source,
+				"events", len(b.events),
+			)
+			continue
+		}
+
 		hadErr := false
-		for i := range events {
-			ev := events[i]
-			if err := r.processTargetDeltaEvent(ctx, target, &ev, &res.TargetDelta); err != nil {
+		for i := range b.events {
+			ev := b.events[i]
+			if err := r.processTargetDeltaEvent(ctx, b.target, &ev, &res.TargetDelta); err != nil {
 				// B18 transient-read tolerance: a narrow set of
 				// well-understood read flakes (events.get / events.instances
 				// 5xx, 400, 404) get logged + skipped without pinning the
@@ -133,7 +183,7 @@ func (r *Reconciler) runTargetDeltaPhase(ctx context.Context, res *TickResult) {
 				// the matrix.
 				transient := isTransientClassifyReadError(err)
 				r.warn("sync.targetDelta: process failed",
-					"target", target,
+					"target", b.target,
 					"target_event", ev.ID,
 					"error", err.Error(),
 					"transient", transient,
@@ -152,26 +202,63 @@ func (r *Reconciler) runTargetDeltaPhase(ctx context.Context, res *TickResult) {
 		if hadErr {
 			continue
 		}
-		if nextToken == "" {
-			delete(r.targetSyncTokens, target)
-			st := res.PerTarget[target]
+		if b.nextToken == "" {
+			delete(r.targetSyncTokens, b.target)
+			st := res.PerTarget[b.target]
 			st.NeedsFullResync = true
-			res.PerTarget[target] = st
+			res.PerTarget[b.target] = st
 			continue
 		}
-		r.targetSyncTokens[target] = nextToken
-		st := res.PerTarget[target]
+		r.targetSyncTokens[b.target] = b.nextToken
+		st := res.PerTarget[b.target]
 		st.SyncTokenChanged = true
-		res.PerTarget[target] = st
+		res.PerTarget[b.target] = st
 	}
+}
+
+// blockingUnreadySource reports the first source calendar in the batch whose
+// exception catalog cannot currently answer a membership question.
+//
+// Only inherited-form recurring instances consult the catalog, so only they
+// can block. A non-recurring mirror edit, a managed-form instance or a
+// recurring parent reconciles fine against an Unknown catalog, and blocking
+// those on an unrelated source read would trade a correctness fix for an
+// availability regression.
+func (r *Reconciler) blockingUnreadySource(b targetDeltaBatch) (string, bool) {
+	for i := range b.events {
+		ev := &b.events[i]
+		if ev.RecurringEventID == "" {
+			continue
+		}
+		if ev.Status == gws.EventStatusCancelled {
+			// Quarantined before classification; never reaches the catalog.
+			continue
+		}
+		tuple, ok := parseSourceFromMirror(ev)
+		if !ok {
+			continue
+		}
+		if instanceSuffixRE.MatchString(tuple.EventID) {
+			// Managed form: the source instance ID is recorded on the mirror
+			// itself, so there is no inherited-vs-user-edit ambiguity.
+			continue
+		}
+		if _, ok := r.findOwningPDir(b.target, tuple.CalendarID); !ok {
+			continue
+		}
+		if !r.sourceCatalogReady(tuple.CalendarID) {
+			return tuple.CalendarID, true
+		}
+	}
+	return "", false
 }
 
 // processTargetDeltaEvent dispatches one target-delta event through the
 // reconcile path. Skips silently for non-mirror events and mirrors with
-// no owning pdir. For inherited-form recurring instances whose source
-// has no override at the occurrence (404 on events.get), Phase 2
-// materializes the source override via materializeSourceOverride
-// instead of skipping.
+// no owning pdir. An inherited-form recurring instance whose source has no
+// exception at the occurrence is routed to reverse materialization by the
+// recurring handler's membership decision table, not by this function - see
+// recurring.Handler.applyDriftMatrix.
 //
 // Routing rules (per Codex must-fix #4):
 //
@@ -210,6 +297,27 @@ func (r *Reconciler) processTargetDeltaEvent(
 		// is "left over from a since-disabled pdir" or a hand-crafted
 		// extended property the user shouldn't see noise about.
 		r.debug("sync.targetDelta: no owning pdir; skipping",
+			"target", target,
+			"target_event", mirrorEvent.ID,
+			"source_tuple", tuple.String(),
+		)
+		return nil
+	}
+
+	// Target-cancellation quarantine. Target deltas list with
+	// ShowDeleted=true, so a mirror the user deleted arrives here as
+	// status=cancelled. Classifying it would reach a revive cell - B20's in
+	// recurring/handler.go for an instance, the equivalent in
+	// sync/reconcile.go for a non-recurring mirror - and recreate the event
+	// the user just deleted. The reverse patch body carries no status, so
+	// pushing the deletion to source instead is not possible yet either.
+	//
+	// Warn, skip, and CONSUME the event. Pinning the token here would let
+	// the first deletion head-of-line block every later target edit until
+	// reverse cancellation ships.
+	if mirrorEvent.Status == gws.EventStatusCancelled {
+		r.emitTargetDeltaSkip(counts, mirrorEvent, tuple.EventID, reasonTargetCancelled, pd)
+		r.warn("sync.targetDelta: target-side deletion is not propagated to source",
 			"target", target,
 			"target_event", mirrorEvent.ID,
 			"source_tuple", tuple.String(),
@@ -257,31 +365,31 @@ func (r *Reconciler) processTargetDeltaEvent(
 	sourceEvent, err := r.API.EventsGet(ctx, tuple.CalendarID, sourceEventID)
 	if err != nil {
 		if errors.Is(err, gws.ErrAPINotFound) {
-			// 404 on the source events.get splits two ways:
+			// 404 on the source events.get is terminal either way. Surface
+			// the observation so the action log isn't silently incomplete,
+			// then consume the event.
 			//
 			//   - Non-recurring source orphan: the source was deleted between
-			//     the last FullSync and this delta. The orphan-walk's prune
-			//     pass cleans the mirror at the next FullSync; target-delta's
-			//     job is just to surface the observation in the JSONL stream
-			//     so the action log isn't silently incomplete.
+			//     the last FullSync and this delta. The orphan walk's prune
+			//     pass cleans the mirror at the next FullSync.
 			//
-			//   - Recurring-instance mirror-only override (B17 Phase 2): the
-			//     user edited a single occurrence on the mirror that has no
-			//     source counterpart at that occurrence. We materialize the
-			//     override on source by patching the constructed source-
-			//     instance ID with the mirror's managed fields, then rewrite
-			//     the mirror from the post-patch source state. See
-			//     materializeSourceOverride for the per-step shape and the
-			//     B16 guardrail (recurrence MUST NOT appear in the patch
-			//     body).
+			//   - Recurring instance not in the series: Google answers 200
+			//     with a virtual occurrence for every slot the parent's RRULE
+			//     does produce, so a 404 means this slot is not part of the
+			//     series at all. Materializing an override here would create
+			//     an exception with no occurrence behind it. This is NOT the
+			//     mirror-only-override case - that one 200s and is decided by
+			//     the recurring handler's membership table (B29).
+			reason := reasonSourceOrphan
 			if mirrorEvent.RecurringEventID != "" {
-				return r.materializeSourceOverride(ctx, pd, mirrorEvent, tuple, sourceEventID, counts)
+				reason = reasonInstanceNotInSeries
 			}
-			r.emitTargetDeltaSkip(counts, mirrorEvent, sourceEventID, reasonSourceOrphan, pd)
-			r.debug("sync.targetDelta: source 404; non-recurring orphan skip",
+			r.emitTargetDeltaSkip(counts, mirrorEvent, sourceEventID, reason, pd)
+			r.debug("sync.targetDelta: source 404; terminal skip",
 				"target", target,
 				"target_event", mirrorEvent.ID,
 				"source_event", sourceEventID,
+				"reason", string(reason),
 			)
 			return nil
 		}
@@ -299,11 +407,11 @@ func (r *Reconciler) processTargetDeltaEvent(
 	// the user's new mirror state against the desired-from-source state,
 	// which is exactly what propagate wants.
 	//
-	// runTargetDeltaPhase guarantees the per-target inventory is present
-	// before dispatch (the loop bails out if r.inventories[target] is
+	// stageTargetDeltas guarantees the per-target inventory is present
+	// before dispatch (it skips a target whose r.inventories entry is
 	// missing). The lookup here is just to grab the *Inventory pointer.
 	inv := r.inventories[target]
-	classifier, _ := r.buildClassifier(pd, inv, counts)
+	classifier, _ := r.buildTargetDeltaClassifier(pd, inv, counts)
 
 	// Refresh the inventory entry with the live mirror state from the
 	// delta. The pre-tick inventory was snapshotted at the last FullSync;
@@ -339,13 +447,11 @@ func (r *Reconciler) processTargetDeltaEvent(
 	return nil
 }
 
-// emitTargetDeltaSkip emits a skip outcome for the non-recurring source-
-// orphan 404 path. Wired through the reconciler's Output sink so the
-// observation appears in the JSONL stream alongside the source-delta
-// outcomes. The recurring-instance mirror-only-override case used to
-// share this helper under Phase 1; Phase 2 routes it through
-// materializeSourceOverride instead, emitting a propagate via the
-// Classifier-scoped output sink.
+// emitTargetDeltaSkip emits a skip outcome for the target-delta paths that
+// short-circuit before the Classifier: the two 404 shapes and the
+// target-cancellation quarantine. Wired through the reconciler's Output sink
+// so the observation appears in the JSONL stream alongside the source-delta
+// outcomes.
 func (r *Reconciler) emitTargetDeltaSkip(
 	counts *Counts,
 	mirrorEvent *gws.Event,
@@ -411,88 +517,4 @@ func extractInstanceSuffix(mirrorID string) (string, bool) {
 		return "", false
 	}
 	return mirrorID[loc[0]:], true
-}
-
-// materializeSourceOverride is B17 Phase 2's promotion of the recurring-
-// instance mirror-only-override case from skip to propagate. The user edited
-// an occurrence on the mirror that has no source counterpart (events.get on
-// the constructed source-instance ID returned 404); this method creates the
-// source override and rewrites the mirror to reflect the post-write source
-// state.
-//
-// The flow mirrors the source-side propagate path in sync/drift.go's
-// doPropagate, with two structural differences:
-//
-//   - The patch body is built via mirror.BuildSourceOverridePatchBody (full
-//     managed fields, recurrence omitted by construction) rather than
-//     mirror.BuildPropagatePatchBody (drifted-fields subset). The source
-//     instance doesn't exist yet, so we materialize the user's full state
-//     to source rather than computing a drift diff.
-//
-//   - The outcome reason is reasonMirrorOnlyOverride rather than
-//     mirror.ReasonTargetEdited, so the JSONL stream stays self-describing
-//     about the bootstrap-from-mirror-only nature of this case.
-//
-// The B16 guardrail is structural: BuildSourceOverridePatchBody NEVER emits
-// recurrence regardless of the mirror's live recurrence value, so the
-// per-instance patch can't be reinterpreted by Google as a parent-level
-// update.
-//
-// Errors propagate up to runTargetDeltaPhase, which keeps the targetSyncToken
-// pinned so the next tick re-delivers the user's edit.
-func (r *Reconciler) materializeSourceOverride(
-	ctx context.Context,
-	pd config.PDir,
-	mirrorEvent *gws.Event,
-	tuple mirror.SourceTuple,
-	sourceInstanceID string,
-	counts *Counts,
-) error {
-	inv := r.inventories[pd.TargetCalendar]
-	classifier, _ := r.buildClassifier(pd, inv, counts)
-
-	// 1. Patch the source instance to materialize the override. The body
-	//    omits recurrence by construction (B16 guardrail).
-	patchedSource, err := r.API.EventsPatch(ctx, tuple.CalendarID, sourceInstanceID,
-		mirror.BuildSourceOverridePatchBody(mirrorEvent))
-	if err != nil {
-		return fmt.Errorf("target-delta source-override patch %s/%s: %w",
-			tuple.CalendarID, sourceInstanceID, err)
-	}
-
-	// 2. Rewrite the mirror from the post-patch source state, refreshing
-	//    calendar-sync:source_updated and (via the checksum follow-up)
-	//    calendar-sync:checksum so subsequent ticks classify as unchanged.
-	//    Use BuildInstancePayloadWithTimeZone (NOT BuildPayload): this is
-	//    always an instance, so recurrence on the rewritten mirror is nil.
-	rewritten := mirror.BuildInstancePayloadWithTimeZone(tuple.CalendarID, patchedSource, pd.TimeZone)
-	post, err := classifier.patchMirrorWithChecksum(ctx, pd.TargetCalendar, mirrorEvent.ID,
-		mirror.BuildPatchPayload(rewritten))
-	if err != nil {
-		return fmt.Errorf("target-delta source-override mirror rewrite %s/%s: %w",
-			pd.TargetCalendar, mirrorEvent.ID, err)
-	}
-
-	// 3. Update inventory at the per-instance source tuple. The override
-	//    now exists at (tuple.CalendarID, sourceInstanceID); the mirror's
-	//    calendar-sync:source updates to that managed-form tuple as part of
-	//    the BuildInstancePayload rewrite, so subsequent ticks treat the
-	//    instance as managed-form rather than inherited.
-	inv.Set(mirror.SourceTuple{CalendarID: tuple.CalendarID, EventID: sourceInstanceID}, post)
-
-	// 4. Emit the propagate outcome through the same wrapped sink the
-	//    Classifier uses, so Counts and Output get wired identically.
-	classifier.emit(Outcome{
-		Action:        mirror.ActionPropagate,
-		Reason:        reasonMirrorOnlyOverride,
-		SourceEventID: sourceInstanceID,
-		TargetEventID: post.ID,
-		Summary:       mirrorEvent.Summary,
-	})
-	r.debug("sync.targetDelta: materialized source override",
-		"target", pd.TargetCalendar,
-		"target_event", post.ID,
-		"source_event", sourceInstanceID,
-	)
-	return nil
 }

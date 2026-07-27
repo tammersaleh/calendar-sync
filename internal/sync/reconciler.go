@@ -86,6 +86,12 @@ type Reconciler struct {
 	// once instead of every 60 seconds forever. Cleared when the target
 	// gets a usable token again.
 	targetDeltaDisabledWarned map[string]bool
+
+	// sourceCatalogs indexes, per source calendar, which recurring
+	// exceptions the unexpanded source collection actually contains (B29).
+	// Rebuilt from each complete full source-list and kept current by each
+	// successful source delta. See catalog.go.
+	sourceCatalogs map[string]*sourceCatalog
 }
 
 // debug is a nil-safe wrapper around r.Log.Debug. Centralizing the nil
@@ -140,13 +146,14 @@ func WithLogger(l Logger) Option {
 // field access (the Reconciler is exported; both styles are supported).
 func New(api API, canonical *config.Canonical, opts ...Option) *Reconciler {
 	r := &Reconciler{
-		API:              api,
-		Canonical:        canonical,
-		syncTokens:       map[string]string{},
-		inventories:      map[string]*Inventory{},
-		lastFullSync:     map[string]time.Time{},
+		API:                       api,
+		Canonical:                 canonical,
+		syncTokens:                map[string]string{},
+		inventories:               map[string]*Inventory{},
+		lastFullSync:              map[string]time.Time{},
 		targetSyncTokens:          map[string]string{},
 		targetDeltaDisabledWarned: map[string]bool{},
+		sourceCatalogs:            map[string]*sourceCatalog{},
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -467,20 +474,34 @@ func (r *Reconciler) Tick(ctx context.Context) (TickResult, error) {
 		PerTarget: map[string]TargetStatus{},
 	}
 
-	// B17 phase 1: target-delta MUST run before source-delta. Otherwise
-	// source-driven mirror rewrites in the source-delta phase can clobber
-	// target edits before target-delta lists them. Pinned by
-	// TestTickPhaseOrdering_TargetBeforeSource.
-	r.runTargetDeltaPhase(ctx, &res)
+	// 1. Stage the target-delta READS. No writes yet: whether a target edit
+	//    to a recurring occurrence may be pushed to source depends on the
+	//    source-exception catalog, which step 2 refreshes.
+	//
+	//    Target-read before source-read is load-bearing, not incidental. It
+	//    puts the source view as close as possible to the reverse write, so
+	//    a source override that already existed when the target was read is
+	//    guaranteed to be in the catalog. The reverse order leaves a window
+	//    in which a just-created override is missed and clobbered.
+	//    Pinned by TestTickPhaseOrdering_TargetBeforeSource.
+	batches := r.stageTargetDeltas(ctx, &res)
 
+	// 2. Source-delta reads, and with them the catalog overlay.
 	stagedEvents, stagedTokens, sourceErrs := r.incrementalListSources(ctx, res.PerSource)
 
+	// 3 + 4. Preflight each target's whole batch, then the target-driven
+	//        writes. Still ahead of the source-driven writes below, so B17's
+	//        "target edits are seen before source rewrites" invariant holds.
+	r.applyTargetDeltas(ctx, &res, batches)
+
+	// 5. Source-driven writes.
 	for _, pd := range r.Canonical.PDirs {
 		pr := r.runPDirTick(ctx, pd, stagedEvents, sourceErrs, res.PerSource)
 		res.PDirs = append(res.PDirs, pr)
 		res.Aggregated.add(pr.Counts)
 	}
 
+	// 6. Commit tokens per the existing conditional-advancement rules.
 	r.advanceTokens(stagedTokens, res.PDirs, res.PerSource)
 
 	// Fold target-delta counts into Aggregated so the daemon's _meta
@@ -518,8 +539,10 @@ func (r *Reconciler) fullListSources(ctx context.Context) (
 		// horizon.
 		horizon := r.sourceMaxHorizon(source)
 		timeMax := ""
+		coverageMax := time.Time{}
 		if horizon > 0 {
-			timeMax = now.Add(horizon).Format(time.RFC3339)
+			coverageMax = now.Add(horizon)
+			timeMax = coverageMax.Format(time.RFC3339)
 		}
 
 		params := gws.EventsListParams{
@@ -534,10 +557,17 @@ func (r *Reconciler) fullListSources(ctx context.Context) (
 		evs, token, err := r.API.EventsList(ctx, params)
 		if err != nil {
 			errs[source] = err
+			// A failed list proves nothing about the collection, so the
+			// exception catalog for this calendar can no longer answer
+			// Absent. Never install a partial replacement.
+			r.markSourceCatalogUnknown(source)
 			continue
 		}
 		events[source] = evs
 		tokens[source] = token
+		// EventsList fails closed on truncation (B28), so reaching here
+		// means the collection is complete over [timeMin, timeMax].
+		r.rebuildSourceCatalog(source, evs, now, coverageMax)
 	}
 	return events, tokens, errs
 }
@@ -603,7 +633,7 @@ func (r *Reconciler) seedTargetSyncTokens(ctx context.Context) map[string]error 
 		// EventsList now guarantees a complete collection, so a missing
 		// token is a protocol violation rather than "the calendar is
 		// large". Storing it would put the map in the one state
-		// runTargetDeltaPhase treats as "skip forever" (B28).
+		// stageTargetDeltas treats as "skip forever" (B28).
 		if token == "" {
 			errs[target] = fmt.Errorf("target seed for %s returned no syncToken", target)
 			r.warn("sync.seedTargetSyncTokens: no syncToken returned; target-delta disabled for this target",
@@ -640,6 +670,9 @@ func (r *Reconciler) incrementalListSources(
 			st := perSource[source]
 			st.NeedsFullResync = true
 			perSource[source] = st
+			// No delta was read at all, so the exception catalog cannot be
+			// current for this tick.
+			r.markSourceCatalogUnknown(source)
 			continue
 		}
 
@@ -652,6 +685,7 @@ func (r *Reconciler) incrementalListSources(
 		}
 		evs, nextToken, err := r.API.EventsList(ctx, params)
 		if err != nil {
+			r.markSourceCatalogUnknown(source)
 			if errors.Is(err, gws.ErrAPIGone) {
 				delete(r.syncTokens, source)
 				st := perSource[source]
@@ -664,6 +698,9 @@ func (r *Reconciler) incrementalListSources(
 		}
 		events[source] = evs
 		tokens[source] = nextToken
+		// Staged overlay: applied only now that the whole delta came back
+		// intact, so a partial read can never half-update the index.
+		r.applySourceDeltaToCatalog(source, evs)
 	}
 	return events, tokens, errs
 }
@@ -885,6 +922,29 @@ func (r *Reconciler) buildClassifier(
 	}
 
 	return c, wrapped
+}
+
+// buildTargetDeltaClassifier is buildClassifier plus the B29 source-exception
+// membership wiring.
+//
+// Only the target-delta path gets it. On the source-delta path the source
+// event came out of the source collection, so its membership is Present by
+// construction and the handler's nil-callback default already says so.
+// Wiring the catalog there too would let a stale or Unknown index turn a
+// perfectly legitimate source-driven reconcile into a hard error.
+func (r *Reconciler) buildTargetDeltaClassifier(
+	pd config.PDir,
+	inv *Inventory,
+	counts *Counts,
+) (*Classifier, Output) {
+	c, out := r.buildClassifier(pd, inv, counts)
+	c.Recurring.SourceExceptionMembership = func(inst *gws.Event) recurring.Membership {
+		return r.lookupSourceException(pd.SourceCalendar, inst)
+	}
+	c.Recurring.NoteSourceException = func(inst *gws.Event) {
+		r.noteSourceException(pd.SourceCalendar, inst)
+	}
+	return c, out
 }
 
 // runClassifyLoop iterates the staged source list for this pdir, calling

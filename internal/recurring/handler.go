@@ -68,6 +68,18 @@ const (
 	// (no longer shared with the parent). See the inherited-instance branch
 	// of applyDriftMatrix.
 	ReasonInheritedUpgrade mirror.Reason = "inherited_upgrade"
+	// ReasonMirrorOnlyOverride is emitted when a target-side edit to a
+	// recurring occurrence the source has no exception for is materialized
+	// onto the source. The name predates B29 - v2.4.0's target-delta phase
+	// used it as a skip reason - and is kept verbatim for JSONL stream
+	// continuity.
+	ReasonMirrorOnlyOverride mirror.Reason = "mirror_only_override"
+	// ReasonOutsideCatalogCoverage is the skip reason for an inherited
+	// instance whose occurrence falls outside the window the source
+	// collection snapshot covered. Neither side can be trusted there:
+	// source-wins might destroy a user edit, target-wins might clobber a
+	// source override the snapshot never saw. Write nothing.
+	ReasonOutsideCatalogCoverage mirror.Reason = "outside_catalog_coverage"
 )
 
 // Result is the outcome of one Handle call. The Action / Reason / Conflict
@@ -161,9 +173,38 @@ type Handler struct {
 	// lacks the source's parent (see ParentReconciler).
 	ReconcileParent ParentReconciler
 
+	// SourceExceptionMembership answers whether the source calendar's
+	// unexpanded collection really contains the instance events.get just
+	// returned (see MembershipLookup). Nil means MembershipPresent, which
+	// is what the source-delta path wants: an event that came out of the
+	// source list is in the collection by construction.
+	SourceExceptionMembership MembershipLookup
+
+	// NoteSourceException records an exception this handler materialized so
+	// a retry sees it (see SourceExceptionNoter). Nil is a no-op.
+	NoteSourceException SourceExceptionNoter
+
 	// Log is the per-step diagnostic logger; nil silences output. Wired
 	// from sync.Reconciler.Log via buildClassifier.
 	Log Logger
+}
+
+// sourceExceptionMembership is a nil-safe wrapper around the injected
+// lookup. Nil defaults to MembershipPresent so the source-delta path, whose
+// events are collection members by construction, keeps its pre-B29
+// behaviour without every caller having to wire a callback.
+func (h *Handler) sourceExceptionMembership(sourceInstance *gws.Event) Membership {
+	if h.SourceExceptionMembership == nil {
+		return MembershipPresent
+	}
+	return h.SourceExceptionMembership(sourceInstance)
+}
+
+// noteSourceException is a nil-safe wrapper around the injected noter.
+func (h *Handler) noteSourceException(sourceInstance *gws.Event) {
+	if h.NoteSourceException != nil {
+		h.NoteSourceException(sourceInstance)
+	}
 }
 
 // debug is a nil-safe wrapper around h.Log.Debug.
@@ -571,7 +612,8 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 
 		upgradeReason := ReasonMigrationUpgrade
 		sourceWonConflict := mirror.ConflictMigrationSourceWon
-		if isInherited && !signal.NeedsMigration {
+		inheritedOnly := isInherited && !signal.NeedsMigration
+		if inheritedOnly {
 			upgradeReason = ReasonInheritedUpgrade
 			sourceWonConflict = mirror.ConflictInheritedSourceWon
 		}
@@ -582,6 +624,44 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 			"mirror_drifted_after_recompute", signal.MirrorDrifted,
 			"upgrade_reason", string(upgradeReason),
 		)
+
+		// B29. isInherited alone cannot separate two opposite situations:
+		// an auto-materialized bootstrap instance, whose junk fields must
+		// lose to the source (B15); and a user-created override on the
+		// target, whose fields are the whole point of two-way sync. Google
+		// copies the parent's extendedProperties onto BOTH, so
+		// calendar-sync:source carries the source parent either way.
+		//
+		// Collection membership tells them apart: a real source exception
+		// appears in the unexpanded source list, a virtual occurrence never
+		// does. Only the drift cells need the distinction - with no drift
+		// there is nothing to lose either way.
+		if inheritedOnly && signal.MirrorDrifted {
+			membership := h.sourceExceptionMembership(source)
+			h.debug("recurring.applyDriftMatrix: inherited drift membership",
+				"source_event", source.ID,
+				"mirror_instance", mirrorInstance.ID,
+				"membership", membership.String(),
+			)
+			switch membership {
+			case MembershipAbsent:
+				// No source exception at this occurrence, so the source
+				// side of the comparison is the parent's RRULE projection
+				// and the drift is the user's edit. Push it to source.
+				return h.materializeSourceOverride(ctx, source, mirrorInstance, desired)
+			case MembershipOutOfScope:
+				return Result{Action: mirror.ActionSkip, Reason: ReasonOutsideCatalogCoverage}, nil
+			case MembershipUnknown:
+				// The caller's batch preflight is supposed to keep this
+				// event out of the write phase entirely. Reaching here
+				// means the two disagreed; fail so the token pins rather
+				// than guessing which side wins.
+				return Result{}, fmt.Errorf(
+					"recurring: source-exception membership unknown for %s/%s; refusing to guess",
+					h.SourceCalendarID, source.ID)
+			}
+			// MembershipPresent falls through to the source-wins cell.
+		}
 
 		switch {
 		case !signal.SourceChanged && !signal.MirrorDrifted:
@@ -694,6 +774,58 @@ func (h *Handler) applyDriftMatrix(ctx context.Context, source, mirrorInstance *
 
 	// Unreachable: mirror.Classify produces only the four actions above.
 	return Result{}, errors.New("recurring: unexpected outcome action " + string(outcome.Action))
+}
+
+// materializeSourceOverride pushes a target-side edit of a recurring
+// occurrence onto a source series that has no exception there (B29). The
+// source instance is virtual: events.get returned it, but the unexpanded
+// source collection does not contain it, so events.patch against the same
+// constructed ID is what turns the projection into a real exception.
+//
+// Two structural differences from the ordinary propagate cell above:
+//
+//   - The body is mirror.BuildSourceOverridePatchBody (full managed fields,
+//     recurrence omitted by construction) rather than
+//     BuildPropagatePatchBody (drifted subset). There is no source-side
+//     state to merge against yet, so the mirror's live fields ARE the
+//     desired source state. The B16 guardrail is structural: that helper
+//     never emits recurrence, so a per-instance patch can never be
+//     reinterpreted as a parent-level update.
+//
+//   - The catalog is told about the new exception between the two writes.
+//     If the mirror rewrite fails, the target syncToken stays pinned and
+//     the next tick re-delivers the same edit; a catalog still reporting
+//     Absent would materialize a second override.
+func (h *Handler) materializeSourceOverride(ctx context.Context, source, mirrorInstance, desired *gws.Event) (Result, error) {
+	fields := mirror.DriftedFieldNames(mirrorInstance, desired)
+	patchedSource, err := h.API.EventsPatch(ctx, h.SourceCalendarID, source.ID,
+		mirror.BuildSourceOverridePatchBody(mirrorInstance))
+	if err != nil {
+		return Result{}, err
+	}
+	h.noteSourceException(patchedSource)
+
+	// Rewrite the mirror from the post-patch source so calendar-sync:source
+	// moves to the per-instance (managed) tuple and the checksum follow-up
+	// records the new state. Subsequent ticks then see a managed instance
+	// and take the standard four-way matrix instead of this branch.
+	desiredFromPatched := mirror.BuildInstancePayloadWithTimeZone(h.SourceCalendarID, patchedSource, h.TimeZone)
+	post, err := h.patchMirrorWithChecksum(ctx, h.TargetCalendarID, mirrorInstance.ID,
+		mirror.BuildPatchPayload(desiredFromPatched))
+	if err != nil {
+		return Result{}, err
+	}
+	h.debug("recurring.materializeSourceOverride: source exception created",
+		"source_event", source.ID,
+		"mirror_instance", mirrorInstance.ID,
+		"fields", fields,
+	)
+	return Result{
+		Action:                  mirror.ActionPropagate,
+		Reason:                  ReasonMirrorOnlyOverride,
+		Fields:                  fields,
+		PostWriteMirrorInstance: post,
+	}, nil
 }
 
 // reviveCancelledMirrorInstance handles SPEC.md's B20 cell: a source

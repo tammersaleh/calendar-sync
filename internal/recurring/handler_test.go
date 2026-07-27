@@ -2418,6 +2418,290 @@ func TestOccurrenceKey(t *testing.T) {
 	}
 }
 
+// ---------- B29: source-exception membership decision table ----------
+
+// newB29Handler builds the shared shape for the membership-table tests: a
+// weekly source parent whose occurrence at 12:00 has been dragged to 13:00
+// on the MIRROR. Google copies the parent's extendedProperties onto a
+// user-created override, so the mirror looks inherited either way and only
+// collection membership can say whether the drift is the user's edit or
+// bootstrap noise.
+//
+// The returned source instance is what events.get answers with when the
+// series has NO exception there: 200 and a virtual occurrence on the native
+// slot.
+func newB29Handler(api *stubAPI, membership Membership) (*Handler, *gws.Event, *gws.Event) {
+	mirrorParent := makeMirrorParent("mp-1")
+	source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
+	source.Start = &gws.EventDateTime{DateTime: "2026-05-01T12:00:00Z", TimeZone: "UTC"}
+	source.End = &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z", TimeZone: "UTC"}
+
+	desired := mirror.BuildInstancePayload("src-cal", source)
+	// storedSourceUpdated == source.Updated so SourceChanged is false; only
+	// the start/end differ, which is the user's drag.
+	mi := makeInheritedMirrorInstance("mi-1",
+		"src-cal:src-parent",
+		"sha256:parent-checksum-not-instance",
+		source.Updated,
+		"2026-04-30T11:00:00Z",
+		managedFieldHints{
+			summary:     desired.Summary,
+			description: desired.Description,
+			start:       &gws.EventDateTime{DateTime: "2026-05-01T13:00:00Z", TimeZone: "UTC"},
+			end:         &gws.EventDateTime{DateTime: "2026-05-01T14:00:00Z", TimeZone: "UTC"},
+		},
+	)
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
+
+	h := &Handler{
+		API:              api,
+		SourceCalendarID: "src-cal",
+		TargetCalendarID: "tgt-cal",
+		SourceWritable:   true,
+		LookupMirrorParent: func(_ mirror.SourceTuple) (*gws.Event, bool) {
+			return mirrorParent, true
+		},
+		SourceExceptionMembership: func(*gws.Event) Membership { return membership },
+	}
+	return h, source, mi
+}
+
+// TestHandle_InheritedInstance_AbsentException_MaterializesSourceOverride is
+// the B29 fix. The source collection does not contain this occurrence, so
+// events.get returned a virtual projection and the mirror's differing start
+// is the user's own edit. It must reach the source.
+func TestHandle_InheritedInstance_AbsentException_MaterializesSourceOverride(t *testing.T) {
+	api := newStubAPI()
+	h, source, mi := newB29Handler(api, MembershipAbsent)
+
+	patchedSource := *source
+	patchedSource.Start = mi.Start
+	patchedSource.End = mi.End
+	patchedSource.Updated = "2026-04-30T12:00:00Z"
+	api.queuePatch(&patchedSource) // source-override materialization
+	postMain := *mi
+	api.queuePatch(&postMain) // mirror rewrite
+	api.queuePatch(&postMain) // checksum follow-up
+
+	var noted *gws.Event
+	h.NoteSourceException = func(inst *gws.Event) { noted = inst }
+
+	got, err := h.Handle(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if got.Action != mirror.ActionPropagate || got.Reason != ReasonMirrorOnlyOverride {
+		t.Errorf("expected propagate(mirror_only_override); got %+v", got)
+	}
+	if !contains(got.Fields, "start") {
+		t.Errorf("expected start in the drifted fields; got %v", got.Fields)
+	}
+
+	patches := api.callsByOp("EventsPatch")
+	if len(patches) != 3 {
+		t.Fatalf("expected 3 patches (source + mirror + checksum); got %d", len(patches))
+	}
+	if patches[0].CalendarID != "src-cal" || patches[0].EventID != source.ID {
+		t.Errorf("first patch should materialize the source instance; got %s/%s",
+			patches[0].CalendarID, patches[0].EventID)
+	}
+	if patches[0].PatchBody.Start == nil || patches[0].PatchBody.Start.DateTime != "2026-05-01T13:00:00Z" {
+		t.Errorf("source patch Start = %+v, want the user's 13:00", patches[0].PatchBody.Start)
+	}
+	// B16 guardrail: a per-instance patch must never carry recurrence.
+	if patches[0].PatchBody.Recurrence != nil {
+		t.Errorf("source patch carried recurrence; got %v", patches[0].PatchBody.Recurrence)
+	}
+	// The mirror is rewritten from the POST-patch source, so the user's
+	// 13:00 survives rather than being reverted to 12:00.
+	if patches[1].PatchBody.Start == nil || patches[1].PatchBody.Start.DateTime != "2026-05-01T13:00:00Z" {
+		t.Errorf("mirror rewrite Start = %+v, want the user's 13:00", patches[1].PatchBody.Start)
+	}
+	// The catalog is told between the two writes so a retry after a failed
+	// rewrite cannot materialize a duplicate.
+	if noted == nil || noted.ID != source.ID {
+		t.Errorf("NoteSourceException should have received the patched source; got %+v", noted)
+	}
+}
+
+// TestHandle_InheritedInstance_NoteRunsBeforeMirrorRewrite pins the ordering
+// of the two writes against the catalog insert. If the insert happened after
+// the rewrite, a failed rewrite would leave the catalog reporting Absent and
+// the retried delta would create a second source override.
+func TestHandle_InheritedInstance_NoteRunsBeforeMirrorRewrite(t *testing.T) {
+	api := newStubAPI()
+	h, source, mi := newB29Handler(api, MembershipAbsent)
+
+	patchedSource := *source
+	patchedSource.Start = mi.Start
+	patchedSource.End = mi.End
+	api.queuePatch(&patchedSource)
+	// The stub drains the error queue ahead of the response queue, so a nil
+	// placeholder lets the source patch succeed before the rewrite fails.
+	api.patchErrors = append(api.patchErrors, nil, errors.New("rewrite boom"))
+
+	var notedAtPatchCount = -1
+	h.NoteSourceException = func(*gws.Event) {
+		notedAtPatchCount = len(api.callsByOp("EventsPatch"))
+	}
+
+	if _, err := h.Handle(context.Background(), source); err == nil {
+		t.Fatal("expected the mirror rewrite failure to surface")
+	}
+	if notedAtPatchCount != 1 {
+		t.Errorf("NoteSourceException ran after %d patches, want exactly 1 (the source patch)",
+			notedAtPatchCount)
+	}
+}
+
+// TestHandle_InheritedInstance_PresentException_StillSourceWins pins that the
+// B15 guard survives B29. The source holds a real exception here, so the
+// mirror's differing fields are the parent's RRULE projection and must lose.
+func TestHandle_InheritedInstance_PresentException_StillSourceWins(t *testing.T) {
+	api := newStubAPI()
+	h, source, mi := newB29Handler(api, MembershipPresent)
+
+	postMain := *mi
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+
+	got, err := h.Handle(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if got.Action != mirror.ActionPatch || got.Conflict != mirror.ConflictInheritedSourceWon {
+		t.Errorf("expected patch/inherited_source_won; got %+v", got)
+	}
+	for _, c := range api.calls {
+		if c.Op == "EventsPatch" && c.CalendarID == "src-cal" {
+			t.Errorf("a Present exception must never be patched; got %+v", c)
+		}
+	}
+}
+
+// TestHandle_InheritedInstance_OutOfScope_WritesNothing pins the coverage
+// guard. Outside the window the source snapshot proved, neither side can be
+// trusted, so the handler writes nothing at all.
+func TestHandle_InheritedInstance_OutOfScope_WritesNothing(t *testing.T) {
+	api := newStubAPI()
+	h, source, _ := newB29Handler(api, MembershipOutOfScope)
+
+	got, err := h.Handle(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if got.Action != mirror.ActionSkip || got.Reason != ReasonOutsideCatalogCoverage {
+		t.Errorf("expected skip(outside_catalog_coverage); got %+v", got)
+	}
+	if patches := api.callsByOp("EventsPatch"); len(patches) != 0 {
+		t.Errorf("out-of-scope must write nothing; got %+v", patches)
+	}
+}
+
+// TestHandle_InheritedInstance_Unknown_Errors pins the fail-safe. The
+// caller's batch preflight should keep this event out of the write phase
+// entirely; reaching the handler means the two disagreed, and guessing a
+// winner is exactly what B29 was about.
+func TestHandle_InheritedInstance_Unknown_Errors(t *testing.T) {
+	api := newStubAPI()
+	h, source, _ := newB29Handler(api, MembershipUnknown)
+
+	_, err := h.Handle(context.Background(), source)
+	if err == nil {
+		t.Fatal("expected an error for unknown membership")
+	}
+	if !strings.Contains(err.Error(), "membership unknown") {
+		t.Errorf("error should name the cause; got %v", err)
+	}
+	if patches := api.callsByOp("EventsPatch"); len(patches) != 0 {
+		t.Errorf("unknown membership must write nothing; got %+v", patches)
+	}
+}
+
+// TestHandle_InheritedInstance_NoDrift_IgnoresMembership pins that the
+// membership question is only asked in the drift cells. A target can receive
+// a delta for an indirectly materialized occurrence with no user change at
+// all; that must stay a metadata bootstrap, never a source write.
+func TestHandle_InheritedInstance_NoDrift_IgnoresMembership(t *testing.T) {
+	api := newStubAPI()
+	mirrorParent := makeMirrorParent("mp-1")
+	source := makeSourceException("2026-04-29T20:00:00Z", "2026-05-01T12:00:00Z", "Standup")
+	desired := mirror.BuildInstancePayload("src-cal", source)
+	mi := makeInheritedMirrorInstance("mi-1",
+		"src-cal:src-parent",
+		"sha256:parent-checksum-not-instance",
+		source.Updated,
+		source.Updated,
+		managedFieldHints{
+			summary:     desired.Summary,
+			description: desired.Description,
+			start:       desired.Start,
+			end:         desired.End,
+		},
+	)
+	api.queueGet("tgt-cal", expectedMirrorInstanceID("mp-1", source), mi)
+	postMain := *mi
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+
+	membershipAsked := false
+	h := &Handler{
+		API:              api,
+		SourceCalendarID: "src-cal",
+		TargetCalendarID: "tgt-cal",
+		SourceWritable:   true,
+		LookupMirrorParent: func(_ mirror.SourceTuple) (*gws.Event, bool) {
+			return mirrorParent, true
+		},
+		SourceExceptionMembership: func(*gws.Event) Membership {
+			membershipAsked = true
+			return MembershipAbsent
+		},
+	}
+	got, err := h.Handle(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if got.Action != mirror.ActionPatch || got.Reason != ReasonInheritedUpgrade {
+		t.Errorf("expected patch(inherited_upgrade); got %+v", got)
+	}
+	if membershipAsked {
+		t.Error("membership must not be consulted when there is no drift")
+	}
+	for _, c := range api.calls {
+		if c.Op == "EventsPatch" && c.CalendarID == "src-cal" {
+			t.Errorf("no-drift bootstrap must not patch source; got %+v", c)
+		}
+	}
+}
+
+// TestHandle_NilMembershipCallback_DefaultsToPresent pins the source-delta
+// path's contract. An event that came out of the source list is a collection
+// member by construction, so a Handler with no callback must keep the
+// pre-B29 source-wins behaviour rather than materializing an override.
+func TestHandle_NilMembershipCallback_DefaultsToPresent(t *testing.T) {
+	api := newStubAPI()
+	h, source, mi := newB29Handler(api, MembershipAbsent)
+	h.SourceExceptionMembership = nil
+
+	postMain := *mi
+	api.queuePatch(&postMain)
+	api.queuePatch(&postMain)
+
+	got, err := h.Handle(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if got.Conflict != mirror.ConflictInheritedSourceWon {
+		t.Errorf("nil callback should behave as Present; got %+v", got)
+	}
+	for _, c := range api.calls {
+		if c.Op == "EventsPatch" && c.CalendarID == "src-cal" {
+			t.Errorf("nil callback must not patch source; got %+v", c)
+		}
+	}
+}
+
 // ---------- helpers used by tests ----------
 
 func contains(haystack []string, needle string) bool {

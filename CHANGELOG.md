@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.6.2](https://github.com/tammersaleh/calendar-sync/compare/v2.6.1...v2.6.2) (2026-07-27)
+
+
+### Bug Fixes
+
+* apply settings.log_level and log_format to the logger (B30) ([14efb8d](https://github.com/tammersaleh/calendar-sync/commit/14efb8d2f4a03bdb161fb30cf656e6295de0700f))
+* fail closed when gws truncates a paginated list (B28) ([c6dcb73](https://github.com/tammersaleh/calendar-sync/commit/c6dcb7393d6191f514a093260b0b508ac46f1079))
+* never reseed or blank a valid target syncToken (B28) ([fa13102](https://github.com/tammersaleh/calendar-sync/commit/fa13102c69e82adad282205d4f669df7bd97ff0e))
+* propagate mirror-side recurring edits instead of reverting them (B29) ([c1a3201](https://github.com/tammersaleh/calendar-sync/commit/c1a3201acc6e11855ef589bbd45b1138b7f4eb31))
+
 ## [2.6.1](https://github.com/tammersaleh/calendar-sync/compare/v2.6.0...v2.6.1) (2026-07-09)
 
 

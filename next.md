@@ -4,17 +4,23 @@ Handoff for the next session. Read this first, then `SPEC.md`, then `CLAUDE.md`.
 
 ## Where the project stands
 
-### FIRST: there are 6 unpushed commits on `main`
+### Shipped and verified in production
 
-`git push origin main` failed with `sign_and_send_pubkey: signing failed ...
-Permission denied (publickey)` - the SSH agent was unreachable at the end of
-the session. Nothing else blocks them. Push, then follow "Installing a
-release" in CLAUDE.md.
+v2.6.2 (B28/B29/B30) and v2.6.3 (B37) are released, installed, and running.
+Daemon on v2.6.3. Nothing outstanding to push.
 
-**This release wakes a sync phase that has been dead in production since
-v2.4.0.** Read `doc/plans/b28-target-delta-dead.md` before shipping,
-especially "What to watch after shipping". Do not cherry-pick part of this
-stack: the pagination fix alone re-activates two destructive paths.
+**Two-way sync for recurring occurrences is verified working end to end.**
+Moved an occurrence on the mirror side whose source had no exception; the
+daemon emitted `propagate(mirror_only_override) fields=[end,start]`, created
+the source override, and upgraded the mirror to per-instance metadata.
+Reverted it and watched the mirror follow the source back. Both directions
+confirmed against live calendars, not just tests.
+
+Also observed working in production: the target-cancellation quarantine
+(fired on two cancelled occurrences, did not resurrect them, consumed the
+events so they stopped repeating once the token advanced), and the pinned-
+token failure mode (a hard error pinned the cursor and retried, then
+recovered cleanly once the underlying problem was fixed - no data loss).
 
 ### What the stack fixes (B28 / B29 / B30)
 
@@ -42,10 +48,28 @@ Designed with Codex, which rejected a first smaller cut and supplied two
 guards: FullSync must never reseed a valid target token, and target
 cancellations must be quarantined. Code review clean, no data-loss findings.
 
+Then **B37**, found only by driving the real scenario against real calendars
+after v2.6.2 installed: both reverse-patch builders read transparency and
+visibility raw while the drift comparison read them normalized, so the patch
+sent `"transparency": ""` and Google returned 400 on every tick. Latent since
+v2.5.0, unreachable until the phase woke up. Shipped as v2.6.3 with a
+property-style test that holds the write layer and the comparison layer to
+each other generically, so a third normalized field cannot repeat it.
+
+The lesson worth keeping: a clean code review and 1133 passing tests both
+missed B37. The fake-gws harness cannot reject an invalid enum the way the
+real API does. For anything that newly reaches a live write path, drive the
+actual scenario against real calendars before calling it done.
+
 Open follow-ups from this work: **B31** (no FullSync recovery for inherited
 target exceptions - the reason B36 matters), **B32** (reverse cancellation,
 currently quarantined), **B33** (`EventsInstances` split), **B34**, **B35**,
 **B36**.
+
+Repo change made along the way: `allow_auto_merge` was disabled on the GitHub
+repo, which is why the v2.6.2 release PR did not self-merge and the release
+workflow failed on `enablePullRequestAutoMerge`. Enabled it; v2.6.3 then cut
+with no intervention.
 
 The user's original event is fixed and verified on both calendars.
 

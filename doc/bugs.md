@@ -160,6 +160,28 @@ Secondary defect in the same code: invalid values (`--log-level=trace`, `--log-f
 
 Fix: `Globals.LogLevel` / `LogFormat` become `*string` with kong `enum` and no `default:` - nil means "the invocation said nothing", so absent is distinguishable from empty and a bad value is a usage error. Level and format resolve independently (`--log-level=warn` still honors `settings.log_format`). A bootstrap logger still exists for configless commands and config-load failures; `loadConfig` replaces `rt.Logger` after a successful load, before any gws client, reconciler or feed runner captures it. `cfg.Settings` is not mutated with CLI values - the config represents the file, the logger represents the invocation.
 
+### B37 - reverse patches sent `"transparency": ""` and got HTTP 400 (CRITICAL)
+
+Caught by driving the real bug end-to-end against live calendars immediately after v2.6.2 installed, which is the only reason it was found: no unit test covered it and the code path had never executed in production.
+
+Test: the exercise series has no source exception on Aug 18, and its mirror instance was inherited-form - exactly the B29 shape. Moving the mirror to 10:00 should have created a source override. Instead every tick logged:
+
+```
+sync.targetDelta: process failed ... target-delta classify
+me@tammersaleh.com/k6dsed..._20260818T154500Z:
+api_invalid_request during events.patch (HTTP 400): Bad Request
+```
+
+Cause: `BuildSourceOverridePatchBody` and `BuildPropagatePatchBody` read `live.Transparency` / `live.Visibility` RAW, while `DriftedFieldNames` reads the same fields through `ManagedFieldsFromEvent`, which runs `normalizeTransparency` / `normalizeVisibility`. Google OMITS these fields when the value equals the default, so a raw read yields `""` and the patch body carried `"transparency": ""` - not a member of the enum. Reproduced by hand: the identical body with `transparency` omitted succeeds, with `"transparency": ""` returns 400 `badRequest`.
+
+The comparison layer and the write layer disagreed about what an omitted enum means. The write layer was wrong.
+
+Latent since v2.5.0 (`BuildSourceOverridePatchBody` shipped with B17 Phase 2) but never reachable, because B28 had the target-delta phase switched off for that entire period. B28/B29 made it live on the first tick.
+
+Fix: both builders send the NORMALIZED value. Sending the explicit default rather than omitting the field is required, not cosmetic - on the propagate path the field is in the drifted set by definition, so omitting it would leave the drift unresolved and every tick would retry forever. `TestPatchBuilders_AgreeWithDriftComparison` pins the two layers against each other so they cannot drift apart again.
+
+Behaviour while broken was correct-but-stuck rather than destructive: the 400 is non-transient, so the batch pinned the target token and retried, and no calendar data was corrupted. That is the designed failure mode working.
+
 ### B26 - a FullSync that races a fresh feed import stranded the imported events
 
 Surfaced live during the v2.6.0 install: the tripit feed imported the rebooked Jul-13 flights onto Personal, but they didn't mirror to CoreWeave for ~10 minutes (and in principle up to `full_sync_interval`, 24h).

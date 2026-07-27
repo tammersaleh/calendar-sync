@@ -131,10 +131,16 @@ func BuildSourceOverridePatchBody(live *gws.Event) *gws.PatchEvent {
 		Summary:      gws.PatchStr(live.Summary),
 		Description:  gws.PatchStr(stripped),
 		Location:     gws.PatchStr(live.Location),
-		Start:        live.Start,
-		End:          live.End,
-		Transparency: gws.PatchStr(live.Transparency),
-		Visibility:   gws.PatchStr(live.Visibility),
+		Start: live.Start,
+		End:   live.End,
+		// Normalized, not raw. Google OMITS transparency/visibility when the
+		// value equals the default, so a raw read yields "" and the patch
+		// sends `"transparency": ""` - not a member of the enum, and a hard
+		// 400 (B37). The explicit default is also what keeps this builder
+		// consistent with DriftedFieldNames, which compares through the same
+		// normalization.
+		Transparency: gws.PatchStr(normalizeTransparency(live.Transparency)),
+		Visibility:   gws.PatchStr(normalizeVisibility(live.Visibility)),
 	}
 	// body.Recurrence stays nil. Do NOT add recurrence handling here. See
 	// the doc comment above for the B16 rationale.
@@ -178,9 +184,14 @@ func BuildPropagatePatchBody(live *gws.Event, drifted []string) *gws.PatchEvent 
 		case "end":
 			body.End = live.End
 		case "transparency":
-			body.Transparency = gws.PatchStr(live.Transparency)
+			// Normalized for the same reason as BuildSourceOverridePatchBody:
+			// an omitted value reads as "" and Calendar API rejects that (B37).
+			// Omitting the field instead is NOT an option - it is in the
+			// drifted set, so leaving it unset would never resolve the drift
+			// and every tick would retry.
+			body.Transparency = gws.PatchStr(normalizeTransparency(live.Transparency))
 		case "visibility":
-			body.Visibility = gws.PatchStr(live.Visibility)
+			body.Visibility = gws.PatchStr(normalizeVisibility(live.Visibility))
 		case "recurrence":
 			if len(live.Recurrence) == 0 {
 				body.Recurrence = gws.PatchRecurrenceClear()

@@ -48,6 +48,7 @@ func (c *Client) CalendarListList(ctx context.Context) ([]CalendarListEntry, err
 	args := []string{
 		"calendar", "calendarList", "list",
 		"--page-all",
+		"--page-limit", MaxPagesPerList,
 		"--format", "json",
 	}
 
@@ -59,6 +60,13 @@ func (c *Client) CalendarListList(ctx context.Context) ([]CalendarListEntry, err
 	pages, err := parseCalendarListPages(stdout)
 	if err != nil {
 		return nil, fmt.Errorf("gws calendarList.list: %w", err)
+	}
+	// Same fail-closed contract as EventsList (B28): callers resolve a
+	// calendar by display summary, and a truncated list would surface as
+	// "no such calendar" rather than as an error.
+	if len(pages) > 0 && pages[len(pages)-1].NextPageToken != "" {
+		return nil, fmt.Errorf("%w: calendarList.list stopped after %d pages (--page-limit %s) with more results pending",
+			ErrIncompletePagination, len(pages), MaxPagesPerList)
 	}
 
 	var out []CalendarListEntry

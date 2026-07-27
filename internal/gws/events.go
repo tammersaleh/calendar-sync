@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -47,6 +48,55 @@ type eventsPage struct {
 	NextSyncToken string  `json:"nextSyncToken,omitempty"`
 }
 
+// MaxPagesPerList is the explicit `--page-limit` every exhaustive
+// `--page-all` invocation passes. It is a string because it goes straight
+// into argv.
+//
+// gws defaults --page-limit to 10. At maxResults=250 that silently caps a
+// list at 2500 events (B28): gws stops early, the final emitted page still
+// carries nextPageToken and carries no nextSyncToken, and the wrapper used
+// to return that partial prefix as success. 1000 pages is 250,000 events -
+// far beyond any real calendar (the largest here needs 41) while still
+// bounding a runaway.
+//
+// Raising the cap alone is not the fix; assertPaginationComplete below is.
+// The cap only decides where "complete" stops being achievable.
+const MaxPagesPerList = "1000"
+
+// ErrIncompletePagination reports that gws stopped paginating before the
+// collection was exhausted, so the results are a partial prefix.
+//
+// Callers must treat this as a hard failure. Every consumer of EventsList
+// (source lists, source/target deltas, target seeding, inventory rebuilds,
+// feed inventory, mirror list/prune) assumes it received the COMPLETE
+// collection; acting on a prefix produces missed inserts, bogus orphan
+// classification, and - via an empty sync token - permanently disabled
+// delta phases.
+var ErrIncompletePagination = errors.New("gws: pagination incomplete")
+
+// assertPaginationComplete verifies the emitted page sequence exhausted the
+// collection. Google's contract: every page except the last carries
+// nextPageToken, and the last one does not. A final page that still
+// advertises nextPageToken therefore means gws hit --page-limit and
+// stopped, NOT that the calendar is merely large.
+//
+// Deliberately does NOT require a nextSyncToken on the final page. Whether
+// Google issues one depends on the query (and events.instances has none at
+// all), so token expectations belong to the caller, not here.
+//
+// pageCount and the limit go into the message; the opaque page token never
+// does - it is cursor state, not diagnostics, and these errors reach logs.
+func assertPaginationComplete(op string, pages []eventsPage) error {
+	if len(pages) == 0 {
+		return nil
+	}
+	if last := pages[len(pages)-1]; last.NextPageToken != "" {
+		return fmt.Errorf("%w: %s stopped after %d pages (--page-limit %s) with more results pending",
+			ErrIncompletePagination, op, len(pages), MaxPagesPerList)
+	}
+	return nil
+}
+
 // EventsList runs `gws calendar events list --params <p> --page-all` and
 // returns the merged event list plus the nextSyncToken from the last page.
 // On a successful incremental list the caller stores the returned token to
@@ -71,6 +121,7 @@ func (c *Client) EventsList(ctx context.Context, params EventsListParams) (event
 		"calendar", "events", "list",
 		"--params", string(paramsJSON),
 		"--page-all",
+		"--page-limit", MaxPagesPerList,
 		"--format", "json",
 	}
 
@@ -82,6 +133,11 @@ func (c *Client) EventsList(ctx context.Context, params EventsListParams) (event
 	pages, err := parseNDJSONPages(stdout)
 	if err != nil {
 		return nil, "", fmt.Errorf("gws events.list: %w", err)
+	}
+	// Fail closed before touching Items: a truncated list must never reach
+	// a caller, not even alongside an error (B28).
+	if err := assertPaginationComplete("events.list", pages); err != nil {
+		return nil, "", err
 	}
 
 	for _, p := range pages {
@@ -143,10 +199,19 @@ type EventsInstancesParams struct {
 }
 
 // EventsInstances returns the materialized instances of a recurring event
-// over the supplied time window. SPEC.md uses this for two purposes:
-// horizon-eligibility checks on recurring parents (small bounded window,
-// MaxResults=1) and locating a specific mirror instance by OriginalStart
-// for the recurring-instance handler.
+// over the supplied time window. Both remaining callers are existence
+// checks that pass MaxResults=1 and only test len(result) > 0:
+// classify.go's horizon eligibility for a recurring parent and orphan.go's
+// equivalent. (Locating a mirror instance moved to events.get in B24.)
+//
+// Deliberately does NOT pass --page-limit and does NOT run
+// assertPaginationComplete, unlike EventsList. Both would be wrong here:
+// with MaxResults=1 the API returns one item per page, so an exhaustive
+// walk of a long series would be up to MaxPagesPerList round-trips to
+// answer a yes/no question, and truncation is the EXPECTED outcome of an
+// existence probe rather than a fault. If a caller ever needs the full
+// instance set, give it a separate exhaustive method rather than changing
+// this one.
 func (c *Client) EventsInstances(ctx context.Context, params EventsInstancesParams) ([]Event, error) {
 	c.debug("gws.EventsInstances",
 		"calendar_id", params.CalendarID,

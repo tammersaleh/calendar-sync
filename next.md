@@ -4,6 +4,54 @@ Handoff for the next session. Read this first, then `SPEC.md`, then `CLAUDE.md`.
 
 ## Where the project stands
 
+### FIRST: there are 6 unpushed commits on `main`
+
+`git push origin main` failed with `sign_and_send_pubkey: signing failed ...
+Permission denied (publickey)` - the SSH agent was unreachable at the end of
+the session. Nothing else blocks them. Push, then follow "Installing a
+release" in CLAUDE.md.
+
+**This release wakes a sync phase that has been dead in production since
+v2.4.0.** Read `doc/plans/b28-target-delta-dead.md` before shipping,
+especially "What to watch after shipping". Do not cherry-pick part of this
+stack: the pagination fix alone re-activates two destructive paths.
+
+### What the stack fixes (B28 / B29 / B30)
+
+Started from a user report - a recurring event edited on the mirror side
+never propagated back. It turned out B17's entire target-delta phase had
+been dead for months.
+
+`gws --page-all` defaults to `--page-limit 10`. The wrapper never passed the
+flag, so any list over 2500 events came back as a partial prefix reported as
+success, with an empty `nextSyncToken`. The target-token seed lists the whole
+calendar unbounded; both targets need 14 and 41 pages. Both stored `""`, and
+the phase skipped them every tick. Two-way sync was off, silently, and
+`settings.log_level` never reaching the logger (B30) is why nobody saw it.
+
+Underneath that, B29: Google answers `events.get` on a virtual recurring
+occurrence with **200**, not 404, so even with the token fixed the daemon
+would have reverted the user's edit instead of propagating it. The fix is a
+per-source recurring-exception catalog - membership in a complete unexpanded
+`events.list` is the only sound discriminator. `etag`, `sequence`,
+`start != originalStartTime`, `SourceChanged` and managed-field comparison
+were each tried against live calendars and each fails; the rejections are
+written up in `doc/bugs.md` B29 so nobody re-derives them.
+
+Designed with Codex, which rejected a first smaller cut and supplied two
+guards: FullSync must never reseed a valid target token, and target
+cancellations must be quarantined. Code review clean, no data-loss findings.
+
+Open follow-ups from this work: **B31** (no FullSync recovery for inherited
+target exceptions - the reason B36 matters), **B32** (reverse cancellation,
+currently quarantined), **B33** (`EventsInstances` split), **B34**, **B35**,
+**B36**.
+
+The user's original event is fixed and verified on both calendars.
+
+### Prior history
+
+
 calendar-sync is feature-complete on the planned scope. Recent work history:
 
 000. **iCal feed importer (`[[feeds]]`)** - SHIPPED as **v2.6.0** (merged to main, released, installed; daemon running it). Six layers (`internal/ical` parser, `internal/feed` fetcher, `internal/feedimport` importer + Runner, `[[feeds]]` config, daemon/cmd wiring, docs), each red-green with before+after code review plus a final full-diff review. Design in `doc/plans/ical-importer.md`.

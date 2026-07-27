@@ -234,30 +234,75 @@ Therefore B28's fix must NOT ship alone. Ship the whole cut below, or leave
 
 ## Status
 
+All six shipped items are DONE, reviewed clean, and merged to local `main`
+(6 commits, unpushed - the SSH agent was unreachable).
+
 - [x] Diagnosis, all three defects confirmed against live calendars.
-- [x] User's Jul 28 event repaired by hand: source override materialized on
-      `me@tammersaleh.com` at 09:00-09:45, mirror already at 09:00.
-- [x] Item 2 (pagination): `MaxPagesPerList`, `ErrIncompletePagination`,
-      `assertPaginationComplete`, wired into `EventsList` + `CalendarListList`,
-      `EventsInstances` explicitly excluded with a comment.
-      Tests in `internal/gws/pagination_test.go`. Green.
-- [ ] Item 1 (logging precedence).
-- [ ] Item 3 (target-token seeding invariant).
-- [ ] Item 4 (membership catalog).
-- [ ] Item 5 (staged reads + preflight).
-- [ ] Item 6 (cancellation quarantine).
-- [ ] `doc/bugs.md` entries B28/B29/B30 + the five deferred.
-- [ ] SPEC.md corrections: the "Google omitted nextSyncToken on a long delta"
-      assumption (SPEC ~line 1056, CLAUDE.md ~199-201, `reconciler.go` ~1004)
-      is wrong. A terminal page without a sync token means truncation.
-- [ ] Code review (before + after), both passes.
-- [ ] `next.md` handoff update.
+- [x] User's Jul 28 event repaired. Both sides 09:00-09:45, and the mirror's
+      `calendar-sync:source` upgraded to per-instance form, so that
+      occurrence is out of the inherited state entirely.
+- [x] Item 1 (logging precedence, B30).
+- [x] Item 2 (pagination, B28). Verified against real gws: `--page-limit
+      1000` is accepted and the terminal page has no `nextPageToken` and a
+      populated `nextSyncToken`.
+- [x] Item 3 (target-token seeding invariant, B28).
+- [x] Item 4 (membership catalog, B29) - `internal/sync/catalog.go`,
+      `internal/recurring/membership.go`.
+- [x] Item 5 (staged reads + batch preflight).
+- [x] Item 6 (cancellation quarantine).
+- [x] `doc/bugs.md`: B28/B29/B30 fixed; B31-B36 open.
+- [x] SPEC.md + CLAUDE.md corrections.
+- [x] Code review - clean, no critical or data-loss findings. It verified
+      the quarantine specifically (no path from a target tombstone reaches a
+      revive cell), the readiness gating (a stale index can never answer
+      Absent), the `MembershipPresent` zero-value default (only
+      `buildTargetDeltaClassifier` wires the real lookup; the source-delta
+      path correctly defaults to Present), and that the modified tests were
+      strengthened rather than weakened. One observation became B36.
+- [x] Temporary local daemon changes reverted (see below).
+- [ ] **PUSH** - blocked on the SSH agent, nothing else.
+- [ ] After push: wait for the release, `brew upgrade --cask calendar-sync`,
+      `launchctl kickstart -k "gui/$(id -u)/org.calendar-sync.agent"`, then
+      watch the first ticks (see "What to watch after shipping").
+
+## What to watch after shipping
+
+This release wakes a phase that has been dead since v2.4.0, so the first
+hours are the interesting ones.
+
+The startup FullSync seeds both target tokens fresh, so the first delta
+contains only changes made after the seed. There is no stampede over
+history - but every subsequent mirror-side edit now acts.
+
+Expect in `~/Library/Logs/calendar-sync/calendar-sync.err.log`:
+
+- No more `token_present:false`. The seed should now produce real tokens.
+- `sync.targetDelta: no target syncToken` should NOT appear. If it does,
+  the seed is still failing and two-way sync is still off.
+- `sync.sourceCatalog: rebuilt` per source on each FullSync, with a
+  plausible exception count.
+
+Watch stdout (`calendar-sync.out.log`) for the newly-reachable outcomes:
+`propagate(mirror_only_override)`, `skip(target_cancelled)`,
+`skip(instance_not_in_series)`, `skip(outside_catalog_coverage)`. The first
+two are the ones to sanity-check against what you actually did in the UI.
+
+Red flags: any `conflict=inherited_source_won` on an occurrence you edited
+on the mirror side (that would mean membership said Present when it should
+have said Absent), or a mirror-side deletion coming back.
 
 ## Temporary local changes to revert before finishing
 
-- `~/.config/calendar-sync/config.toml`: `log_level` set to `debug`.
-- `~/Library/LaunchAgents/org.calendar-sync.agent.plist`: added
-  `CALENDAR_SYNC_LOG_LEVEL=debug` to `EnvironmentVariables`. Remove it and
-  re-bootstrap, or re-run `calendar-sync install`.
-- `internal/sync/scratch_b28_test.go`: throwaway observation test for B29.
-  Delete once the real regression test lands.
+All reverted and verified:
+
+- `~/.config/calendar-sync/config.toml`: `log_level` back to `info`.
+- `~/Library/LaunchAgents/org.calendar-sync.agent.plist`:
+  `CALENDAR_SYNC_LOG_LEVEL` removed, daemon re-bootstrapped, confirmed
+  emitting INFO again.
+- `internal/sync/scratch_b28_test.go`: deleted; the real regression test is
+  `TestTargetDeltaPhase_VirtualOccurrence_MaterializesSourceOverride`.
+
+Note the installed daemon is still v2.6.1, which predates B30 and therefore
+ignores `settings.log_level`. To get debug out of the CURRENT binary you
+need the env var in the plist. After this release ships, `log_level` in
+config.toml works on its own.

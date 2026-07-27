@@ -14,6 +14,14 @@ The fix is to keep inherited target exceptions in a separate inventory collectio
 
 The one known instance of this damage (the Jul 28 exercise event) was repaired by hand: the source override was materialized directly at 09:00.
 
+### B36 - a transient read error on the target-delta path silently drops the edit
+
+`applyTargetDeltas` reuses B18's transient-read carve-out: a well-understood flake (`events.get` 5xx/400/404) inside `processTargetDeltaEvent` is logged, skipped, and does NOT pin the target token. The carve-out exists so one flaky read cannot replay the same delta forever.
+
+That tradeoff is sound on the source-delta path, where the next FullSync re-lists the source event anyway. It is worse on the target-delta path, because B31 means there is no recovery scan: the token advances past the user's edit and nothing ever re-delivers it. A single transient flake at the wrong moment silently loses a mirror-side edit.
+
+Pre-existing behaviour extended to a newly-live path rather than a new regression, but the consequence is different here and worth choosing deliberately. Options: pin the token for transient errors on the target path only (accepting a possible replay loop, bounded the same way B35's deferred batches are), or fix B31 so FullSync recovers dropped edits. B31 is the better fix because it also covers the offline-edit and 410 cases.
+
 ### B32 - reverse target cancellation is quarantined, not implemented
 
 Deleting one occurrence of a recurring event on the MIRROR side does not propagate to the source. Target deltas carry `ShowDeleted: true`, and the revive cells in `internal/recurring/handler.go` (B20) and `internal/sync/reconcile.go` would resurrect a cancelled mirror whose source is still live. The reverse patch body omits `status`, so routing cancellations through materialization would not delete anything either.

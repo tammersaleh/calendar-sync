@@ -81,9 +81,10 @@ type Canonical struct {
 // URL is a bearer secret; never log it directly. RedactedURL is the only
 // form safe for logs and `config show`.
 type CanonicalFeed struct {
-	Name           string
-	URL            string // resolved secret (from Feed.URL or os.Getenv(Feed.URLEnv)); MarshalJSON redacts it - see below
-	TargetCalendar string // canonical ID
+	Name            string
+	URL             string // resolved secret (from Feed.URL or os.Getenv(Feed.URLEnv)); MarshalJSON redacts it - see below
+	TargetCalendar  string // canonical ID
+	ForceAllDayBusy bool   // force imported all-day events Busy regardless of TRANSP
 }
 
 // RedactedURL returns a log-safe rendering of the feed URL: "scheme://host/
@@ -106,13 +107,15 @@ func (f CanonicalFeed) RedactedURL() string {
 // (in memory); anything that serializes gets the redacted form.
 func (f CanonicalFeed) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
-		Name           string `json:"name"`
-		URL            string `json:"url"`
-		TargetCalendar string `json:"target_calendar"`
+		Name            string `json:"name"`
+		URL             string `json:"url"`
+		TargetCalendar  string `json:"target_calendar"`
+		ForceAllDayBusy bool   `json:"force_all_day_busy"`
 	}{
-		Name:           f.Name,
-		URL:            f.RedactedURL(),
-		TargetCalendar: f.TargetCalendar,
+		Name:            f.Name,
+		URL:             f.RedactedURL(),
+		TargetCalendar:  f.TargetCalendar,
+		ForceAllDayBusy: f.ForceAllDayBusy,
 	})
 }
 
@@ -571,9 +574,10 @@ func expandFeeds(c Config, calendars map[string]Calendar, refToCanonical map[str
 		}
 
 		out = append(out, CanonicalFeed{
-			Name:           f.Name,
-			URL:            feedURL,
-			TargetCalendar: targetCal.CanonicalID,
+			Name:            f.Name,
+			URL:             feedURL,
+			TargetCalendar:  targetCal.CanonicalID,
+			ForceAllDayBusy: f.ForceAllDayBusy,
 		})
 	}
 	return out, nil

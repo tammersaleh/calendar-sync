@@ -4,6 +4,17 @@ Handoff for the next session. Read this first, then `SPEC.md`, then `CLAUDE.md`.
 
 ## Where the project stands
 
+### In flight: per-feed `force_all_day_busy` (feat)
+
+Branch `feat/feed-force-all-day-busy`. Adds a per-feed `[[feeds]].force_all_day_busy`
+bool: forces imported all-day events to Busy (opaque), overriding the feed's
+`TRANSP`; timed events untouched. No `[settings]` default. Surfaced in
+`config show`. Full wiring config.Feed → CanonicalFeed → feedimport.FeedConfig
+→ Importer → build.go `transparencyFor`, keyed off `it.Start.AllDay` only. The
+forced value rides the checksum, so a flip repatches then stays stable. Tests
+green, code review clean. See the CLAUDE.md architecture note. Remaining:
+commit `feat:`, push, wait for release, install + restart daemon, verify.
+
 ### Shipped and verified in production
 
 v2.6.2 (B28/B29/B30) and v2.6.3 (B37) are released, installed, and running.

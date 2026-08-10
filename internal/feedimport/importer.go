@@ -53,7 +53,11 @@ type Importer struct {
 	Target string // canonical target calendar ID
 	FeedID string // stable feed identifier; namespaces deterministic IDs
 	DryRun bool
-	Log    Logger
+	// ForceAllDayBusy forces every imported all-day event to opaque (Busy),
+	// overriding the feed's TRANSP. Timed events keep their own TRANSP. See
+	// build.go:transparencyFor.
+	ForceAllDayBusy bool
+	Log             Logger
 }
 
 // Result tallies what Reconcile did (or, under DryRun, would have done).

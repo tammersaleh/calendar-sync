@@ -341,6 +341,7 @@ Typical use: replace Google's slow "subscribe by URL" refresh (hours to a day) w
 | `url_env` | string                 | one of     | Name of an environment variable holding the URL instead of `url`. Exactly one of `url` / `url_env` must be set. Prefer `url_env` to keep the secret out of the config file. |
 | `target`  | string or inline table | yes        | Calendar to import into. Same reference forms as a pair's `target` (see "Calendar references"). Must be writable (`accessRole >= writer`).       |
 | `enabled` | bool                   | no (true)  | If false, the feed is skipped entirely - no URL resolution, no validation, no import.                                                           |
+| `force_all_day_busy` | bool        | no (false) | If true, every imported **all-day** event is marked Busy (opaque), overriding the feed's own `TRANSP`. Timed events keep their feed transparency. TripIt trip spans ship `TRANSP:TRANSPARENT` (Free); set this to make a trip block your availability. |
 
 Fetch cadence is governed by the feed's own HTTP caching, not a config knob: the importer honors `Cache-Control: max-age` (falling back to the feed's `X-PUBLISHED-TTL`, then a 15-min default), clamped to `[60s, 24h]`. The daemon calls the importer every tick, but the in-memory cache gate skips the actual HTTP request until the TTL elapses. Deletion is scoped to the feed's own events and only ever happens after a successful fetch + full parse - a fetch failure, a `304 Not Modified`, or a parse error never prunes anything.
 
@@ -444,7 +445,10 @@ Rather than subscribing Google Calendar to the TripIt `.ics` (which Google re-po
 name = "tripit"
 url_env = "TRIPIT_ICAL_URL"
 target = "primary"
+force_all_day_busy = true
 ```
+
+`force_all_day_busy = true` marks the all-day trip spans Busy. TripIt ships them as `TRANSP:TRANSPARENT` (Free), so without this a multi-day trip wouldn't block your availability; the timed flight/hotel events keep their own transparency either way. Omit the flag (or set it false) to import transparency verbatim.
 
 The events land on `primary` as ordinary events, so any `[[pairs]]` with `source = "primary"` mirrors them to the other calendar within the same tick. Nothing else references the feed; `name` just has to stay stable (renaming orphans the previously-imported events).
 
@@ -712,7 +716,7 @@ Stdout:
 
 ```
 $ calendar-sync config show
-{"settings":{"poll_interval":"60s","horizon":"365d","full_sync_interval":"24h","log_level":"info","log_format":"json","dry_run":false,"propagate_target_edits":true},"pairs":[{"name":"work-to-personal","source":"alice@example.com","target":"primary","enabled":true}],"feeds":[{"name":"tripit","url":"https://www.tripit.com/<redacted>","target_calendar":"primary"}]}
+{"settings":{"poll_interval":"60s","horizon":"365d","full_sync_interval":"24h","log_level":"info","log_format":"json","dry_run":false,"propagate_target_edits":true},"pairs":[{"name":"work-to-personal","source":"alice@example.com","target":"primary","enabled":true}],"feeds":[{"name":"tripit","url":"https://www.tripit.com/<redacted>","target":"primary","force_all_day_busy":false}]}
 {"_meta":{"count":1}}
 ```
 

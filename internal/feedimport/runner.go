@@ -17,9 +17,10 @@ import (
 // URL is a bearer secret. It is held only on the feedEntry and handed to the
 // fetcher; it never reaches the Importer, a log line, or a returned error.
 type FeedConfig struct {
-	Name           string
-	URL            string
-	TargetCalendar string
+	Name            string
+	URL             string
+	TargetCalendar  string
+	ForceAllDayBusy bool // force imported all-day events Busy regardless of TRANSP
 }
 
 // fetcher is the feed-fetch capability a feedEntry depends on. The production
@@ -72,11 +73,12 @@ func NewRunner(api EventsAPI, feeds []FeedConfig, dryRun bool, now func() time.T
 			url:     f.URL,
 			fetcher: &feed.Fetcher{Now: now},
 			importer: &Importer{
-				API:    api,
-				Target: f.TargetCalendar,
-				FeedID: f.Name,
-				DryRun: dryRun,
-				Log:    log,
+				API:             api,
+				Target:          f.TargetCalendar,
+				FeedID:          f.Name,
+				DryRun:          dryRun,
+				ForceAllDayBusy: f.ForceAllDayBusy,
+				Log:             log,
 			},
 		})
 	}

@@ -45,6 +45,15 @@ type Feed struct {
 	URLEnv  string      `toml:"url_env"`
 	Target  CalendarRef `toml:"target"`
 	Enabled *bool       `toml:"enabled"`
+
+	// ForceAllDayBusy, when true, marks every imported all-day event Busy
+	// (opaque) regardless of the feed's own TRANSP. Absent == false == import
+	// the feed's transparency verbatim. Plain bool (not *bool): there is no
+	// [settings] default to fall back to, so absence maps exactly to false.
+	// Timed events are never affected; the discriminator is the item's all-day
+	// start. Typical use: a TripIt feed whose trip spans ship
+	// TRANSP:TRANSPARENT that you want to block your availability instead.
+	ForceAllDayBusy bool `toml:"force_all_day_busy"`
 }
 
 // IsEnabled returns whether the feed should be imported. Enabled defaults to

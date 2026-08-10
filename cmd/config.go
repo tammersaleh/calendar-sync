@@ -154,9 +154,10 @@ type configShowPayload struct {
 // URL is a bearer secret and the raw value must never reach stdout. Target is
 // the raw ref (non-canonicalize) or the canonical calendar ID (canonicalize).
 type feedPayload struct {
-	Name   string `json:"name"`
-	URL    string `json:"url"`
-	Target string `json:"target"`
+	Name            string `json:"name"`
+	URL             string `json:"url"`
+	Target          string `json:"target"`
+	ForceAllDayBusy bool   `json:"force_all_day_busy"`
 }
 
 // feedPayloadsFromCanonical renders resolved canonical feeds (already
@@ -169,9 +170,10 @@ func feedPayloadsFromCanonical(feeds []config.CanonicalFeed) []feedPayload {
 	out := make([]feedPayload, 0, len(feeds))
 	for _, f := range feeds {
 		out = append(out, feedPayload{
-			Name:   f.Name,
-			URL:    f.RedactedURL(),
-			Target: f.TargetCalendar,
+			Name:            f.Name,
+			URL:             f.RedactedURL(),
+			Target:          f.TargetCalendar,
+			ForceAllDayBusy: f.ForceAllDayBusy,
 		})
 	}
 	return out
@@ -192,9 +194,10 @@ func feedPayloadsFromConfig(feeds []config.Feed) []feedPayload {
 			raw = os.Getenv(f.URLEnv)
 		}
 		out = append(out, feedPayload{
-			Name:   f.Name,
-			URL:    config.CanonicalFeed{URL: raw}.RedactedURL(),
-			Target: feedTargetString(f.Target),
+			Name:            f.Name,
+			URL:             config.CanonicalFeed{URL: raw}.RedactedURL(),
+			Target:          feedTargetString(f.Target),
+			ForceAllDayBusy: f.ForceAllDayBusy,
 		})
 	}
 	return out

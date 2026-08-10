@@ -36,7 +36,7 @@ func (im *Importer) buildEvent(it ical.Item) *gws.Event {
 		Location:     it.Location,
 		Start:        toEventDateTime(it.Start),
 		End:          toEventDateTime(it.End),
-		Transparency: transparency(it.Transparency),
+		Transparency: im.transparencyFor(it),
 	}
 	checksum := mirror.Checksum(managedFields(ev))
 	ev.ExtendedProperties = &gws.ExtendedProperties{
@@ -88,6 +88,20 @@ func toEventDateTime(dt ical.DateTime) *gws.EventDateTime {
 		tz = "UTC"
 	}
 	return &gws.EventDateTime{DateTime: dt.Time.Format(time.RFC3339), TimeZone: tz}
+}
+
+// transparencyFor resolves an item's Calendar-API transparency, applying the
+// feed's force_all_day_busy override. When the flag is set AND the item is
+// all-day (all-day START - DTEND is exclusive and may be absent, so it is not
+// consulted), the event is forced opaque (Busy) regardless of its TRANSP.
+// Timed events always keep their own TRANSP. The forced value flows into
+// managedFields and thus the checksum, so flipping the flag repatches affected
+// all-day events on the next poll and then stays stable (no per-poll churn).
+func (im *Importer) transparencyFor(it ical.Item) string {
+	if im.ForceAllDayBusy && it.Start.AllDay {
+		return gws.TransparencyOpaque
+	}
+	return transparency(it.Transparency)
 }
 
 // transparency maps the ical (upper-cased) TRANSP value to the Calendar-API

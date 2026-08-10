@@ -354,9 +354,10 @@ source = "work@example.com"
 target = "personal@example.com"
 
 [[feeds]]
-name   = "trip"
-url    = "https://feeds.example.com/private/SUPER-SECRET-TOKEN/cal.ics"
-target = "travel@example.com"
+name               = "trip"
+url                = "https://feeds.example.com/private/SUPER-SECRET-TOKEN/cal.ics"
+target             = "travel@example.com"
+force_all_day_busy = true
 `
 
 // TestConfigShowCmd_EmitsFeedsRedacted pins that `config show` surfaces each
@@ -407,6 +408,9 @@ func TestConfigShowCmd_EmitsFeedsRedacted(t *testing.T) {
 			}
 			if f.Target != "travel@example.com" {
 				t.Errorf("feed target = %q, want travel@example.com", f.Target)
+			}
+			if !f.ForceAllDayBusy {
+				t.Errorf("feed force_all_day_busy = false, want true (%s path)", name)
 			}
 		})
 	}

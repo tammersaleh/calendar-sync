@@ -17,9 +17,10 @@ func feedConfigs(feeds []config.CanonicalFeed) []feedimport.FeedConfig {
 	out := make([]feedimport.FeedConfig, 0, len(feeds))
 	for _, f := range feeds {
 		out = append(out, feedimport.FeedConfig{
-			Name:           f.Name,
-			URL:            f.URL,
-			TargetCalendar: f.TargetCalendar,
+			Name:            f.Name,
+			URL:             f.URL,
+			TargetCalendar:  f.TargetCalendar,
+			ForceAllDayBusy: f.ForceAllDayBusy,
 		})
 	}
 	return out

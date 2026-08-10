@@ -202,6 +202,24 @@ func TestCanonicalize_FeedWritableStringTarget(t *testing.T) {
 	}
 }
 
+func TestCanonicalize_FeedForceAllDayBusyPropagates(t *testing.T) {
+	for _, want := range []bool{true, false} {
+		c := feedConfig(func(f *config.Feed) { f.ForceAllDayBusy = want })
+		lister := &stubLister{
+			responses: map[string]*gws.CalendarListEntry{
+				"personal@example.com": {ID: "personal@example.com", AccessRole: "owner"},
+			},
+		}
+		can, err := c.Canonicalize(context.Background(), lister)
+		if err != nil {
+			t.Fatalf("Canonicalize: %v", err)
+		}
+		if got := can.Feeds[0].ForceAllDayBusy; got != want {
+			t.Errorf("ForceAllDayBusy = %v, want %v", got, want)
+		}
+	}
+}
+
 func TestCanonicalize_FeedURLEnvResolves(t *testing.T) {
 	const varName = "CALENDAR_SYNC_TEST_FEED_URL"
 	t.Setenv(varName, feedURL())
@@ -350,7 +368,7 @@ func TestRedactedURL(t *testing.T) {
 // CanonicalFeed (however it's reached - a future config-show wiring, an
 // embedding struct, a log line) must emit the redacted URL, never the secret.
 func TestCanonicalFeed_MarshalJSONRedacts(t *testing.T) {
-	cf := config.CanonicalFeed{Name: "tripit", URL: feedURL(), TargetCalendar: "cal@x"}
+	cf := config.CanonicalFeed{Name: "tripit", URL: feedURL(), TargetCalendar: "cal@x", ForceAllDayBusy: true}
 
 	b, err := json.Marshal(cf)
 	if err != nil {
@@ -359,6 +377,9 @@ func TestCanonicalFeed_MarshalJSONRedacts(t *testing.T) {
 	out := string(b)
 	if strings.Contains(out, feedSecret) {
 		t.Fatalf("MarshalJSON leaked the secret: %s", out)
+	}
+	if !strings.Contains(out, `"force_all_day_busy":true`) {
+		t.Errorf("MarshalJSON should emit force_all_day_busy, got: %s", out)
 	}
 	// The redacted host is present and the token path is gone. (encoding/json
 	// HTML-escapes the "<redacted>" marker to <redacted>, so match on

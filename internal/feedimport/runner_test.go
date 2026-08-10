@@ -234,7 +234,7 @@ func TestRunner_NewRunner_WiresEntries(t *testing.T) {
 	now := func() time.Time { return time.Unix(0, 0) }
 	log := &recordingLogger{}
 	feeds := []FeedConfig{
-		{Name: "trip", URL: secretURL, TargetCalendar: "tgt@example.com"},
+		{Name: "trip", URL: secretURL, TargetCalendar: "tgt@example.com", ForceAllDayBusy: true},
 	}
 	r := NewRunner(api, feeds, true, now, log)
 
@@ -250,6 +250,9 @@ func TestRunner_NewRunner_WiresEntries(t *testing.T) {
 	}
 	if !e.importer.DryRun {
 		t.Errorf("importer DryRun = false, want true (dryRun propagated)")
+	}
+	if !e.importer.ForceAllDayBusy {
+		t.Errorf("importer ForceAllDayBusy = false, want true (flag propagated)")
 	}
 	if e.importer.API != EventsAPI(api) {
 		t.Errorf("importer API not the shared api")

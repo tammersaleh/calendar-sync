@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.7.0](https://github.com/tammersaleh/calendar-sync/compare/v2.6.3...v2.7.0) (2026-08-10)
+
+
+### Features
+
+* add per-feed force_all_day_busy to mark imported all-day events Busy ([b891a07](https://github.com/tammersaleh/calendar-sync/commit/b891a07966d31c2a1939938e9654b1c3f786b0f6))
+
 ## [2.6.3](https://github.com/tammersaleh/calendar-sync/compare/v2.6.2...v2.6.3) (2026-07-27)
 
 

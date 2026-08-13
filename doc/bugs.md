@@ -4,6 +4,38 @@ Running list of bugs surfaced during the v1.0.0 install + test session. Add a ne
 
 ## Open
 
+### B38 - a single recurring-instance edit moved the entire source series anchor and cancelled the edited occurrence (CRITICAL)
+
+Surfaced from a live user report: the user edited one occurrence of the "Breakfast and drive Mads to school" series on the CoreWeave mirror ("this morning's event"). The occurrence vanished from both calendars and the whole weekly series shifted 15 minutes. This is the B16 failure class - an instance-level interaction rewriting the source recurring parent - but B16's fix does NOT cover it, because the mirror instance here is managed form, not inherited form.
+
+Evidence (2026-08-13, all writes at the 07:22 tick; source `me@tammersaleh.com` [personal], mirror `tsaleh@coreweave.com` [work], pair `personal-to-work`):
+
+- Source parent `ij3p7feqdeku8i1nncht48hf3k`: `RRULE:FREQ=WEEKLY;WKST=MO;UNTIL=20261221T075959Z;BYDAY=MO,TU,WE`, start moved 07:25 -> 07:40, sequence 4, updated `2026-08-13T14:22:10.346Z`.
+- Mirror parent `cs22oh9u867c0j1bi1sa7ddleoralr5gjsnpdiuj38nfm0tamvqdq`: same RRULE, start 07:40, sequence 1, updated `2026-08-13T14:22:12.881Z`.
+- Source Thursday exception `ij3p7…_20260812T142500Z` (occurrence key on the old 07:25 grid, moved to Thu 2026-08-13 07:25): cancelled, sequence 5, updated `14:22:10.346Z`.
+- Mirror Thursday exception `cs22oh9…_20260812T142500Z`: managed form - `calendar-sync:source = me@tammersaleh.com:ij3p7feqdeku8i1nncht48hf3k_20260812T142500Z` (note the trailing `_<UTC>` suffix); cancelled, sequence 2, updated `14:21:59.440Z`.
+
+Action log (`calendar-sync.out.log`, in order): `propagate personal-to-work ij3p7→cs22oh9 target_edited fields:[start]`, then `skip …_142500Z target_cancelled`, then `delete …_142500Z source_cancelled`. `calendar-sync.err.log` at `14:22:12` WARN `sync.targetDelta: target-side deletion is not propagated to source` for `cs22oh9…_142500Z` <- `ij3p7…_142500Z`. An earlier round the same morning propagated `fields:[end,start]` on BOTH the parent and the instance, so there were at least two edit/reconcile rounds.
+
+Confirmed:
+
+- Neither parent was user-edited. Both parents carry the daemon's tick time and low sequence numbers; an "All events" / "this and following" scope edit would stamp the user's time and bump the parent sequence. The only user action was to a single occurrence.
+- The daemon nevertheless propagated a bare-parent `start` change to the source parent (`target_edited fields:[start]`), shifting all of MO/TU/WE from 07:25 to 07:40. The moved Thursday exception then fell off the new grid and was cancelled on both sides. Net user-visible effect: the edited occurrence disappeared and the series moved.
+
+Why B16's fix does not catch it: B16's two-pass `BuildInventory` filter (`internal/sync/inventory.go:160-217`) skips only INHERITED-form instances - those whose `calendar-sync:source` equals the parent's tuple. This instance is MANAGED form (source tuple `ij3p7…_20260812T142500Z`, with the suffix), so it is indexed under its own per-instance key and never shadows the parent. B16's guard is never engaged.
+
+Open question for the fix session - the exact path that produced the bare-parent `start` propagate is not yet pinned. Inventory shadowing is ruled out (managed key differs from the parent key). Candidates to investigate:
+
+- Target-delta processing the mirror PARENT `cs22oh9` as an edited event (`internal/sync/target_delta.go:275` `processTargetDeltaEvent`, non-instance branch -> fetch bare source parent -> `Classify` -> drift on `start` -> propagate). This requires the mirror parent to have appeared in the target delta with a changed start, which contradicts its sequence-1/daemon-only update. Reconcile that contradiction first - it is the crux.
+- Drift cross-talk from duplicate series (below).
+- The source-classify path computing a spurious `start` drift on the source parent.
+
+Duplicate-series context (likely contributing, own cleanup needed): "Breakfast and drive Mads to school" exists as ~4-5 overlapping recurring masters across both calendars - personal `ij3p7`, `6fh25ms4tqrl8ju7t1i4gmmrrl`, `raea2qb0fqjlv86had0jjhrn04`, `u1e7g45jkh0770gt55gqiahudi`; work-native `e9im6r31…` splits - all named identically, all MO,TU,WE, several propagated/deleted in the same 07:22 tick. This tangle can make one series' mirror reconcile against another's and manufacture drift. Determine whether the duplication is a precondition for the bug or independent of it.
+
+Repro to run first (throwaway calendars, `propagate_target_edits = true`, writable source): create a weekly recurring event on the source, let it mirror, move a single occurrence on the mirror to a new time with "This event only", wait one tick. Correct outcome: the source gets a per-instance override, parent untouched. Bug repro: the source PARENT start moves and the exception is cancelled. Capture the out.log action lines and the pre/post `sequence` + `updated` on both parents.
+
+Recovery for the live event would be a direct `events.patch` restoring the source parent's original 07:25 start (as in B16's manual recovery) then un-cancelling the exception; the user does not need this occurrence restored, so it is left as-is.
+
 ### B31 - no FullSync recovery for inherited target exceptions
 
 `BuildInventory` drops recurring mirror instances whose `calendar-sync:source` is the inherited (parent) form, so a target-side override that the target-delta stream never delivered has no second chance. There is no automatic repair for: edits made while the daemon was stopped, edits predating process startup, anything queued when a target token 410s, occurrences quarantined by B32, or occurrences that only enter the horizon later.

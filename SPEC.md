@@ -196,6 +196,12 @@ This is a deliberate trade-off: trying to repair a partial trailer risks corrupt
 
 `propagate` only writes the fields that actually drifted, not the whole payload. The `events.patch` request to the source carries just those fields. This keeps fields the source has that calendar-sync doesn't manage (attendees, location, conferenceData) untouched.
 
+#### Recurring-parent anchor exception
+
+There is one exception to field-level propagate: when the reconciled event is a recurring PARENT (either the source or the mirror still carries a `RRULE`), the timing anchor fields `start`, `end`, and `recurrence` are NEVER propagated back to the source, regardless of `source_writable`. An `events.patch` of `start`/`end` on a recurring parent's endpoint moves the whole DTSTART grid (every occurrence shifts); a `recurrence` patch rewrites or recreates the series. A single false-positive mirror-parent drift there destroys the series irrecoverably (B38), so the source stays authoritative for a recurring parent's structure and timing. Only the safe allowlist `{summary, description, location, transparency, visibility}` propagates; any other field (including managed fields added later) fails closed.
+
+When drift is confined to the refused fields, the mirror parent is instead reverted to the source's values (action `revert`, reason `target_edited`, with any conflict label preserved) and no source write happens. When both safe and refused fields drifted, the safe fields propagate and the follow-up mirror rewrite from the post-patch source resets the refused anchor. To move or restructure an entire recurring series, edit the source; the mirror side cannot author a series anchor. This does NOT constrain per-occurrence overrides: dragging a single instance on the mirror still materializes a source exception via the recurring-instance path, which patches the occurrence's own ID and never carries recurrence.
+
 #### Schema version migration
 
 The current schema version is `3`. A mirror whose stored `calendar-sync:version` differs from the current value is a legacy mirror; calendar-sync supports migrating any prior version (v1, v2) to the current schema in a single write on first encounter.

@@ -4,37 +4,13 @@ Running list of bugs surfaced during the v1.0.0 install + test session. Add a ne
 
 ## Open
 
-### B38 - a single recurring-instance edit moved the entire source series anchor and cancelled the edited occurrence (CRITICAL)
+### B39 - recurring-instance reverse propagate is not structurally barred from sending `recurrence`
 
-Surfaced from a live user report: the user edited one occurrence of the "Breakfast and drive Mads to school" series on the CoreWeave mirror ("this morning's event"). The occurrence vanished from both calendars and the whole weekly series shifted 15 minutes. This is the B16 failure class - an instance-level interaction rewriting the source recurring parent - but B16's fix does NOT cover it, because the mirror instance here is managed form, not inherited form.
+Follow-up surfaced by Codex during the B38 review. The ordinary recurring-instance propagate path (`internal/recurring/handler.go` `applyDriftMatrix` ActionPropagate case) computes `fields := mirror.DriftedFieldNames(mirrorInstance, desired)` and hands the whole set to `mirror.BuildPropagatePatchBody`, which WILL emit `recurrence` if it is in the set. The desired instance payload sets `Recurrence=nil` (`BuildInstancePayload`), so if a mirror instance ever carried a non-empty RRULE, `recurrence` would enter the drift set and be patched onto the source-instance ID. Per SPEC's B16 rule, a per-instance patch containing recurrence can be reinterpreted by Google as a PARENT update - the exact series-destruction class B16/B38 guard against.
 
-Evidence (2026-08-13, all writes at the 07:22 tick; source `me@tammersaleh.com` [personal], mirror `tsaleh@coreweave.com` [work], pair `personal-to-work`):
+Not currently reachable: neither the daemon nor Google puts an RRULE on an instance, so `mirrorInstance.Recurrence` is always empty and `recurrence` never drifts. This is empirical, not enforced. B38 closed the parent path structurally; the instance path is still only empirically safe.
 
-- Source parent `ij3p7feqdeku8i1nncht48hf3k`: `RRULE:FREQ=WEEKLY;WKST=MO;UNTIL=20261221T075959Z;BYDAY=MO,TU,WE`, start moved 07:25 -> 07:40, sequence 4, updated `2026-08-13T14:22:10.346Z`.
-- Mirror parent `cs22oh9u867c0j1bi1sa7ddleoralr5gjsnpdiuj38nfm0tamvqdq`: same RRULE, start 07:40, sequence 1, updated `2026-08-13T14:22:12.881Z`.
-- Source Thursday exception `ij3p7…_20260812T142500Z` (occurrence key on the old 07:25 grid, moved to Thu 2026-08-13 07:25): cancelled, sequence 5, updated `14:22:10.346Z`.
-- Mirror Thursday exception `cs22oh9…_20260812T142500Z`: managed form - `calendar-sync:source = me@tammersaleh.com:ij3p7feqdeku8i1nncht48hf3k_20260812T142500Z` (note the trailing `_<UTC>` suffix); cancelled, sequence 2, updated `14:21:59.440Z`.
-
-Action log (`calendar-sync.out.log`, in order): `propagate personal-to-work ij3p7→cs22oh9 target_edited fields:[start]`, then `skip …_142500Z target_cancelled`, then `delete …_142500Z source_cancelled`. `calendar-sync.err.log` at `14:22:12` WARN `sync.targetDelta: target-side deletion is not propagated to source` for `cs22oh9…_142500Z` <- `ij3p7…_142500Z`. An earlier round the same morning propagated `fields:[end,start]` on BOTH the parent and the instance, so there were at least two edit/reconcile rounds.
-
-Confirmed:
-
-- Neither parent was user-edited. Both parents carry the daemon's tick time and low sequence numbers; an "All events" / "this and following" scope edit would stamp the user's time and bump the parent sequence. The only user action was to a single occurrence.
-- The daemon nevertheless propagated a bare-parent `start` change to the source parent (`target_edited fields:[start]`), shifting all of MO/TU/WE from 07:25 to 07:40. The moved Thursday exception then fell off the new grid and was cancelled on both sides. Net user-visible effect: the edited occurrence disappeared and the series moved.
-
-Why B16's fix does not catch it: B16's two-pass `BuildInventory` filter (`internal/sync/inventory.go:160-217`) skips only INHERITED-form instances - those whose `calendar-sync:source` equals the parent's tuple. This instance is MANAGED form (source tuple `ij3p7…_20260812T142500Z`, with the suffix), so it is indexed under its own per-instance key and never shadows the parent. B16's guard is never engaged.
-
-Open question for the fix session - the exact path that produced the bare-parent `start` propagate is not yet pinned. Inventory shadowing is ruled out (managed key differs from the parent key). Candidates to investigate:
-
-- Target-delta processing the mirror PARENT `cs22oh9` as an edited event (`internal/sync/target_delta.go:275` `processTargetDeltaEvent`, non-instance branch -> fetch bare source parent -> `Classify` -> drift on `start` -> propagate). This requires the mirror parent to have appeared in the target delta with a changed start, which contradicts its sequence-1/daemon-only update. Reconcile that contradiction first - it is the crux.
-- Drift cross-talk from duplicate series (below).
-- The source-classify path computing a spurious `start` drift on the source parent.
-
-Duplicate-series context (likely contributing, own cleanup needed): "Breakfast and drive Mads to school" exists as ~4-5 overlapping recurring masters across both calendars - personal `ij3p7`, `6fh25ms4tqrl8ju7t1i4gmmrrl`, `raea2qb0fqjlv86had0jjhrn04`, `u1e7g45jkh0770gt55gqiahudi`; work-native `e9im6r31…` splits - all named identically, all MO,TU,WE, several propagated/deleted in the same 07:22 tick. This tangle can make one series' mirror reconcile against another's and manufacture drift. Determine whether the duplication is a precondition for the bug or independent of it.
-
-Repro to run first (throwaway calendars, `propagate_target_edits = true`, writable source): create a weekly recurring event on the source, let it mirror, move a single occurrence on the mirror to a new time with "This event only", wait one tick. Correct outcome: the source gets a per-instance override, parent untouched. Bug repro: the source PARENT start moves and the exception is cancelled. Capture the out.log action lines and the pre/post `sequence` + `updated` on both parents.
-
-Recovery for the live event would be a direct `events.patch` restoring the source parent's original 07:25 start (as in B16's manual recovery) then un-cancelling the exception; the user does not need this occurrence restored, so it is left as-is.
+Fix: strip `recurrence` from the field set before `BuildPropagatePatchBody` in the instance propagate path (route through a recurrence-omitting builder, matching `BuildSourceOverridePatchBody`), and re-check the empty-fields branch so a recurrence-only drift degrades to a mirror-side repair rather than an empty `{}` source patch. Separately, verify against the real API whether `BuildPatchPayload`'s explicit `recurrence: []` clear on target-side instance rewrites (`handler.go` :672,:689,:711,:731,:748,:762,:814,:840) is benign - production two-way sync has run with it and shows no series damage, so it is believed harmless, but it is unverified. Deferred out of B38 to keep that fix focused and because changing a verified-working live write path without real-calendar verification is against the B37 lesson.
 
 ### B31 - no FullSync recovery for inherited target exceptions
 
@@ -125,6 +101,24 @@ Rare: needs a `Changed` feed import AND a 410 in the same tick, plus Google's fu
 Fix options: (a) if `runFeeds` reported a `Changed` import this tick, defer any fast-track FullSync by one `poll_interval` so the write settles before the full list (needs `runFeeds` to report changed, and `runTick` to tell the scheduler); (b) hold/skip the syncToken reset in FullSync for any source written to within the last few seconds (touches the token-advancement path). (a) is smaller and localizes the change to the daemon. Needs a test driving feed-changed-tick + NeedsFullResync and asserting the fast-track doesn't strand the event.
 
 ## Fixed
+
+### B38 - a mirror-parent drift reverse-propagated and moved the entire source series (CRITICAL)
+
+Surfaced from a live user report: the user interacted with one occurrence of the "Breakfast and drive Mads to school" weekly series on the CoreWeave mirror. The occurrence vanished from both calendars and the whole series shifted 15 minutes (07:25 -> 07:40). This is the B16 failure class - an instance-level interaction ending in a rewritten source recurring parent - but B16's inventory filter does NOT cover it: that filter skips only INHERITED-form instances (whose `calendar-sync:source` equals the parent's tuple), and the mirror instance here was MANAGED form (per-instance `_<UTC>` suffix), so it never shadowed the parent.
+
+Evidence (2026-08-13, source `me@tammersaleh.com`, mirror `tsaleh@coreweave.com`, pair `personal-to-work`, `propagate_target_edits=true`): the daemon's action log recorded `propagate personal-to-work ij3p7→cs22oh9 target_edited fields:[start]` on the bare recurring PARENT, moving the source parent `ij3p7…`'s start from 07:25 to 07:40, sequence 4. The Thursday exception then fell off the new grid and was cancelled on both sides. Neither parent was user-edited (both carried daemon-tick timestamps and low sequence numbers); the only user action was to a single occurrence.
+
+Destructive mechanism (pinned and reproduced): a source recurring PARENT (Recurrence set, empty RecurringEventID) is classified through `internal/sync/reconcile.go` `reconcileNormal` - the same path as any non-recurring event. When the drift matrix returned `MirrorDrifted && !SourceChanged` (mirror looks edited, source unchanged) it called `doPropagate` (`internal/sync/drift.go`), which sent the drifted fields to the SOURCE via `events.patch` using `mirror.BuildPropagatePatchBody`. For a recurring parent, an `events.patch` of `start`/`end` on the parent endpoint moves the DTSTART grid and shifts every occurrence; a `recurrence` patch rewrites the rule. `doPropagate` is the single source-side write in the sync layer, and it is reached identically from FullSync, the tick source-delta, AND the target-delta phase (`processTargetDeltaEvent` routes a mirror-parent edit through the same `Classify`), so any spurious mirror-parent drift could trigger it.
+
+The exact cause of the spurious parent drift was not statically pinnable (it is entangled with a duplicate-series mess: ~4-5 identically-named overlapping recurring masters across both calendars, several reconciled in the same tick). So the fix is STRUCTURAL and holds regardless of trigger, mirroring B16's approach (`BuildSourceOverridePatchBody` never emits recurrence, making an instance-patch-as-parent-update structurally impossible).
+
+Fix (`doPropagate`): when either side is a recurring parent (`len(source.Recurrence) > 0 || len(mirrorEvent.Recurrence) > 0`), keep only an explicit safe allowlist `{summary, description, location, transparency, visibility}`; everything else - anchors `{start, end, recurrence}` plus any future managed field - fails closed. Refused fields are NEVER sent to the source, so it stays authoritative for series timing regardless of `source_writable`. Safe fields still propagate; the follow-up mirror-rewrite-from-post-patch-source resets the refused anchor. When nothing safe remains, the path delegates to `doRevert` (forcing `outcome.Action=revert`), which rewrites the mirror parent from source with no source write and preserves the conflict label/timestamps. The either-side condition also blocks the source-cleared-but-mirror-still-recurring transition from re-propagating a stale RRULE and resurrecting the series.
+
+The asymmetry justifies refusal: a false-positive drift on a parent destroys the whole series irrecoverably, versus the rare convenience of dragging an entire series from the mirror side (still doable by editing the source).
+
+The recurring-INSTANCE path is NOT modified. Its source-instance patch targets the occurrence's materialized ID, and recurrence is empirically never in an instance's drifted set (neither the daemon nor Google writes an RRULE on an instance) - but that is not structurally enforced, so the belt-and-suspenders hardening is tracked as B39.
+
+Test pins in `internal/sync/drift_test.go`: `TestDoPropagate_RecurringParent_DoesNotMoveSourceAnchor` (anchor-only -> revert, no source patch, exact fields), `_PropagatesSafeFieldsButNotAnchor` (mixed: summary propagates, start stripped from source body), `_RecurrenceClearRefused`, `_SourceClearedMirrorStillRecurring`, `_AnchorOnlyConflictPreservesMetadata` (conflict_target_won + timestamps survive), `_AllDayAnchorRefused`. Reviewed by the feature-dev code-reviewer (clean) and by Codex, whose findings on the discriminator, conflict-metadata preservation, fail-closed allowlist, and B39 are folded in.
 
 ### B28 - gws truncated every long list at 10 pages; two-way sync was dead in production (CRITICAL)
 

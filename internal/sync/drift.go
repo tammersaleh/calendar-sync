@@ -29,6 +29,45 @@ func (c *Classifier) doPropagate(
 	outcome mirror.Outcome,
 ) error {
 	fields := mirror.DriftedFieldNames(mirrorEvent, desired)
+
+	// B38: a recurring PARENT (reached here via the non-recurring/parent path
+	// in reconcileNormal, so RecurringEventID is always "") must NEVER have
+	// its anchor fields (start / end / recurrence) reverse-propagated. An
+	// events.patch of start/end on the parent endpoint moves the DTSTART grid,
+	// shifting every occurrence; a recurrence patch rewrites (or recreates) the
+	// series. A single false-positive mirror-parent drift there destroys the
+	// series irrecoverably - the live damage recorded in doc/bugs.md B38. The
+	// asymmetry against the rare convenience of dragging/creating a whole
+	// series from the mirror side makes refusal the safe default, so the
+	// source stays authoritative for series timing regardless of
+	// source_writable. Only the explicit safe allowlist propagates; every
+	// other field (anchors AND any future managed field) fails closed.
+	//
+	// The guard fires when EITHER side is recurring, not just the source.
+	// If the source cleared its RRULE while the mirror still carries the old
+	// one, source.Recurrence is empty but mirrorEvent.Recurrence is not, and
+	// the un-guarded path would re-propagate the stale RRULE and resurrect the
+	// series on the source (Codex-flagged transition).
+	if len(source.Recurrence) > 0 || len(mirrorEvent.Recurrence) > 0 {
+		refused, propagatable := splitParentSafeFields(fields)
+		if len(refused) > 0 {
+			c.warn("sync.doPropagate: refusing to move recurring series anchor from mirror-side edit",
+				"source_event", source.ID,
+				"refused_fields", refused,
+				"propagated_fields", propagatable,
+			)
+			fields = propagatable
+			if len(fields) == 0 {
+				// Nothing safe to send to source: revert the mirror parent to
+				// source (mirror-only patch, no source write) so the series is
+				// protected and the drift resolves. Delegate to doRevert so the
+				// conflict label and timestamps from the four-way matrix survive.
+				outcome.Action = mirror.ActionRevert
+				return c.doRevert(ctx, source, mirrorEvent, desired, outcome)
+			}
+		}
+	}
+
 	if len(fields) == 0 {
 		// MirrorDrifted=true (stored checksum disagreed) but the live
 		// managed fields actually match desired-from-source. The only
@@ -117,10 +156,40 @@ func (c *Classifier) degradePropagateToStaleBookkeeping(
 	return nil
 }
 
+// recurringParentSafeFields is the allowlist of managed fields that MAY be
+// reverse-propagated from a mirror to a recurring PARENT's events.patch
+// endpoint. Everything not listed - the timing anchors start/end/recurrence,
+// plus any managed field added in the future - is refused (fails closed),
+// because a mistaken write of an unmodeled field to a parent could carry the
+// same series-wide blast radius as an anchor move (B38).
+var recurringParentSafeFields = map[string]bool{
+	"summary":      true,
+	"description":  true,
+	"location":     true,
+	"transparency": true,
+	"visibility":   true,
+}
+
+// splitParentSafeFields partitions drifted field names into those refused for
+// a recurring parent (not on the allowlist) and those safe to propagate.
+func splitParentSafeFields(fields []string) (refused, propagatable []string) {
+	for _, f := range fields {
+		if recurringParentSafeFields[f] {
+			propagatable = append(propagatable, f)
+		} else {
+			refused = append(refused, f)
+		}
+	}
+	return refused, propagatable
+}
+
 // doRevert handles `!source_changed && mirror_drifted && !source_writable`
-// (and the mirror-newer-and-source-readonly conflict cell). The mirror's
-// drifted fields are overwritten with the desired payload; no source-side
-// write since the source is read-only.
+// (and the mirror-newer-and-source-readonly conflict cell). It is also the
+// B38 anchor-only path: doPropagate delegates here (with outcome.Action forced
+// to revert) when a recurring parent's only drift is in refused timing fields,
+// so the mirror is rewritten from source and the series is never touched. The
+// mirror's drifted fields are overwritten with the desired payload; no
+// source-side write since the source is read-only (or, for B38, protected).
 //
 // Inventory entry replaced with the post-checksum mirror resource.
 func (c *Classifier) doRevert(

@@ -107,6 +107,13 @@ func (c *Classifier) debug(msg string, args ...any) {
 	}
 }
 
+// warn is a nil-safe wrapper around c.Log.Warn.
+func (c *Classifier) warn(msg string, args ...any) {
+	if c.Log != nil {
+		c.Log.Warn(msg, args...)
+	}
+}
+
 // Classify runs SPEC.md "Classification logic" 8-step switch for one
 // source event. May call c.Output zero or more times (most actions
 // produce one outcome). Mutates c.Inventory in place after every write.

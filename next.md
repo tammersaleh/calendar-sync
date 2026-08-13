@@ -4,24 +4,28 @@ Handoff for the next session. Read this first, then `SPEC.md`, then `CLAUDE.md`.
 
 ## Where the project stands
 
-### In flight: B38 recurring-parent anchor guard (fix)
+### Shipped and verified: B38 recurring-parent anchor guard (v2.7.1)
 
-Branch `fix/b38-recurring-parent-anchor`. A source recurring PARENT reaching
-`reconcileNormal` -> `doPropagate` could reverse-`events.patch` its `start`/
-`end`/`recurrence` to the source parent, moving the whole series (live user
-damage: a weekly series jumped 15 min off a single-occurrence interaction).
-Fix refuses anchor `{start,end,recurrence}` reverse-propagation for a
-recurring parent (source authoritative for series timing); safe fields still
-propagate; anchor-only drift reverts the mirror to source. `doPropagate` is
-the sole source-write chokepoint (FullSync, tick source-delta, target-delta
-all funnel through it); instance path untouched. Tests green, `mise run
-lint` clean, feature-dev code review clean. See the CLAUDE.md architecture
-note and `doc/bugs.md` B38. Remaining: (Codex second-opinion was engaged but
-the codex MCP hung/timed out twice this session), merge to main, push,
-wait for release (2.7.1), install `brew upgrade --cask calendar-sync` +
-`launchctl kickstart -k gui/$(id -u)/org.calendar-sync.agent`, verify.
+A source recurring PARENT reaching `reconcileNormal` -> `doPropagate` could
+reverse-`events.patch` its `start`/`end`/`recurrence` to the source parent,
+moving the whole series (live user damage: a weekly series jumped 15 min off
+a single-occurrence interaction). Fix refuses anchor `{start,end,recurrence}`
+reverse-propagation whenever either side is recurring (source authoritative
+for series timing, fail-closed allowlist); safe fields still propagate;
+anchor-only drift delegates to `doRevert` preserving conflict metadata.
+`doPropagate` is the sole source-write chokepoint (FullSync, tick
+source-delta, target-delta all funnel through it); instance path untouched
+(latent instance-recurrence concern tracked as B39). Reviewed by the
+feature-dev code-reviewer (two passes, clean) and Codex; both findings folded
+in. See the CLAUDE.md architecture note, `doc/bugs.md` B38/B39, and the SPEC
+"Recurring-parent anchor exception" section.
 
-### Shipped and verified in production
+Released as v2.7.1, installed via `~/packages/go calendar-sync`, daemon
+restarted with `launchctl kickstart`. Verified: `calendar-sync version` ->
+2.7.1, and the post-restart FullSync logged `sync.BuildInventory complete`
+(me@ 457 mirrors, tsaleh@coreweave 234) - healthy.
+
+### Previously shipped and verified in production
 
 v2.6.2 (B28/B29/B30) and v2.6.3 (B37) are released, installed, and running.
 Daemon on v2.6.3. Nothing outstanding to push.

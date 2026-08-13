@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.7.1](https://github.com/tammersaleh/calendar-sync/compare/v2.7.0...v2.7.1) (2026-08-13)
+
+
+### Bug Fixes
+
+* never reverse-propagate a recurring parent's series anchor (B38) ([5999157](https://github.com/tammersaleh/calendar-sync/commit/5999157a1750a7091959de9358d1288500dc45ba))
+
 ## [2.7.0](https://github.com/tammersaleh/calendar-sync/compare/v2.6.3...v2.7.0) (2026-08-10)
 
 

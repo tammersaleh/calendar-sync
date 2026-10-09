@@ -53,6 +53,6 @@ Rationale for the orphan walk rather than per-tick: the walk runs on FullSync on
 - [x] Tests (red) for inventory + orphan
 - [x] Implement
 - [x] `mise run check`
-- [ ] code-reviewer pass, fix, second pass (first pass done: vacuous fractional-seconds case, missing log coverage, same-ID guard - all fixed; Codex: hierarchy demotion - fixed)
-- [ ] SPEC/bugs/CLAUDE/next docs
-- [ ] Commit `fix:`, push, wait for release, install, restart daemon, verify logs
+- [x] code-reviewer pass, fix, second pass (first pass: vacuous fractional-seconds case, missing log coverage, same-ID guard - all fixed; Codex: hierarchy demotion - fixed)
+- [x] SPEC/bugs/CLAUDE/next docs
+- [x] Commit `fix:` (00dc301), released as v2.7.2, installed, daemon restarted, FullSync healthy with `duplicate_tuples:0`

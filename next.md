@@ -4,6 +4,30 @@ Handoff for the next session. Read this first, then `SPEC.md`, then `CLAUDE.md`.
 
 ## Where the project stands
 
+### Shipped and verified: B40 duplicate-mirror collision handling (v2.7.2)
+
+Two live mirror parents on CoreWeave carried the same `calendar-sync:source`
+(Google cloned the 🧘/🏃 mirror server-side, extended properties included).
+`BuildInventory` last-writer-won on list order and the loser became an
+invisible zombie, so rescheduling an occurrence moved one copy and not the
+other. Fix: `Inventory.index` resolves same-tuple collisions (newest
+`Updated`, then deterministic ID, then lexical ID), parents before instances
+with instances under losing parents demoted, losers recorded and warned once
+per tuple, and `OrphanWalker.deleteDuplicates` removes them as step 0 of the
+FullSync walk (reason `duplicate_mirror`). Reviewed by the feature-dev
+code-reviewer (two passes) and Codex (two passes); Codex's hierarchy finding
+(parent and instance collisions picking winners from opposite series) is
+folded in. See `doc/bugs.md` B40, `doc/plans/B40-duplicate-mirrors.md`, the
+CLAUDE.md note, and SPEC "Mirror inventory rebuild" / full re-sync step 5.
+
+Released as v2.7.2, cask upgraded, daemon kickstarted. Post-restart
+FullSync logged `sync.BuildInventory complete` with `duplicate_tuples:0`
+(me@ 724 mirrors, tsaleh@coreweave 307). The live duplicate had already
+been deleted by hand before the fix, so the production run exercised the
+no-collision path only; the deletion path is pinned by tests, not yet
+observed live.
+
+
 ### Shipped and verified: B38 recurring-parent anchor guard (v2.7.1)
 
 A source recurring PARENT reaching `reconcileNormal` -> `doPropagate` could

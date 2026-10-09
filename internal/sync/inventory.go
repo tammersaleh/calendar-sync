@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
+	"time"
 
 	"github.com/tammersaleh/calendar-sync/internal/gws"
 	"github.com/tammersaleh/calendar-sync/internal/mirror"
@@ -29,6 +31,12 @@ type API interface {
 type Inventory struct {
 	target string
 	items  map[mirror.SourceTuple]*gws.Event
+
+	// duplicates holds live mirrors that lost a same-tuple collision in
+	// BuildInventory (B40). They are redundant copies of items[tuple]; the
+	// orphan walk deletes them. Keyed by tuple so each pdir's walker can
+	// claim only the losers for its own source calendar.
+	duplicates map[mirror.SourceTuple][]*gws.Event
 }
 
 // NewInventory returns an empty Inventory keyed for the given target
@@ -37,8 +45,9 @@ type Inventory struct {
 // faking out the events.list call.
 func NewInventory(target string) *Inventory {
 	return &Inventory{
-		target: target,
-		items:  make(map[mirror.SourceTuple]*gws.Event),
+		target:     target,
+		items:      make(map[mirror.SourceTuple]*gws.Event),
+		duplicates: make(map[mirror.SourceTuple][]*gws.Event),
 	}
 }
 
@@ -68,6 +77,116 @@ func (i *Inventory) Set(s mirror.SourceTuple, e *gws.Event) {
 // successful events.delete on the target side.
 func (i *Inventory) Delete(s mirror.SourceTuple) {
 	delete(i.items, s)
+}
+
+// addDuplicate records a losing copy for tuple.
+func (i *Inventory) addDuplicate(s mirror.SourceTuple, e *gws.Event) {
+	i.duplicates[s] = append(i.duplicates[s], e)
+}
+
+// dropDuplicate forgets the loser with mirrorID under tuple, removing the
+// tuple key once no losers remain. It never touches items[tuple] - that is
+// the winner, which Delete owns. It rewrites the slice in place, so callers
+// iterating duplicates[tuple] must copy it first.
+func (i *Inventory) dropDuplicate(s mirror.SourceTuple, mirrorID string) {
+	kept := i.duplicates[s][:0]
+	for _, e := range i.duplicates[s] {
+		if e.ID != mirrorID {
+			kept = append(kept, e)
+		}
+	}
+	if len(kept) == 0 {
+		delete(i.duplicates, s)
+		return
+	}
+	i.duplicates[s] = kept
+}
+
+// loserIDs returns the Google event IDs of every recorded duplicate.
+func (i *Inventory) loserIDs() map[string]bool {
+	out := make(map[string]bool)
+	for _, losers := range i.duplicates {
+		for _, l := range losers {
+			out[l.ID] = true
+		}
+	}
+	return out
+}
+
+// index places e at tuple, resolving a same-tuple collision (B40): the
+// loser is recorded as a duplicate, the winner is set. losingParents holds
+// the IDs of mirror parents that already lost their own collision; a
+// recurring instance under one of them is demoted and loses to any
+// instance under a surviving parent regardless of Updated, because the
+// orphan walk's delete of the losing parent cascades to its instances. Two
+// instances under surviving (or both under losing) parents fall through to
+// preferMirror.
+func (i *Inventory) index(s mirror.SourceTuple, e *gws.Event, losingParents map[string]bool) {
+	cur, ok := i.items[s]
+	if !ok {
+		i.items[s] = e
+		return
+	}
+	if cur.ID == e.ID {
+		// The same Google event listed twice is one mirror, not a
+		// collision; recording it as its own loser would have the orphan
+		// walk delete the live mirror.
+		return
+	}
+	demoted := func(ev *gws.Event) bool {
+		return ev.RecurringEventID != "" && losingParents[ev.RecurringEventID]
+	}
+	var eWins bool
+	switch ed, cd := demoted(e), demoted(cur); {
+	case ed != cd:
+		eWins = cd
+	default:
+		eWins = preferMirror(s, e, cur)
+	}
+	if eWins {
+		i.items[s] = e
+		i.addDuplicate(s, cur)
+		return
+	}
+	i.addDuplicate(s, e)
+}
+
+// preferMirror reports whether candidate should win the inventory slot for
+// tuple over incumbent when both are live mirrors of the same source.
+// Order (B40, see doc/plans/B40-duplicate-mirrors.md):
+//
+//  1. newest parseable Updated - the copy the daemon has been maintaining
+//     is the one that moved most recently; an unparseable or empty Updated
+//     counts as oldest.
+//  2. the deterministic mirror ID for the tuple (the daemon's own insert).
+//  3. the lexically smaller ID, so the choice is stable across list order.
+func preferMirror(s mirror.SourceTuple, candidate, incumbent *gws.Event) bool {
+	ct, cok := parseUpdated(candidate.Updated)
+	it, iok := parseUpdated(incumbent.Updated)
+	switch {
+	case cok && !iok:
+		return true
+	case !cok && iok:
+		return false
+	case cok && iok && !ct.Equal(it):
+		return ct.After(it)
+	}
+	det := mirror.DeterministicID(s.CalendarID, s.EventID)
+	switch {
+	case candidate.ID == det && incumbent.ID != det:
+		return true
+	case incumbent.ID == det && candidate.ID != det:
+		return false
+	}
+	return candidate.ID < incumbent.ID
+}
+
+func parseUpdated(u string) (time.Time, bool) {
+	if u == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339Nano, u)
+	return t, err == nil
 }
 
 // All returns every mirror Event currently in the inventory in
@@ -177,46 +296,76 @@ func BuildInventory(ctx context.Context, api API, target string, log Logger) (*I
 	}
 
 	// Pass 2: index each event, skipping cancelled tombstones, unparseable
-	// source values, and inherited recurring instances.
+	// source values, and inherited recurring instances. Parents and
+	// non-recurring events go first (2a), then recurring instances (2b),
+	// so that by the time an instance collision is resolved the set of
+	// LOSING parents is known and an instance under one of them is
+	// demoted (see Inventory.index). Without that ordering the parent and
+	// instance tuples could pick winners from opposite series and the
+	// orphan walk would delete both copies of an occurrence (B40).
 	addedByVersion := make(map[string]int)
 	skippedByVersion := make(map[string]int)
-	for _, te := range allEvents {
-		ev := te.ev
-		// Tombstones (events deleted via events.delete; status=cancelled)
-		// reach this listing because ShowDeleted:true is set above. Skip
-		// them: SPEC's cancelled-and-revived flow inspects status via a
-		// per-event events.get triggered by a 409 on insert, not via the
-		// inventory. Indexing tombstones would mislead the orphan walk
-		// (which would try to events.delete them and hit
-		// api_invalid_request "Resource has been deleted") and the
-		// standard reconcile path (which would treat them as live mirrors
-		// needing drift checks).
-		if ev.Status == gws.EventStatusCancelled {
-			skippedByVersion[te.version]++
-			continue
-		}
-		tuple, ok := parseSourceFromMirror(&ev)
-		if !ok {
-			skippedByVersion[te.version]++
-			continue
-		}
-		// Inherited-instance filter: if this is a recurring instance and
-		// its parent's source-tuple matches its own, the instance only
-		// holds Google's auto-copied parent metadata. Indexing it would
-		// shadow the real parent at the same key.
-		if ev.RecurringEventID != "" {
-			if parentTuple, found := parentSourceTuples[ev.RecurringEventID]; found {
-				if mirror.IsInheritedRecurringInstance(&ev, parentTuple.EventID) {
-					skippedByVersion[te.version]++
-					continue
+	losingParents := map[string]bool{}
+	for _, instancePass := range []bool{false, true} {
+		for _, te := range allEvents {
+			ev := te.ev
+			if (ev.RecurringEventID != "") != instancePass {
+				continue
+			}
+			// Tombstones (events deleted via events.delete; status=cancelled)
+			// reach this listing because ShowDeleted:true is set above. Skip
+			// them: SPEC's cancelled-and-revived flow inspects status via a
+			// per-event events.get triggered by a 409 on insert, not via the
+			// inventory. Indexing tombstones would mislead the orphan walk
+			// (which would try to events.delete them and hit
+			// api_invalid_request "Resource has been deleted") and the
+			// standard reconcile path (which would treat them as live mirrors
+			// needing drift checks).
+			if ev.Status == gws.EventStatusCancelled {
+				skippedByVersion[te.version]++
+				continue
+			}
+			tuple, ok := parseSourceFromMirror(&ev)
+			if !ok {
+				skippedByVersion[te.version]++
+				continue
+			}
+			// Inherited-instance filter: if this is a recurring instance and
+			// its parent's source-tuple matches its own, the instance only
+			// holds Google's auto-copied parent metadata. Indexing it would
+			// shadow the real parent at the same key.
+			if instancePass {
+				if parentTuple, found := parentSourceTuples[ev.RecurringEventID]; found {
+					if mirror.IsInheritedRecurringInstance(&ev, parentTuple.EventID) {
+						skippedByVersion[te.version]++
+						continue
+					}
 				}
 			}
+			inv.index(tuple, &ev, losingParents)
+			addedByVersion[te.version]++
 		}
-		inv.Set(tuple, &ev)
-		addedByVersion[te.version]++
+		if !instancePass {
+			losingParents = inv.loserIDs()
+		}
 	}
 
 	if log != nil {
+		// One warning per colliding tuple, after pass 2 so a three-way
+		// collision reports the final winner rather than an intermediate.
+		for _, tuple := range sortedTuples(inv.duplicates) {
+			losers := make([]string, 0, len(inv.duplicates[tuple]))
+			for _, l := range inv.duplicates[tuple] {
+				losers = append(losers, l.ID)
+			}
+			sort.Strings(losers)
+			log.Warn("sync.BuildInventory: duplicate mirrors for source tuple",
+				"target", target,
+				"source_tuple", tuple.String(),
+				"winner", inv.items[tuple].ID,
+				"losers", strings.Join(losers, ","),
+			)
+		}
 		// Emit one log line per version pass that actually saw events, with
 		// the per-version added/skipped counts the legacy single-pass
 		// implementation reported. Versions whose listing returned zero
@@ -237,9 +386,20 @@ func BuildInventory(ctx context.Context, api API, target string, log Logger) (*I
 		log.Info("sync.BuildInventory complete",
 			"target", target,
 			"total_mirrors", len(inv.Tuples()),
+			"duplicate_tuples", len(inv.duplicates),
 		)
 	}
 	return inv, nil
+}
+
+// sortedTuples returns the keys of m in Tuples() order.
+func sortedTuples(m map[mirror.SourceTuple][]*gws.Event) []mirror.SourceTuple {
+	out := make([]mirror.SourceTuple, 0, len(m))
+	for t := range m {
+		out = append(out, t)
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].String() < out[b].String() })
+	return out
 }
 
 // parseSourceFromMirror extracts the SourceTuple stored on a mirror's

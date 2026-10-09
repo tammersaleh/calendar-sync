@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -20,8 +21,9 @@ import (
 // pre-step-7 horizon prune; the orphan walk reuses the same string so
 // callers see one vocabulary regardless of which path produced the delete.
 const (
-	ReasonOrphaned       mirror.Reason = "orphaned"
-	ReasonSourceFiltered mirror.Reason = "source_filtered"
+	ReasonOrphaned        mirror.Reason = "orphaned"
+	ReasonSourceFiltered  mirror.Reason = "source_filtered"
+	ReasonDuplicateMirror mirror.Reason = "duplicate_mirror"
 )
 
 // defaultOrphanConcurrency mirrors SPEC.md §"Concurrency" line 1107:
@@ -103,11 +105,17 @@ func (w *OrphanWalker) Walk(ctx context.Context, visited map[mirror.SourceTuple]
 		concurrency = defaultOrphanConcurrency
 	}
 
+	// 0. Delete same-tuple collision losers for this source calendar (B40).
+	//    Independent of visited: a visited tuple is the normal duplicate
+	//    case. Errors are collected, not fatal, so the orphan walk below
+	//    still runs.
+	errs := w.deleteDuplicates(ctx)
+
 	// 1. Filter inventory to the entries this walker is responsible for:
 	//    same source calendar, not visited.
 	toCheck := w.candidateTuples(visited)
 	if len(toCheck) == 0 {
-		return nil
+		return errors.Join(errs...)
 	}
 
 	// 2. Fan out events.get with a buffered-channel semaphore. The
@@ -118,7 +126,6 @@ func (w *OrphanWalker) Walk(ctx context.Context, visited map[mirror.SourceTuple]
 	// 3. Drain results, classify, and apply mutations serially. Errors
 	//    on individual entries are accumulated; the walk continues so
 	//    other orphans get cleaned up.
-	var errs []error
 	for r := range results {
 		if r.err != nil && !errors.Is(r.err, gws.ErrAPINotFound) {
 			errs = append(errs, fmt.Errorf("orphan walk events.get %s/%s: %w",
@@ -130,6 +137,43 @@ func (w *OrphanWalker) Walk(ctx context.Context, visited map[mirror.SourceTuple]
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// deleteDuplicates removes every recorded collision loser (B40) whose
+// tuple references w.SourceCalendarID. No events.get: a loser is a
+// redundant copy of the winner regardless of source state. A loser is
+// dropped from duplicate state only on success/404/410, so a real delete
+// failure stays recorded and is retried on the next FullSync. Losers are
+// processed in tuple then ID order for deterministic output. Deleting a
+// losing recurring parent cascades to its instances on Google's side;
+// BuildInventory demotes instances under losing parents so the survivor of
+// an instance collision is always under the surviving parent.
+func (w *OrphanWalker) deleteDuplicates(ctx context.Context) []error {
+	var errs []error
+	for _, tuple := range sortedTuples(w.Inventory.duplicates) {
+		if tuple.CalendarID != w.SourceCalendarID {
+			continue
+		}
+		losers := append([]*gws.Event(nil), w.Inventory.duplicates[tuple]...)
+		sort.Slice(losers, func(a, b int) bool { return losers[a].ID < losers[b].ID })
+		for _, loser := range losers {
+			err := w.API.EventsDelete(ctx, w.TargetCalendarID, loser.ID)
+			if err != nil && !errors.Is(err, gws.ErrAPINotFound) && !errors.Is(err, gws.ErrAPIGone) {
+				errs = append(errs, fmt.Errorf("orphan walk duplicate events.delete %s/%s: %w",
+					w.TargetCalendarID, loser.ID, err))
+				continue
+			}
+			w.Inventory.dropDuplicate(tuple, loser.ID)
+			w.emit(Outcome{
+				Action:        mirror.ActionDelete,
+				Reason:        ReasonDuplicateMirror,
+				SourceEventID: tuple.EventID,
+				TargetEventID: loser.ID,
+				Summary:       loser.Summary,
+			})
+		}
+	}
+	return errs
 }
 
 // candidateTuples returns the inventory entries this walker should

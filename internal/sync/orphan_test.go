@@ -770,3 +770,100 @@ func TestOrphanWalk_OutcomeCarriesPairAndDirection(t *testing.T) {
 			got.Pair, got.Direction)
 	}
 }
+
+// ---------- B40: duplicate mirrors ----------
+
+// TestOrphanWalk_DuplicateMirrors_DeletesLosersForOwnSource pins B40: the
+// walk deletes every duplicate loser whose tuple belongs to this walker's
+// source calendar, before and independently of the visited filter (a
+// visited tuple is the normal duplicate case). No events.get is issued for
+// a duplicate - it is redundant regardless of source state. The winner stays
+// in inventory; a loser for another source calendar stays recorded for
+// that calendar's walker.
+func TestOrphanWalk_DuplicateMirrors_DeletesLosersForOwnSource(t *testing.T) {
+	api := newStubAPI()
+	inv := NewInventory("tgt-cal")
+	sink, captured := captureOutputs()
+
+	mine := mirror.SourceTuple{CalendarID: "src-cal", EventID: "mine"}
+	other := mirror.SourceTuple{CalendarID: "other-cal", EventID: "theirs"}
+	inv.Set(mine, makeOrphanMirror("m-winner", mine.String()))
+	inv.addDuplicate(mine, makeOrphanMirror("m-loser", mine.String()))
+	inv.Set(other, makeOrphanMirror("o-winner", other.String()))
+	inv.addDuplicate(other, makeOrphanMirror("o-loser", other.String()))
+
+	w := newOrphanWalker(t, api, inv, sink, orphanOptions{horizon: 30 * 24 * time.Hour})
+	visited := map[mirror.SourceTuple]bool{mine: true, other: true}
+	if err := w.Walk(context.Background(), visited); err != nil {
+		t.Fatalf("Walk error: %v", err)
+	}
+
+	dels := api.callsByOp("EventsDelete")
+	if len(dels) != 1 || dels[0].EventID != "m-loser" || dels[0].CalendarID != "tgt-cal" {
+		t.Errorf("expected exactly one events.delete of m-loser on tgt-cal; got %v", dels)
+	}
+	if gets := api.callsByOp("EventsGet"); len(gets) != 0 {
+		t.Errorf("duplicate cleanup must not events.get; got %v", gets)
+	}
+	if len(*captured) != 1 {
+		t.Fatalf("expected one outcome; got %d", len(*captured))
+	}
+	got := (*captured)[0]
+	if got.Action != mirror.ActionDelete || got.Reason != ReasonDuplicateMirror ||
+		got.SourceEventID != "mine" || got.TargetEventID != "m-loser" || got.Pair != "test-pair" {
+		t.Errorf("outcome = %+v, want delete/duplicate_mirror mine->m-loser on test-pair", got)
+	}
+	if ev, ok := inv.Lookup(mine); !ok || ev.ID != "m-winner" {
+		t.Errorf("winner must remain in inventory; got %v ok=%v", ev, ok)
+	}
+	dups := inv.duplicates
+	if _, ok := dups[mine]; ok {
+		t.Errorf("deleted loser must be dropped from duplicate state")
+	}
+	if d := dups[other]; len(d) != 1 || d[0].ID != "o-loser" {
+		t.Errorf("other-source loser must remain recorded; got %v", d)
+	}
+}
+
+// TestOrphanWalk_DuplicateMirrors_DeleteFailureIsRetryable pins that a real
+// events.delete error on one loser is returned, keeps that loser recorded
+// for the next FullSync, and does not stop the other losers (or the normal
+// orphan walk) from running. 404/410 count as success, matching
+// deleteMirror.
+func TestOrphanWalk_DuplicateMirrors_DeleteFailureIsRetryable(t *testing.T) {
+	api := newStubAPI()
+	inv := NewInventory("tgt-cal")
+	sink, captured := captureOutputs()
+
+	tuple := mirror.SourceTuple{CalendarID: "src-cal", EventID: "evt"}
+	inv.Set(tuple, makeOrphanMirror("winner", tuple.String()))
+	inv.addDuplicate(tuple, makeOrphanMirror("l-fail", tuple.String()))
+	inv.addDuplicate(tuple, makeOrphanMirror("l-gone", tuple.String()))
+	// Losers are processed in ID order: l-fail then l-gone.
+	api.deleteErrors = append(api.deleteErrors, errors.New("delete kaboom"), &gws.Error{Code: gws.CodeAPIGone, ExitCode: 1})
+
+	// An ordinary orphan alongside, to prove the walk continues past the
+	// duplicate failure.
+	ghost := mirror.SourceTuple{CalendarID: "src-cal", EventID: "ghost"}
+	inv.Set(ghost, makeOrphanMirror("m-ghost", ghost.String()))
+	api.queueGetErr("src-cal", "ghost", &gws.Error{Code: gws.CodeAPINotFound, ExitCode: 1})
+
+	w := newOrphanWalker(t, api, inv, sink, orphanOptions{horizon: 30 * 24 * time.Hour})
+	err := w.Walk(context.Background(), map[mirror.SourceTuple]bool{tuple: true})
+	if err == nil || !strings.Contains(err.Error(), "delete kaboom") {
+		t.Fatalf("expected the duplicate delete error to propagate; got %v", err)
+	}
+	if d := inv.duplicates[tuple]; len(d) != 1 || d[0].ID != "l-fail" {
+		t.Errorf("failed loser must stay recorded for retry, 410 loser dropped; got %v", d)
+	}
+	if _, ok := inv.Lookup(ghost); ok {
+		t.Errorf("normal orphan walk must still run after a duplicate delete failure")
+	}
+	reasons := map[mirror.Reason]int{}
+	for _, o := range *captured {
+		reasons[o.Reason]++
+	}
+	if reasons[ReasonDuplicateMirror] != 1 || reasons[ReasonOrphaned] != 1 {
+		t.Errorf("outcomes by reason = %v, want 1 duplicate_mirror + 1 orphaned", reasons)
+	}
+}

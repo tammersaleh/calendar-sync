@@ -348,6 +348,10 @@ Cancelled source exceptions count as `Present` - cancellation is real source int
 
 Readiness is per source CALENDAR, not per occurrence: a failed or truncated source list means any exception anywhere in it might be unknown, so you cannot claim a specific ID is `Absent`.
 
+### Same-tuple mirror collisions resolve by `preferMirror`, losers die in the orphan walk (B40)
+
+Google can clone a mirror server-side with its extended properties intact, so two live events on a target can carry the same `calendar-sync:source`. `BuildInventory` goes through `Inventory.index`, never `Set`, for list results: `preferMirror` picks newest parseable `Updated`, then the deterministic ID, then lexical ID, and the loser lands in `Inventory.duplicates`. `Set` stays for post-write upserts where the caller already holds the one true mirror. Pass 2 indexes parents before instances and demotes an instance under a losing parent so it can never out-win an instance under the surviving parent (the walk's parent delete cascades to instances). Losers are deleted only by `OrphanWalker.deleteDuplicates` (step 0 of `Walk`, FullSync only) with reason `duplicate_mirror`; use `dropDuplicate` for them, never `Delete`, which removes the winner. Do not pick the deterministic ID first: in the live incident it was the stale copy.
+
 ### golang-ical parses but does not expand recurrence; property lookup is case-sensitive
 
 `internal/ical` wraps `github.com/arran4/golang-ical` (the only runtime dep beyond kong/toml). Two gotchas baked into the wrapper: (1) the library parses `RRULE`/`RDATE`/`EXDATE` but does NOT expand them into occurrences — fine because target feeds (TripIt, Navan) ship pre-expanded concrete `VEVENT`s; a feed with a recurring master would import only the master. (2) the library's `GetProperty` matches `IANAToken` case-*sensitively*, but RFC 5545 §3.1 makes names case-insensitive, so `internal/ical.getProp` does the lookup with `EqualFold` — a lowercase `dtstart:` would otherwise silently import a zero date. Route all property reads through `getProp`, never the library's `GetProperty`.

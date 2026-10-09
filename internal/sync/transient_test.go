@@ -20,15 +20,25 @@ import (
 type captureLogger struct {
 	mu    sync.Mutex
 	warns []map[string]any
+	infos []map[string]any
 }
 
 func (l *captureLogger) Debug(string, ...any) {}
-func (l *captureLogger) Info(string, ...any)  {}
 func (l *captureLogger) Error(string, ...any) {}
+
+func (l *captureLogger) Info(msg string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.infos = append(l.infos, logEntry(msg, args))
+}
 
 func (l *captureLogger) Warn(msg string, args ...any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.warns = append(l.warns, logEntry(msg, args))
+}
+
+func logEntry(msg string, args []any) map[string]any {
 	entry := map[string]any{"msg": msg}
 	for i := 0; i+1 < len(args); i += 2 {
 		k, ok := args[i].(string)
@@ -37,7 +47,7 @@ func (l *captureLogger) Warn(msg string, args ...any) {
 		}
 		entry[k] = args[i+1]
 	}
-	l.warns = append(l.warns, entry)
+	return entry
 }
 
 // makeRecurringParentSource builds a source event with Recurrence set so

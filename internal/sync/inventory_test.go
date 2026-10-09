@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/tammersaleh/calendar-sync/internal/gws"
@@ -255,6 +256,13 @@ func TestBuildInventory_InheritedInstanceDoesNotOverwriteParent(t *testing.T) {
 	if !ok || got2.ID != "mp1" {
 		t.Errorf("reverse-order inventory at parent's tuple: got=%v ok=%v, want parent mp1", got2, ok)
 	}
+	// B40: an inherited instance is filtered BEFORE duplicate detection, so
+	// it must never be recorded as a duplicate of its parent.
+	for name, i := range map[string]*Inventory{"forward": inv, "reverse": inv2} {
+		if d := i.duplicates; len(d) != 0 {
+			t.Errorf("%s: inherited instance must not be recorded as a duplicate; got %v", name, d)
+		}
+	}
 }
 
 // TestBuildInventory_ManagedInstanceStillIndexed pins that the inherited-
@@ -361,6 +369,202 @@ func TestInventory_TuplesSortedAndAllAligned(t *testing.T) {
 		expected := want[i].CalendarID + "-" + want[i].EventID
 		if ev.ID != expected {
 			t.Errorf("All[%d].ID = %q, want %q", i, ev.ID, expected)
+		}
+	}
+}
+
+// TestBuildInventory_DuplicateMirrors_WinnerSelection pins B40: two live
+// mirrors carrying the same source-tuple must not silently last-writer-win.
+// Newest parseable Updated wins; the deterministic ID breaks a tie; then
+// the lexically smaller ID. Losers are recorded in the duplicates map so the orphan
+// walk can delete them. Each case runs in both list orders because the
+// pre-fix bug was order-dependent.
+func TestBuildInventory_DuplicateMirrors_WinnerSelection(t *testing.T) {
+	tuple := mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt"}
+	detID := mirror.DeterministicID("src-cal", "src-evt")
+	mk := func(id, updated string) *gws.Event {
+		m := makeMirrorWithSource(id, tuple.String(), mirror.SchemaVersion)
+		m.Updated = updated
+		return m
+	}
+	cases := []struct {
+		name       string
+		a, b       *gws.Event
+		wantWinner string
+	}{
+		{"newer random beats older deterministic", mk(detID, "2026-10-05T17:59:51.061Z"), mk("random1", "2026-10-06T05:07:46.229Z"), "random1"},
+		{"newer deterministic beats older random", mk(detID, "2026-10-06T05:07:46.229Z"), mk("random1", "2026-10-05T17:59:51.061Z"), detID},
+		// As strings "46.5Z" < "46Z" ('.' sorts before 'Z'); as times .5 is
+		// newer. Lexical ID would pick aa. Only a real time compare picks zz.
+		{"fractional seconds compared as time, not string", mk("zz", "2026-10-06T05:07:46.5Z"), mk("aa", "2026-10-06T05:07:46Z"), "zz"},
+		// 05:00-07:00 is 12:00Z, later than 11:00Z, though the string is smaller.
+		{"offsets compared as time, not string", mk("zz", "2026-10-06T05:00:00-07:00"), mk("aa", "2026-10-06T11:00:00Z"), "zz"},
+		{"unparseable updated counts as oldest", mk("aa", "garbage"), mk("zz", "2026-01-01T00:00:00Z"), "zz"},
+		{"empty updated counts as oldest", mk("aa", ""), mk("zz", "2026-01-01T00:00:00Z"), "zz"},
+		{"equal updated: deterministic wins", mk("aaaa", "2026-10-06T05:07:46Z"), mk(detID, "2026-10-06T05:07:46Z"), detID},
+		{"equal updated, neither deterministic: lexical", mk("zzz", "2026-10-06T05:07:46Z"), mk("aaa", "2026-10-06T05:07:46Z"), "aaa"},
+	}
+	for _, tc := range cases {
+		for _, order := range [][]gws.Event{{*tc.a, *tc.b}, {*tc.b, *tc.a}} {
+			api := newStubAPI()
+			api.queueList(order, "")
+			api.queueList(nil, "")
+			api.queueList(nil, "")
+			inv, err := BuildInventory(context.Background(), api, "tgt-cal", nil)
+			if err != nil {
+				t.Fatalf("%s: BuildInventory error: %v", tc.name, err)
+			}
+			got, ok := inv.Lookup(tuple)
+			if !ok || got.ID != tc.wantWinner {
+				t.Errorf("%s (order %s,%s): winner = %v, want %s", tc.name, order[0].ID, order[1].ID, got, tc.wantWinner)
+			}
+			wantLoser := tc.a.ID
+			if wantLoser == tc.wantWinner {
+				wantLoser = tc.b.ID
+			}
+			dups := inv.duplicates
+			if len(dups) != 1 || len(dups[tuple]) != 1 || dups[tuple][0].ID != wantLoser {
+				t.Errorf("%s (order %s,%s): duplicates = %v, want exactly [%s] under %s", tc.name, order[0].ID, order[1].ID, dups, wantLoser, tuple)
+			}
+		}
+	}
+}
+
+// TestBuildInventory_ThreeWayDuplicate pins that the winner is the global
+// best across all copies, not just the last pairwise comparison, that both
+// losers are recorded, and that the log reports the FINAL winner once per
+// tuple (not an intermediate pairwise winner) plus the duplicate count on
+// the complete line.
+func TestBuildInventory_ThreeWayDuplicate(t *testing.T) {
+	tuple := mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt"}
+	mk := func(id, updated string) gws.Event {
+		m := makeMirrorWithSource(id, tuple.String(), mirror.SchemaVersion)
+		m.Updated = updated
+		return *m
+	}
+	api := newStubAPI()
+	api.queueList([]gws.Event{mk("mid", "2026-02-01T00:00:00Z"), mk("newest", "2026-03-01T00:00:00Z"), mk("oldest", "2026-01-01T00:00:00Z")}, "")
+	api.queueList(nil, "")
+	api.queueList(nil, "")
+	logger := &captureLogger{}
+	inv, err := BuildInventory(context.Background(), api, "tgt-cal", logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := inv.Lookup(tuple); got == nil || got.ID != "newest" {
+		t.Errorf("winner = %v, want newest", got)
+	}
+	losers := inv.duplicates[tuple]
+	ids := []string{}
+	for _, l := range losers {
+		ids = append(ids, l.ID)
+	}
+	sort.Strings(ids)
+	if !reflect.DeepEqual(ids, []string{"mid", "oldest"}) {
+		t.Errorf("losers = %v, want [mid oldest]", ids)
+	}
+
+	if len(logger.warns) != 1 {
+		t.Fatalf("want exactly one duplicate warning; got %d: %v", len(logger.warns), logger.warns)
+	}
+	w := logger.warns[0]
+	if w["msg"] != "sync.BuildInventory: duplicate mirrors for source tuple" ||
+		w["target"] != "tgt-cal" || w["source_tuple"] != tuple.String() ||
+		w["winner"] != "newest" || w["losers"] != "mid,oldest" {
+		t.Errorf("warning = %v, want final winner newest and losers mid,oldest", w)
+	}
+	var complete map[string]any
+	for _, e := range logger.infos {
+		if e["msg"] == "sync.BuildInventory complete" {
+			complete = e
+		}
+	}
+	if complete == nil || complete["duplicate_tuples"] != 1 || complete["total_mirrors"] != 1 {
+		t.Errorf("complete line = %v, want duplicate_tuples=1 total_mirrors=1", complete)
+	}
+}
+
+// TestBuildInventory_SameIDTwiceIsNotADuplicate pins the guard against the
+// same Google event ID appearing twice in the merged per-version lists:
+// it is one mirror, not a collision, so recording it as its own loser
+// would make the orphan walk delete the live mirror.
+func TestBuildInventory_SameIDTwiceIsNotADuplicate(t *testing.T) {
+	tuple := mirror.SourceTuple{CalendarID: "src-cal", EventID: "src-evt"}
+	m := makeMirrorWithSource("only", tuple.String(), mirror.SchemaVersion)
+	api := newStubAPI()
+	api.queueList([]gws.Event{*m}, "")
+	api.queueList([]gws.Event{*m}, "")
+	api.queueList(nil, "")
+	inv, err := BuildInventory(context.Background(), api, "tgt-cal", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := inv.Lookup(tuple); !ok || got.ID != "only" {
+		t.Errorf("winner = %v ok=%v, want only", got, ok)
+	}
+	if d := inv.duplicates; len(d) != 0 {
+		t.Errorf("same ID twice must not be a duplicate; got %v", d)
+	}
+}
+
+// TestBuildInventory_DuplicateParents_InstanceFollowsSurvivingParent pins
+// the B40 hierarchy rule: when two recurring mirror parents collide AND
+// their managed instances for the same occurrence collide, the instance
+// under the SURVIVING parent must win even when the instance under the
+// losing parent is newer. Otherwise the orphan walk deletes the losing
+// parent (cascading to its instances, including the "winning" one) and
+// then deletes the surviving parent's instance as the recorded loser,
+// leaving no mirror occurrence at all. Both list orders.
+func TestBuildInventory_DuplicateParents_InstanceFollowsSurvivingParent(t *testing.T) {
+	parentTuple := mirror.SourceTuple{CalendarID: "src-cal", EventID: "sp"}
+	instTuple := mirror.SourceTuple{CalendarID: "src-cal", EventID: "sp_20261013T154500Z"}
+	mk := func(id, parent, tuple, updated string) gws.Event {
+		m := makeMirrorWithSource(id, tuple, mirror.SchemaVersion)
+		m.RecurringEventID = parent
+		m.Updated = updated
+		return *m
+	}
+	p1 := mk("P1", "", parentTuple.String(), "2026-10-06T00:00:00Z") // parent winner (newer)
+	p2 := mk("P2", "", parentTuple.String(), "2026-10-01T00:00:00Z")
+	p1x := mk("P1_20261013T154500Z", "P1", instTuple.String(), "2026-10-01T00:00:00Z") // older, but under the survivor
+	p2x := mk("P2_20261013T154500Z", "P2", instTuple.String(), "2026-10-09T00:00:00Z") // newer, under the loser
+
+	orders := [][]gws.Event{{p1, p1x, p2, p2x}, {p2x, p2, p1x, p1}, {p1x, p2x, p1, p2}}
+	for _, order := range orders {
+		api := newStubAPI()
+		api.queueList(order, "")
+		api.queueList(nil, "")
+		api.queueList(nil, "")
+		inv, err := BuildInventory(context.Background(), api, "tgt-cal", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := inv.Lookup(parentTuple); got == nil || got.ID != "P1" {
+			t.Errorf("parent winner = %v, want P1", got)
+		}
+		if got, _ := inv.Lookup(instTuple); got == nil || got.ID != "P1_20261013T154500Z" {
+			t.Errorf("instance winner = %v, want P1's instance (under the surviving parent) despite being older", got)
+		}
+		if d := inv.duplicates[parentTuple]; len(d) != 1 || d[0].ID != "P2" {
+			t.Errorf("parent losers = %v, want [P2]", d)
+		}
+		if d := inv.duplicates[instTuple]; len(d) != 1 || d[0].ID != "P2_20261013T154500Z" {
+			t.Errorf("instance losers = %v, want [P2's instance]", d)
+		}
+
+		// The orphan walk must then never delete the surviving parent's
+		// instance.
+		sink, _ := captureOutputs()
+		w := newOrphanWalker(t, api, inv, sink, orphanOptions{})
+		if err := w.Walk(context.Background(), map[mirror.SourceTuple]bool{parentTuple: true, instTuple: true}); err != nil {
+			t.Fatal(err)
+		}
+		deleted := map[string]bool{}
+		for _, c := range api.callsByOp("EventsDelete") {
+			deleted[c.EventID] = true
+		}
+		if !deleted["P2"] || !deleted["P2_20261013T154500Z"] || deleted["P1"] || deleted["P1_20261013T154500Z"] || len(deleted) != 2 {
+			t.Errorf("deleted = %v, want exactly P2 and P2's instance", deleted)
 		}
 	}
 }

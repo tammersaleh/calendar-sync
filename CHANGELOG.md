@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.7.2](https://github.com/tammersaleh/calendar-sync/compare/v2.7.1...v2.7.2) (2026-10-09)
+
+
+### Bug Fixes
+
+* resolve same-tuple mirror collisions instead of dropping one (B40) ([00dc301](https://github.com/tammersaleh/calendar-sync/commit/00dc301c5e6b2fadc28105c0fda0491de113b082))
+
 ## [2.7.1](https://github.com/tammersaleh/calendar-sync/compare/v2.7.0...v2.7.1) (2026-08-13)
 
 

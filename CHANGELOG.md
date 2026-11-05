@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.7.3](https://github.com/tammersaleh/calendar-sync/compare/v2.7.2...v2.7.3) (2026-11-05)
+
+
+### Bug Fixes
+
+* **release:** migrate cask post-install hook to install_steps ([5323611](https://github.com/tammersaleh/calendar-sync/commit/532361154a6f94ffe92a7dd4f77939e44bbf90c4))
+
 ## [2.7.2](https://github.com/tammersaleh/calendar-sync/compare/v2.7.1...v2.7.2) (2026-10-09)
 
 

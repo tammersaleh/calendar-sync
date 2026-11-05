@@ -39,41 +39,15 @@ homebrew_casks:
     description: Google Calendar event mirroring tool
     hooks:
       post:
-        install: |
-          if OS.mac?
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/calendar-sync"]
-
-            # Restart the launchd agent if it's currently loaded so
-            # `brew upgrade calendar-sync` picks up the new binary
-            # automatically. Without this, the running daemon keeps
-            # executing the prior binary's mmap'd code (kernel caches
-            # the file, on-disk replacement doesn't bounce the process)
-            # and the user has to run `calendar-sync uninstall &&
-            # calendar-sync install` by hand.
-            #
-            # Cold install: launchctl print fails (agent not loaded),
-            # the kickstart skips, and the user runs `calendar-sync
-            # install` to load the agent for the first time. The
-            # probe's stderr is suppressed so a normal cold install
-            # doesn't print "Could not find service" through brew.
-            #
-            # Custom-label installs (`calendar-sync install --label
-            # foo`) are NOT covered by this hook - the postflight only
-            # knows the default label. Users who customized the label
-            # need to keep using the manual uninstall/install dance on
-            # upgrade.
-            #
-            # must_succeed: false on both calls so a transient
-            # launchctl issue doesn't fail the brew upgrade itself.
-            uid = Process.uid
-            label = "org.calendar-sync.agent"
-            loaded = system_command "/bin/launchctl",
-              args: ["print", "gui/#{uid}/#{label}"],
-              must_succeed: false,
-              print_stderr: false
-            if loaded.success?
-              system_command "/bin/launchctl",
-                args: ["kickstart", "-k", "gui/#{uid}/#{label}"],
-                must_succeed: false
-            end
-          end
+        # Restart the launchd agent so `brew upgrade` picks up the new
+        # binary. A running daemon keeps executing the old binary's mmap'd
+        # code. On a cold install the agent isn't loaded, so the silent
+        # `launchctl print` probe fails and kickstart is skipped. Only the
+        # default label is covered. Custom `--label` installs still need
+        # `calendar-sync uninstall && calendar-sync install` after upgrade.
+        # The steps DSL has no uid token or exit-status guard, hence sh.
+        install_steps: |
+          run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/calendar-sync"]
+          run "/bin/sh",
+              args:         ["-c", 's="gui/$(/usr/bin/id -u)/org.calendar-sync.agent"; /bin/launchctl print "$s" >/dev/null 2>&1 || exit 0; /bin/launchctl kickstart -k "$s"'],
+              must_succeed: false
